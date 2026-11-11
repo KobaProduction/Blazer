@@ -32,7 +32,7 @@ try {
         Invoke-CargoGate @('test', '--workspace', '--locked', '--target', $buildTarget)
     }
     if ($Stage -in @('All', 'Build')) {
-        Invoke-CargoGate @('build', '--release', '--locked', '--target', $buildTarget, '-p', 'vpn-client')
+        Invoke-CargoGate @('build', '--release', '--locked', '--target', $buildTarget, '-p', 'vpn-client', '-p', 'vpn-headless')
     }
 }
 finally {

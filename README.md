@@ -1,18 +1,25 @@
 # VPN-клиент
 
-Заготовка desktop GUI-приложения на Rust. Постоянное название пока не выбрано.
+Нативное Rust-приложение под временным названием «VPN-клиент».
 Репозиторий: [KobaProduction/vpn-client](https://github.com/KobaProduction/vpn-client).
+Собственный код — [MIT](LICENSE); приватность репозитория сейчас не меняется.
 
-Текущий целевой вариант — Windows x64 (MSVC). Окно показывает отсутствие
-настроенного VPN-модуля; подключение недоступно. Приложение не создаёт туннель,
-не меняет маршруты/DNS и не требует прав администратора на этом этапе.
+Цель — клиент с собственным модифицированным Shoes, низким расходом ресурсов,
+подписками и знакомым управлением. Полный замысел и критерии:
+[product requirements](docs/product-requirements.md);
+поведение референса и границы паритета: [Happ](docs/reference-behavior.md).
+
+Сейчас подготовлена основа: native GUI с большой недоступной кнопкой
+подключения, общий backend, headless `status`, typed import/engine ports,
+1 MiB input guard и локальная bounded диагностика. Engine/normalizer
+явно недоступны: VPN, downloader, parser, persistence и маршрутизация
+не реализованы. Системные routes/DNS не меняются.
 
 ## Установка и запуск
 
-Нужны Git, PowerShell 7 (`pwsh`), rustup и Visual Studio Build Tools с компонентами
-Desktop development with C++, MSVC x64 и Windows SDK. Версия Rust закреплена
-в `rust-toolchain.toml`. На свежем checkout явно установите указанный MSVC
-toolchain до первого запуска Cargo, как показано ниже.
+Текущий проверяемый target — Windows x64 MSVC. Нужны Git, PowerShell 7,
+rustup, Visual Studio Build Tools с Desktop development with C++, MSVC x64
+и Windows SDK. До первого Cargo на свежем checkout установить pinned toolchain:
 
 ```powershell
 cd C:\Users\Koba\RustroverProjects\vpn-client
@@ -21,33 +28,48 @@ git config --local core.hooksPath .githooks
 cargo run --locked -p vpn-client
 ```
 
-Откройте корневую папку в RustRover как Cargo workspace.
+Откройте корень в RustRover как Cargo workspace. GUI — egui/eframe + Glow;
+JS, Electron и WebView не используются. Headless без GUI dependencies:
 
-## Сборка и проверка
+```powershell
+cd C:\Users\Koba\RustroverProjects\vpn-client
+cargo run --locked -p vpn-headless -- status
+```
+
+Headless сообщает `engine=unavailable`, `connect_enabled=false`,
+`telemetry_export=not_configured`. Он завершается после запроса;
+это не установленный сервис и не работающий VPN.
+
+## Локальные проверки и сборка
 
 ```powershell
 cd C:\Users\Koba\RustroverProjects\vpn-client
 pwsh -NoProfile -File scripts/verify.ps1
 ```
 
-Команда проверяет архитектурные зависимости, формат, Clippy, компиляцию,
-тесты и release-сборку для `x86_64-pc-windows-msvc`.
-Результат: `target/x86_64-pc-windows-msvc/release/vpn-client.exe`.
-Тот же gate обязателен в pre-push hook и GitHub Actions.
-Отдельные проверки и правила локального цикла: [разработка](docs/development.md).
+Gate проверяет границы шести пакетов и отсутствие GUI в headless-графе,
+формат, Clippy (сложность максимум 15), компиляцию, тесты и release-build:
+`target/x86_64-pc-windows-msvc/release/vpn-client.exe` и `vpn-headless.exe`
+в той же папке. Локальный pre-push обязателен.
+По решению владельца CI не используется и его ожидание не входит в разработку.
+Локальный быстрый цикл и отдельные этапы: [development](docs/development.md).
 
-## Карта проекта
+## Карта
 
 | Область | Путь |
 | --- | --- |
-| Предметная область без GUI/OS-зависимостей | `crates/domain` |
-| Сценарии и порты приложения | `crates/application` |
-| Реализации внешних портов | `crates/infrastructure` |
-| GUI (egui/eframe), представление и composition root | `apps/desktop` |
-| Правила для AI-агентов | [AGENTS.md](AGENTS.md) |
-| Направление зависимостей и границы | [архитектура](docs/architecture.md) |
-| Поддерживаемый target и будущие платформы | [платформы](docs/platforms.md) |
+| Домен | `crates/domain` |
+| Сценарии и типизированные порты | `crates/application` |
+| Внешние адаптеры | `crates/infrastructure` |
+| Общий backend, состояние, OTel/diagnostics | `crates/backend` |
+| Native GUI и headless delivery | `apps/desktop`, `apps/headless` |
+| AI-agent entry map | [AGENTS.md](AGENTS.md) |
+| Архитектура и integration boundaries | [architecture](docs/architecture.md) |
+| Windows и будущие платформы | [platforms](docs/platforms.md) |
+| Измерение ресурсов | [performance](docs/performance.md) |
 
-На этапе заготовки DEV/TEST/production не имеют внешних сервисов или секретов.
-`.env.example` описывает отсутствие runtime-конфигурации; `.env` не загружается.
-Задачи и дальнейшие решения ведутся в GitHub Issues.
+OTel wiring включена, network export выключен и не настраивается через
+OTEL env. Локальный ring ограничен 128 enum events без подписок/URL/IP/секретов.
+`.env` не загружается; DEV/TEST/production пока не имеют внешнего backend.
+Целевые Linux/macOS/Android/iOS/OpenWrt требуют отдельной build/runtime приёмки.
+Задачи и незавершённая работа ведутся в GitHub Issues, не в Markdown backlog.

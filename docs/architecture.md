@@ -1,54 +1,99 @@
-# Архитектурный контракт
+# Архитектурный контракт клиента
 
-Приложение — один продукт с несколькими Rust-пакетами, разделёнными по
-направлению зависимостей Clean Architecture. Канонический справочник:
-[AI Agent Workflow / Clean Architecture / DDD](https://github.com/ArthurKoba/ai-agent-workflow/blob/main/skills/software-engineering/clean-architecture-ddd.md).
+Продуктовые обязательства: [требования](product-requirements.md);
+референс и границы паритета: [Happ](reference-behavior.md).
+Справочник: [AI Agent Workflow / Clean Architecture / DDD](https://github.com/ArthurKoba/ai-agent-workflow/blob/main/skills/software-engineering/clean-architecture-ddd.md).
+Требование в документации не означает реализованный VPN.
 
-## Границы
+## Границы пакетов
 
 | Пакет | Ответственность | Разрешённые внутренние зависимости |
 | --- | --- | --- |
 | `vpn-domain` | Предметные значения и инварианты | Нет |
-| `vpn-application` | Сценарии, типизированные порты и результаты | `vpn-domain` |
-| `vpn-infrastructure` | Адаптеры системных API, VPN-протокола и хранения | `vpn-application`, `vpn-domain` |
-| `vpn-client` | Desktop GUI, преобразование результатов в UI и composition root | Все три внутренних пакета |
+| `vpn-application` | Сценарии, import guard, engine/normalizer ports, типизированные ошибки | `vpn-domain` |
+| `vpn-infrastructure` | Реализации внешних портов | `vpn-application`, `vpn-domain` |
+| `vpn-backend` | Общая composition root, состояние, facade, OTel/diagnostics | `vpn-infrastructure`, `vpn-application`, `vpn-domain` |
+| `vpn-client` | Нативный GUI и presentation state | `vpn-backend` |
+| `vpn-headless` | Консольная доставка без окна | `vpn-backend` |
 
-Домен не имеет внешних зависимостей. Application зависит только от домена.
-Внутренние слои не импортируют GUI, системные API, файловое хранение или
-конкретные реализации портов. Тестовые и build-зависимости подчиняются тем же
-границам. `scripts/check-architecture.ps1` проверяет граф Cargo и наследование
-обязательных workspace lint-правил.
+Домен не имеет внешних зависимостей; application зависит только от домена.
+GUI, OS API, SDK и конкретные реализации портов находятся во внешних слоях.
+Та же граница действует для test/build dependencies. Dependency gate проверяет
+шесть пакетов, наследование lint-правил, MIT собственных пакетов и отсутствие
+GUI/window/webview библиотек в headless-графе.
 
-Composition root desktop-приложения собирает сценарии с реализациями портов.
-Сценарий не создаёт инфраструктуру самостоятельно. GUI вызывает сценарии и
-отображает их результаты; сетевые операции не должны блокировать UI-поток.
-Будущие привилегированные операции изолируются в адаптере/системном сервисе с
-отдельным контрактом прав и IPC до их реализации.
+Mutable состояние принадлежит backend. GUI хранит screen enum и cached snapshot;
+отрисовка не запрашивает engine status и не генерирует telemetry.
+Обновление статуса происходит при запуске и явном действии пользователя.
+Не добавлять постоянный repaint/poll timer. Будущие I/O-адаптеры требуют
+отменяемого фонового исполнения; нельзя блокировать GUI-поток.
 
-## Bootstrap-контракт
+## Текущий исполняемый контракт
 
-Единственный текущий сценарий — чтение состояния туннеля через порт.
-Начальный адаптер возвращает явную недоступность backend, а не выдуманное
-подключение или достоверный статус системной сети. Отсутствие backend не
-приравнивается к отключённому туннелю. Кнопка подключения недоступна.
+Оба entrypoint используют один backend с явно недоступными engine и normalizer.
+`vpn-headless status` выводит реальное состояние этих адаптеров и завершается;
+это не daemon, системная служба или установленный VPN. GUI имеет экраны
+подключения, подписок, конфигураций, маршрутизации, VPN, журнала и телеметрии,
+но незавершённые функции обозначены как недоступные. Кнопка подключения крупная
+и отключена: рабочий engine/data path не реализован.
 
-Протокол, профиль сервера, хранилище ключей, маршрутизация и DNS пока не выбраны.
-Не добавлять repositories, CQRS, event bus, ORM или фоновые службы без
-сценария, которому они нужны. Это границы для дальнейшего развития, а не
-доказательство существования полноценного VPN-клиента.
+## Подписки и конфигурации
 
-## Будущее VPN-ядро
+Входной документ имеет формат и bytes; размер ограничен 1 MiB до вызова
+normalizer. Декларированы Xray JSON и список share links как форматы будущего
+ingestion, а не реализованные parsers. Native format не заявлен без parser.
 
-Выбрана собственная модификация [Shoes](https://github.com/cfal/shoes).
-Адрес проектного форка и форма интеграции ещё не утверждены. Ядро будет
-подключаться во внешнем инфраструктурном адаптере за портами приложения;
-решение о библиотеке, FFI или отдельном процессе принимается вместе с
-разработкой ядра. На текущем этапе зависимость и сетевые операции не добавляются.
-## GUI-решение
+Цепочка: input document → guarded application import → normalizer port →
+typed normalized configuration → engine validation. Модель не является
+`serde_json::Value` или произвольным Xray JSON. Текущий normalizer всегда
+возвращает `NormalizerUnavailable`; неподдержанный формат/feature и отсутствие
+engine имеют отдельные ошибки. Никакого parse-success или активного профиля
+из сырых bytes не создаётся. Downloader, translator, persistence, provider
+metadata, QR и закрытые форматы пока не реализованы.
 
-Для первого desktop-окна используется [egui/eframe](https://docs.rs/eframe/0.37.0/eframe/)
-с Glow renderer и встроенными шрифтами. Это Rust GUI без отдельного JavaScript
-toolchain, пригодный для текущей Windows-сборки. Альтернативы с дополнительным
-web-стеком или собственным UI-языком сейчас добавляют ненужную сборочную границу.
-GUI остаётся внешним адаптером и может быть заменён. Выбор desktop GUI не
-фиксирует Android/iOS frontend; мобильные оболочки потребуют отдельной проверки.
+Небольшой protocol enum — словарь model contract, не feature matrix поддержки.
+Реальная нормализованная схема расширяется под fixtures и версионированный
+core contract, с отказом от неподдержанных полей без silent drop.
+
+## Собственное модифицированное ядро
+
+Источник ядра — [ArthurKoba/shoes](https://github.com/ArthurKoba/shoes),
+его [архитектура](https://github.com/ArthurKoba/shoes/blob/master/docs/architecture.md)
+владеет engine runtime/Device/Session и core/app contract. Не копировать его
+schema в клиент. Library/FFI/process boundary выбирается по согласованному
+versioned contract и платформенным ограничениям; сейчас Shoes dependency нет.
+
+Engine вызывается только через application ports. Наличие процесса ядра
+не доказывает VPN. Windows VPN runtime не заявляется до подтверждённой
+поддержки со стороны ядра и реального data path. Privileged OS операции,
+routes/DNS и service/IPC потребуют отдельных adapters и cleanup-контрактов.
+
+## Нативный GUI и ресурсы
+
+Сохраняем [egui/eframe](https://docs.rs/eframe/0.37.0/eframe/) + Glow:
+Rust UI без JS, Electron и WebView, уже проверяемый Windows build.
+Iced — подходящая native Rust модель messages/tasks, но смена toolkit сейчас
+не даёт доказанной экономии. Slint добавляет отдельный UI DSL и требует
+своей проверки лицензии/platform delivery. Оба остаются альтернативами,
+не установленными зависимостями.
+
+Toolkit — внешняя деталь; core/application/backend не зависят от layout.
+Desktop выбор не доказывает Android/iOS GUI. Headless предназначен для будущего
+OpenWrt/router deployment, но target/ABI/libc и runtime ещё не приняты.
+Ресурсы измеряются по [performance contract](performance.md); Rust сам по себе
+не доказывает энергоэффективность.
+
+## OpenTelemetry и диагностика
+
+API/SDK 0.33.1 подключены только во внешнем backend с trace features.
+Provider использует `Sampler::AlwaysOff` и `Resource::builder_empty` со
+статическими service.name/version. Нет exporters, processors, фоновых workers,
+global provider или чтения exporter/sampler/resource environment settings.
+Lifecycle, status и import-result вызывают реальные span API с enum/staticcodes.
+Это wiring, не готовый collector/export pipeline или все traces/metrics/logs.
+
+Локальный ring хранит максимум 128 fixed-size enum events; старые вытесняются,
+dropped-counter насыщается. Нет raw payload, URL, IP, profile names или secrets.
+Cached snapshot не создаёт событий. Запрос включения экспорта возвращает
+`NotConfigured`. Наличие OTEL environment variables не включает сеть.
+Consent, проверенный exporter, metadata policy и cleanup/TTL нужны до экспорта.
