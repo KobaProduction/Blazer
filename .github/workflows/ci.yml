@@ -1,0 +1,28 @@
+name: Windows quality gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show active-toolchain
+      - name: Verify
+        shell: pwsh
+        run: ./scripts/verify.ps1
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-client-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/vpn-client.exe
+          if-no-files-found: error
