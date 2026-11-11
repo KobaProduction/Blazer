@@ -11,10 +11,12 @@
 
 Нужны Git, PowerShell 7 (`pwsh`), rustup и Visual Studio Build Tools с компонентами
 Desktop development with C++, MSVC x64 и Windows SDK. Версия Rust закреплена
-в `rust-toolchain.toml`; rustup загрузит её и необходимые компоненты.
+в `rust-toolchain.toml`. На свежем checkout явно установите указанный MSVC
+toolchain до первого запуска Cargo, как показано ниже.
 
 ```powershell
 cd C:\Users\Koba\RustroverProjects\vpn-client
+rustup toolchain install 1.95.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
 git config --local core.hooksPath .githooks
 cargo run --locked -p vpn-client
 ```

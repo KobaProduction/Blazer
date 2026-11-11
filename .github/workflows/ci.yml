@@ -16,7 +16,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         shell: pwsh
-        run: rustup show active-toolchain
+        run: |
+          $channelLine = Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$'
+          if (@($channelLine).Count -ne 1) { throw 'Expected one pinned Rust channel' }
+          $channel = $channelLine.Matches[0].Groups[1].Value
+          rustup toolchain install $channel --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup show active-toolchain
       - name: Verify
         shell: pwsh
         run: ./scripts/verify.ps1
