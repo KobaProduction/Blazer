@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="BlazerTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorBackground">@color/background</item>
+        <item name="android:colorBackgroundFloating">@color/surface</item>
+        <item name="android:colorButtonNormal">@color/control</item>
+        <item name="android:buttonStyle">@style/BlazerButton</item>
+        <item name="android:textColorPrimary">@color/foreground</item>
+        <item name="android:textColorSecondary">@color/muted</item>
+        <item name="android:statusBarColor">@color/inset</item>
+        <item name="android:navigationBarColor">@color/inset</item>
+    </style>
+    <style name="BlazerButton" parent="android:style/Widget.Material.Button">
+        <item name="android:backgroundTint">@color/button_background</item>
+        <item name="android:textColor">@color/button_text</item>
+    </style>
+</resources>

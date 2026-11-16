@@ -1,0 +1,13 @@
+[package]
+name = "vpn-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "domain.rs"
+
+[lints]
+workspace = true

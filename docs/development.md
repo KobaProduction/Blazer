@@ -28,9 +28,28 @@ backend/diagnostics — соответствующий пакет. Не повт
 ## Команды и gate
 
 `scripts/verify.ps1` выполняет архитектуру, format, Clippy, type-check, tests
-и release-build двух entrypoint для Windows MSVC. `-Stage` выбирает один этап:
-`Architecture`, `Format`, `Lint`, `Check`, `Test`, `Build`.
+и release-build обычного клиента и headless для Windows MSVC. Проверки
+Clippy, type-check и tests включают также демо. Параметр `-Stage` выбирает
+этап `Architecture`, `Format`, `Lint`, `Check`, `Test` или `Build`.
+Локальные папки с исполняемыми файлами клиента и демо создаёт
+[`scripts/build-windows.ps1`](../scripts/build-windows.ps1).
 `cargo lint` и `cargo typecheck` — короткие host-native команды.
+
+Для разработки используйте обычный Debug и постоянные папки
+`dist/windows/client` и `dist/windows/demo`. Указывайте
+`-Configuration Release` для оптимизированного пакета. Оба профиля
+переиспользуют общую папку `target` с отдельными кешами профилей и целей.
+В dev и test сохраняются номера строк для backtrace собственного кода,
+отключены incremental и отладочная информация зависимостей. Это ограничивает
+рост локального кеша ценой более долгой повторной компиляции изменённых пакетов.
+[Профили Cargo и скорость сборки](https://doc.rust-lang.org/cargo/guide/build-performance.html)
+
+Windows-скрипт заменяет только файлы пакета и переиспользует уже проверенные
+`shoes.exe` и `wintun.dll`, если их SHA‑256 совпадает. Запустите один
+экземпляр упаковщика за раз. Если Windows удерживает exe, закройте
+соответствующий клиент или демо и повторите ту же команду. Для Android
+используйте `scripts/build-android.ps1` и сохраняйте тот же путь к APK.
+Скрипт заменяет APK после проверки подписи и удаляет временные файлы упаковки.
 
 Architecture gate контролирует направление зависимостей, MIT/lint inheritance
 и GUI-free headless dependency tree. Полные тесты включают 1 MiB guard,

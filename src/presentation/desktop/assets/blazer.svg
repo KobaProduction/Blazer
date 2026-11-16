@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Blazer · Тёмное стекло</title>
+  <path fill="#FF914D" d="m3 20 7-11 6 7 7-4h18l7 4 6-7 7 11-4 9-12 4H19L7 29Z"/>
+  <path fill="#FFB276" d="m17 17 6-4h18l6 4-7 5H24Z"/>
+  <path fill="#141414" d="m8.5 20 12 2 5-2h13l5 2 12-2-7.5 10-10 2-4-4h-4l-4 4-10-2Z"/>
+  <path fill="#776256" d="m14 23 7.5 1.5 4.5-2h10l-9 3.2-5 1.3Z"/>
+  <path fill="#212121" stroke="#FF914D" stroke-width="1.8" stroke-linejoin="round" d="m19 31 13 4 13-4 12 8 3 19H4l3-19Z"/>
+  <path fill="#FF914D" d="m20 33-8 9 7 2-2 5 15 8-7-18Zm24 0 8 9-7 2 2 5-15 8 7-18Z"/>
+  <path fill="#FFE1BD" d="m27 36 5 2 5-2-5 15Zm18 14 3-3 4 3Z"/>
+  <path stroke="#FFB276" stroke-width="1.5" stroke-linecap="round" d="M44 51.5h9"/>
+</svg>

@@ -1,0 +1,50 @@
+[package]
+name = "vpn-infrastructure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "adapters.rs"
+
+[dependencies]
+vpn-domain.workspace = true
+vpn-application.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+base64.workspace = true
+percent-encoding.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rustix = { version = "1.1.6", features = ["fs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1"
+
+[target.'cfg(windows)'.dependencies]
+clap = { version = "=4.6.7", default-features = false }
+futures-util = { version = "=0.3.34", default-features = false }
+net-route = "=0.4.6"
+tun = { version = "=0.8.14", features = ["async"] }
+tun2proxy = { version = "=0.8.7", default-features = false }
+wait-timeout = "=0.2.1"
+win-custody = "=0.1.1"
+windows-dpapi = "=0.2.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+etherparse = "=0.20.3"
+
+[lints]
+workspace = true

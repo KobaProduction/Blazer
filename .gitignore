@@ -1,4 +1,5 @@
 /target
+/dist/windows/
 /.idea/
 /.vscode/
 .env
