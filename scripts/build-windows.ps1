@@ -247,7 +247,8 @@ $releaseVersion = if ($ReleaseArchive) { Get-ReleaseVersion $repo }
     elseif ($PreviewArchive) { Get-WorkspaceAppVersion $repo 'blazer' }
     else { $null }
 $target = 'x86_64-pc-windows-msvc'
-$targetDirectory = Join-Path $repo 'target'
+$targetDirectory = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repo) }
+    else { Join-Path $repo 'target' }
 $targetPlatformDirectory = Join-Path $targetDirectory $target
 $buildDirectory = Join-Path $targetPlatformDirectory $Configuration.ToLowerInvariant()
 $profileArguments = @('--features', 'demo')

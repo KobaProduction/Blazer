@@ -1331,7 +1331,10 @@ mod compatibility_tests {
             .unwrap()
             .into_profile()
             .unwrap();
-        let ProxySecurity::Tls { alpn, fingerprint, .. } = &mut profile.profile.security else {
+        let ProxySecurity::Tls {
+            alpn, fingerprint, ..
+        } = &mut profile.profile.security
+        else {
             panic!("expected the TLS setting");
         };
         assert!(alpn.is_empty());

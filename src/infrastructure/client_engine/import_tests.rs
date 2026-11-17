@@ -27,8 +27,12 @@ fn firefox_fingerprint_survives_tcp_import_and_engine_rendering() {
         let link = format!(
             "vless://{ID}@example.test:443?type=tcp&security={security}&sni=example.test&fp={fingerprint}{parameters}"
         );
-        let profile = SubscriptionNormalizer.normalize(link.as_bytes()).unwrap().remove(0);
-        let config: Value = serde_json::from_slice(&config::render(&profile, 40000, None).unwrap()).unwrap();
+        let profile = SubscriptionNormalizer
+            .normalize(link.as_bytes())
+            .unwrap()
+            .remove(0);
+        let config: Value =
+            serde_json::from_slice(&config::render(&profile, 40000, None).unwrap()).unwrap();
         let wrapper = &config[0]["rules"][0]["client_chain"]["protocol"];
         assert_eq!(wrapper["type"], security);
         assert_eq!(wrapper["fingerprint"], expected);
