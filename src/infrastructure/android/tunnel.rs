@@ -10,6 +10,7 @@ use vpn_application::client::{
     RunningConnection,
 };
 use vpn_application::session::ModeCapabilities;
+use vpn_domain::client::ProxyTransport;
 
 use super::AndroidPlatform;
 
@@ -126,6 +127,11 @@ impl ClientEnginePort for AndroidEngine {
     }
 
     fn validate_profile(&self, profile: &ProxyProfile) -> Result<(), ClientError> {
+        // Alternate placement is enabled for the verified Windows engine.
+        if matches!(&profile.transport, ProxyTransport::Xhttp { metadata, .. } if !metadata.is_default())
+        {
+            return Err(ClientError::UnsupportedFeature);
+        }
         validate_profile(profile)
     }
 
@@ -139,6 +145,7 @@ impl ClientEnginePort for AndroidEngine {
         if !self.available || mode != ConnectionMode::Tun {
             return Err(ClientError::UnsupportedMode);
         }
+        self.validate_profile(profile)?;
         let result = self
             .load_engine(cancel)
             .and_then(|()| self.start_tunnel(profile, cancel));

@@ -13,6 +13,28 @@ const ID: &str = "a5c41b77-fc31-4ab0-a275-1c67aa9aab31";
 const HOST_HEADER: &str = "loopback.example.test";
 const WS_PATH: &str = "/format-import";
 
+#[test]
+fn firefox_fingerprint_survives_tcp_import_and_engine_rendering() {
+    for (security, parameters, fingerprint, expected) in [
+        ("tls", "", "firefox", "firefox-148"),
+        (
+            "reality",
+            "&pbk=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio&sid=abcd",
+            "hellofirefox_120",
+            "firefox-120",
+        ),
+    ] {
+        let link = format!(
+            "vless://{ID}@example.test:443?type=tcp&security={security}&sni=example.test&fp={fingerprint}{parameters}"
+        );
+        let profile = SubscriptionNormalizer.normalize(link.as_bytes()).unwrap().remove(0);
+        let config: Value = serde_json::from_slice(&config::render(&profile, 40000, None).unwrap()).unwrap();
+        let wrapper = &config[0]["rules"][0]["client_chain"]["protocol"];
+        assert_eq!(wrapper["type"], security);
+        assert_eq!(wrapper["fingerprint"], expected);
+    }
+}
+
 struct FixtureRoot(PathBuf);
 
 impl FixtureRoot {
@@ -39,9 +61,9 @@ impl Drop for OwnedChild {
 }
 
 fn trusted_binary() -> PathBuf {
-    let path = std::env::var_os("VPN_CLIENT_TEST_SHOES_EXE")
+    let path = std::env::var_os("BLAZER_TEST_BLAZECORE_EXE")
         .map(PathBuf::from)
-        .expect("set VPN_CLIENT_TEST_SHOES_EXE to the approved Windows Shoes executable");
+        .expect("set BLAZER_TEST_BLAZECORE_EXE to the approved Windows BlazeCore executable");
     assert!(
         path.is_absolute(),
         "fixture must use an absolute engine path"
@@ -51,8 +73,8 @@ fn trusted_binary() -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes executable"]
-fn approved_shoes_validates_scoped_routing_and_dns_options() {
+#[ignore = "requires the pinned Windows BlazeCore executable"]
+fn approved_blazecore_validates_scoped_routing_and_dns_options() {
     let binary = trusted_binary();
     let temp = FixtureRoot::new();
     let private = private::PrivateDirectory::create(&temp.0).unwrap();
@@ -187,12 +209,12 @@ fn check(binary: &Path, directory: &Path, file: &Path) {
     let mut command = engine_command(binary, directory);
     command.arg("check").arg(file);
     run_bounded(command, &cancellation(), ClientError::EngineInvalid)
-        .expect("pinned Shoes validates rendered fixture");
+        .expect("pinned BlazeCore validates rendered fixture");
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary via VPN_CLIENT_TEST_SHOES_EXE"]
-fn approved_shoes_checks_imported_protocol_and_transport_mappings() {
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
+fn approved_blazecore_checks_imported_protocol_and_transport_mappings() {
     let binary = trusted_binary();
     let key = URL_SAFE_NO_PAD.encode([42; 32]);
     let ss_128 = STANDARD.encode([17; 16]);
@@ -242,7 +264,7 @@ fn approved_shoes_checks_imported_protocol_and_transport_mappings() {
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary via VPN_CLIENT_TEST_SHOES_EXE"]
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
 fn xray_xhttp_modes_carry_exact_loopback_payload() {
     let binary = trusted_binary();
     let root = FixtureRoot::new();
@@ -258,7 +280,7 @@ fn xray_xhttp_modes_carry_exact_loopback_payload() {
             "protocol":{"type":"vless", "user_id":ID}
         }),
     );
-    let mut proxy = ShoesProcess::new(
+    let mut proxy = BlazeCoreProcess::new(
         TrustedEngineSpec {
             source_path: binary,
             expected_sha256: APPROVED_ENGINE_SHA256.into(),
@@ -289,7 +311,72 @@ fn xray_xhttp_modes_carry_exact_loopback_payload() {
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary via VPN_CLIENT_TEST_SHOES_EXE"]
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
+fn imported_xray_xhttp_packet_up_uses_configured_sequence_metadata() {
+    const EXCHANGES: &[EchoExchange] = &[
+        (b"\x00first\xff", b"\xffresponse-one\x00"),
+        (b"second\x00\xff", b"response-two\xff\x00"),
+    ];
+    let binary = trusted_binary();
+    let root = FixtureRoot::new();
+    let directory = private::PrivateDirectory::create(&root.0).unwrap();
+    let mut proxy = BlazeCoreProcess::new(
+        TrustedEngineSpec {
+            source_path: binary.clone(),
+            expected_sha256: APPROVED_ENGINE_SHA256.into(),
+            expected_version: APPROVED_ENGINE_VERSION.into(),
+        },
+        root.0.clone(),
+        0,
+    );
+    for (session, sequence) in [
+        ("header", "query"),
+        ("cookie", "header"),
+        ("query", "cookie"),
+    ] {
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        let metadata = json!({
+            "sessionIDPlacement":session, "sessionIDKey":"blazer-test-session",
+            "seqPlacement":sequence, "seqKey":"blazer-test-sequence",
+        });
+        // The strict packet-up server accepts uploads only with both configured metadata fields.
+        let mut inbound = metadata.clone();
+        inbound["type"] = json!("xhttp");
+        inbound["path"] = json!("/sequence");
+        inbound["host"] = json!(HOST_HEADER);
+        inbound["mode"] = json!("packet-up");
+        inbound["protocol"] = json!({"type":"vless", "user_id":ID});
+        let _server = start_loopback_server(&binary, &directory.0, reservation, inbound);
+        let input = json!({
+            "outbounds":[{
+                "protocol":"vless",
+                "settings":{"vnext":[{"address":"127.0.0.1","port":port,"users":[{"id":ID,"encryption":"none"}]}]},
+                "streamSettings":{
+                    "network":"xhttp",
+                    "xhttpSettings":{"path":"/sequence?fixture=1","host":HOST_HEADER,"mode":"packet-up","extra":metadata}
+                }
+            }]
+        });
+        let profile = SubscriptionNormalizer
+            .normalize(&serde_json::to_vec(&input).unwrap())
+            .expect("import Xray XHTTP packet-up profile")
+            .remove(0);
+        proxy
+            .start(ConnectionMode::LocalProxy, &profile, 0, &cancellation())
+            .expect("start imported XHTTP profile");
+        let EngineRuntime::Running(RunningConnection::LocalProxy(local)) = proxy.poll().unwrap()
+        else {
+            panic!("missing XHTTP proxy endpoint for session={session}, sequence={sequence}");
+        };
+        // Waiting for the first response before writing again exercises multiple upload sequences.
+        proxy_echo_exchanges(local, EXCHANGES);
+        proxy.stop().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
 fn xray_vless_encryption_carries_exact_loopback_payload() {
     let binary = trusted_binary();
     encrypted_vless_round_trip(&binary, false, "native", "0rtt");
@@ -329,7 +416,7 @@ fn encrypted_vless_round_trip(binary: &Path, vision: bool, appearance: &str, rtt
         .normalize(&serde_json::to_vec(&outbound).unwrap())
         .unwrap()
         .remove(0);
-    let mut proxy = ShoesProcess::new(
+    let mut proxy = BlazeCoreProcess::new(
         TrustedEngineSpec {
             source_path: binary.to_owned(),
             expected_sha256: APPROVED_ENGINE_SHA256.into(),
@@ -383,7 +470,7 @@ fn generate_vless_pair(
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary via VPN_CLIENT_TEST_SHOES_EXE"]
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
 fn sing_box_vmess_websocket_carries_exact_loopback_payload() {
     let binary = trusted_binary();
     let root = FixtureRoot::new();
@@ -403,7 +490,7 @@ fn sing_box_vmess_websocket_carries_exact_loopback_payload() {
         .normalize(&serde_json::to_vec(&input).unwrap())
         .expect("normalize sing-box VMess WebSocket")
         .remove(0);
-    let mut proxy = ShoesProcess::new(
+    let mut proxy = BlazeCoreProcess::new(
         TrustedEngineSpec {
             source_path: binary,
             expected_sha256: APPROVED_ENGINE_SHA256.to_owned(),
@@ -440,12 +527,12 @@ fn start_ws_server(binary: &Path, directory: &Path, reservation: TcpListener) ->
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary via VPN_CLIENT_TEST_SHOES_EXE"]
+#[ignore = "requires the pinned Windows BlazeCore binary via BLAZER_TEST_BLAZECORE_EXE"]
 fn imported_websocket_early_data_reaches_the_peer_before_websocket_frames() {
     let binary = trusted_binary();
     let root = FixtureRoot::new();
     let directory = private::PrivateDirectory::create(&root.0).unwrap();
-    let mut proxy = ShoesProcess::new(
+    let mut proxy = BlazeCoreProcess::new(
         TrustedEngineSpec {
             source_path: binary.clone(),
             expected_sha256: APPROVED_ENGINE_SHA256.into(),
@@ -582,9 +669,15 @@ fn start_loopback_server(
     child
 }
 
+type EchoExchange = (&'static [u8], &'static [u8]);
+
 fn proxy_echo(local: SocketAddr) {
     const REQUEST: &[u8; 8] = b"\x00\x98\xbb\x02\x03\x04\xa3\xff";
     const RESPONSE: &[u8; 8] = b"\xff\xa3\x04\x03\x02\xbb\x98\x00";
+    proxy_echo_exchanges(local, &[(REQUEST, RESPONSE)]);
+}
+
+fn proxy_echo_exchanges(local: SocketAddr, exchanges: &'static [EchoExchange]) {
     let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("own echo target");
     target.set_nonblocking(true).unwrap();
     let port = target.local_addr().unwrap().port().to_be_bytes();
@@ -595,10 +688,12 @@ fn proxy_echo(local: SocketAddr) {
                 Ok((mut peer, _)) => {
                     peer.set_nonblocking(false).unwrap();
                     tune_stream(&peer);
-                    let mut request = [0u8; REQUEST.len()];
-                    peer.read_exact(&mut request).unwrap();
-                    assert_eq!(&request, REQUEST);
-                    peer.write_all(RESPONSE).unwrap();
+                    for &(request, response) in exchanges {
+                        let mut received = vec![0; request.len()];
+                        peer.read_exact(&mut received).unwrap();
+                        assert_eq!(received, request);
+                        peer.write_all(response).unwrap();
+                    }
                     break;
                 }
                 Err(error)
@@ -622,10 +717,12 @@ fn proxy_echo(local: SocketAddr) {
     let mut reply = [0; 10];
     proxy.read_exact(&mut reply).unwrap();
     assert_eq!(&reply[..4], &[5, 0, 0, 1]);
-    proxy.write_all(REQUEST).unwrap();
-    let mut response = [0; RESPONSE.len()];
-    proxy.read_exact(&mut response).unwrap();
-    assert_eq!(&response, RESPONSE);
+    for &(request, response) in exchanges {
+        proxy.write_all(request).unwrap();
+        let mut received = vec![0; response.len()];
+        proxy.read_exact(&mut received).unwrap();
+        assert_eq!(received, response);
+    }
     echo.join().unwrap();
 }
 

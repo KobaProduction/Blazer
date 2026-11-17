@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $buildTarget = 'x86_64-pc-windows-msvc'
-$workspaceChecks = @('--workspace', '--features', 'vpn-client/demo', '--locked', '--target', $buildTarget)
+$workspaceChecks = @('--workspace', '--features', 'blazer/demo', '--locked', '--target', $buildTarget)
 
 function Invoke-CargoGate {
     param([string[]]$CargoArguments)
@@ -33,7 +33,7 @@ try {
         Invoke-CargoGate (@('test') + $workspaceChecks)
     }
     if ($Stage -in @('All', 'Build')) {
-        Invoke-CargoGate @('build', '--release', '--locked', '--target', $buildTarget, '-p', 'vpn-client', '-p', 'vpn-headless')
+        Invoke-CargoGate @('build', '--release', '--locked', '--target', $buildTarget, '-p', 'blazer')
     }
 }
 finally {

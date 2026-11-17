@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use uuid::{Uuid, Variant, Version};
-use vpn_domain::client::WebSocketEarlyData;
 use vpn_domain::client::{ClientError, ProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport};
+use vpn_domain::client::{WebSocketEarlyData, XhttpMetadata, XhttpPacketOptions, XhttpPlacement};
 use vpn_domain::routing::RoutingProfile;
 
 use super::{routing, vless_encryption};
@@ -73,6 +73,7 @@ fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
             server_name,
             allow_insecure,
             alpn,
+            ..
         } => {
             let mut wrapper = json!({
                 "type":"tls","sni_hostname":server_name,"verify":!allow_insecure,
@@ -80,6 +81,10 @@ fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
             });
             if !alpn.is_empty() {
                 wrapper["alpn_protocols"] = json!(alpn.as_slice());
+            } else if profile.security.fingerprint().is_some()
+                && matches!(profile.transport, ProxyTransport::WebSocket { .. })
+            {
+                wrapper["alpn_protocols"] = json!(["http/1.1"]);
             }
             wrapper
         }
@@ -87,11 +92,15 @@ fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
             server_name,
             public_key,
             short_id,
+            ..
         } => json!({
             "type":"reality","sni_hostname":server_name,"public_key":public_key,
             "short_id":short_id,"vision":vision,"protocol":protocol
         }),
     };
+    if let Some(fingerprint) = profile.security.fingerprint() {
+        protocol["fingerprint"] = json!(fingerprint.name());
+    }
     Ok(json!({"address":address, "protocol":protocol}))
 }
 
@@ -101,6 +110,9 @@ fn quic_chain(
     protocol: Value,
     fingerprint: Option<&str>,
 ) -> Result<Value, ClientError> {
+    if profile.security.fingerprint().is_some() {
+        return Err(ClientError::UnsupportedFeature);
+    }
     let ProxySecurity::Tls {
         server_name,
         allow_insecure,
@@ -139,10 +151,62 @@ fn wrap_transport(profile: &ProxyProfile) -> Value {
             }
             wrapper
         }
-        ProxyTransport::Xhttp { path, host, mode } => json!({
-            "type":"xhttp","path":path,"mode":mode.name(),"protocol":protocol,
-            "host":host.clone().unwrap_or_else(|| xhttp_authority(profile))
-        }),
+        ProxyTransport::Xhttp {
+            path,
+            host,
+            mode,
+            metadata,
+            packet,
+        } => {
+            let mut wrapper = json!({
+                "type":"xhttp","path":path,"mode":mode.name(),"protocol":protocol,
+                "host":host.clone().unwrap_or_else(|| xhttp_authority(profile))
+            });
+            write_xhttp_metadata(&mut wrapper, metadata);
+            write_xhttp_packet(&mut wrapper, packet);
+            wrapper
+        }
+    }
+}
+
+fn write_xhttp_metadata(wrapper: &mut Value, metadata: &XhttpMetadata) {
+    let fields = [
+        (
+            "session_id_placement",
+            "session_id_key",
+            metadata.session_id_placement,
+            &metadata.session_id_key,
+        ),
+        (
+            "seq_placement",
+            "seq_key",
+            metadata.seq_placement,
+            &metadata.seq_key,
+        ),
+    ];
+    for (placement_field, key_field, placement, key) in fields {
+        if placement != XhttpPlacement::Path {
+            wrapper[placement_field] = json!(placement.name());
+            if let Some(key) = key {
+                wrapper[key_field] = json!(key);
+            }
+        }
+    }
+}
+
+fn write_xhttp_packet(wrapper: &mut Value, packet: &XhttpPacketOptions) {
+    for (field, range) in [
+        ("sc_max_each_post_bytes", packet.max_post_bytes),
+        ("sc_min_posts_interval_ms", packet.min_post_interval_ms),
+    ] {
+        if let Some(range) = range {
+            let (min, max) = range.bounds();
+            wrapper[field] = if min == max {
+                json!(min)
+            } else {
+                json!(format!("{min}-{max}"))
+            };
+        }
     }
 }
 
@@ -208,7 +272,8 @@ pub(crate) fn validate(profile: &ProxyProfile) -> Result<(), ClientError> {
     {
         return Err(ClientError::UnsupportedFeature);
     }
-    if let ProxyTransport::Xhttp { .. } = profile.transport {
+    if let ProxyTransport::Xhttp { metadata, .. } = &profile.transport {
+        metadata.validate()?;
         validate_xhttp(profile)?;
     }
     Ok(())
@@ -514,6 +579,32 @@ mod tests {
                 .remove(0);
             assert_eq!(validate(&profile), expected, "{path}, {max}, {header:?}");
         }
+    }
+
+    #[test]
+    fn xhttp_renders_nondefault_metadata_as_blazecore_options() {
+        let input = json!({
+            "type":"vless","server":"localhost","server_port":7443,
+            "uuid":"fa9c41b7-fc31-4ab0-a275-1c67aa9aab31",
+            "transport":{"type":"xhttp","mode":"packet-up","path":"/api",
+                "session_placement":"cookie","seq_placement":"header","seq_key":"X-Packet",
+                "sc_max_each_post_bytes":"128000-256000","sc_min_posts_interval_ms":5,
+                "uplink_http_method":"POST"}
+        });
+        let profile = SubscriptionNormalizer
+            .normalize(input.to_string().as_bytes())
+            .unwrap()
+            .remove(0);
+        let protocol = &client_chain(&profile).unwrap()["protocol"];
+        assert_eq!(protocol["session_id_placement"], "cookie");
+        assert!(protocol.get("session_id_key").is_none());
+        assert_eq!(protocol["seq_placement"], "header");
+        assert_eq!(protocol["seq_key"], "X-Packet");
+        assert_eq!(protocol["path"], "/api");
+        assert_eq!(protocol["sc_max_each_post_bytes"], "128000-256000");
+        assert_eq!(protocol["sc_min_posts_interval_ms"], 5);
+        assert!(protocol.get("uplink_http_method").is_none());
+        assert!(protocol.get("seqPlacement").is_none());
     }
 
     #[test]

@@ -10,7 +10,10 @@ use super::{
 use crate::provider::{
     FetchOutcome, check_security, fetch_update, record_success, resolve_pending, stage_provider,
 };
-use vpn_domain::client::{ProxyTransport, Secret, TcpProbeEndpoint, preserve_profile_uuids};
+use vpn_domain::client::{
+    ProxyTransport, Secret, TcpProbeEndpoint, preserve_profile_uuids,
+    validate_subscription_user_agent,
+};
 use vpn_domain::provider::{ProviderChangeKind, ProviderState};
 
 struct SubscriptionUpdate {
@@ -230,13 +233,8 @@ impl ClientApplication {
     ) -> Result<SubscriptionUpdate, ClientError> {
         let source = self.services.source.as_ref();
         let primary = source.endpoint(url)?;
-        let (outcome, used_fallback) = fetch_update(
-            source,
-            &primary,
-            &state,
-            self.catalog.settings.send_subscription_hwid,
-            cancel,
-        )?;
+        let (outcome, used_fallback) =
+            fetch_update(source, &primary, &state, &self.catalog.settings, cancel)?;
         let (document, version) = match outcome {
             FetchOutcome::Modified { document, version } => (document, version),
             FetchOutcome::Unchanged { retain_version } => {
@@ -290,6 +288,9 @@ impl ClientApplication {
                 Ok(()) => entries.profiles.push(profile),
                 Err(error) => {
                     let reason = match error {
+                        ClientError::UnsupportedXhttpUploadMethod => {
+                            ProfileUnavailableReason::UnsupportedXhttpUploadMethod
+                        }
                         ClientError::UnsupportedFeature
                         | ClientError::UnsupportedFormat
                         | ClientError::UnsupportedMode => ProfileUnavailableReason::Unsupported,
@@ -345,9 +346,23 @@ impl ClientApplication {
         }
         let mut candidate = self.catalog.clone();
         candidate.settings.send_subscription_hwid = enabled;
-        for subscription in &mut candidate.subscriptions {
-            subscription.provider.cached_version = None;
+        clear_subscription_validators(&mut candidate);
+        self.commit(candidate)
+    }
+
+    pub fn set_subscription_user_agent(
+        &mut self,
+        value: Option<Secret>,
+    ) -> Result<(), ClientError> {
+        if let Some(value) = &value {
+            validate_subscription_user_agent(value.expose())?;
         }
+        if self.catalog.settings.subscription_user_agent == value {
+            return Ok(());
+        }
+        let mut candidate = self.catalog.clone();
+        candidate.settings.subscription_user_agent = value;
+        clear_subscription_validators(&mut candidate);
         self.commit(candidate)
     }
 
@@ -418,6 +433,12 @@ impl ClientApplication {
         } else {
             Ok(())
         }
+    }
+}
+
+fn clear_subscription_validators(catalog: &mut Catalog) {
+    for subscription in &mut catalog.subscriptions {
+        subscription.provider.cached_version = None;
     }
 }
 

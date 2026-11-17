@@ -5,8 +5,21 @@ use std::fmt;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
+mod xhttp;
+pub use xhttp::{XhttpMetadata, XhttpPacketOptions, XhttpPacketRange, XhttpPlacement};
+
 pub const MAX_PROFILES: usize = 256;
 pub const MAX_SUBSCRIPTIONS: usize = 64;
+pub const MAX_SUBSCRIPTION_USER_AGENT_BYTES: usize = 512;
+pub const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = match option_env!("BLAZER_RELEASE_USER_AGENT") {
+    Some(agent) => agent,
+    None => concat!(
+        "Blazer/",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        ".",
+        env!("CARGO_PKG_VERSION_MINOR")
+    ),
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(Arc<str>);
@@ -47,6 +60,7 @@ pub enum ClientError {
     InvalidInput,
     UnsupportedFormat,
     UnsupportedFeature,
+    UnsupportedXhttpUploadMethod,
     PayloadTooLarge,
     InvalidUrl,
     Network,
@@ -173,6 +187,8 @@ pub enum ProxyTransport {
         path: String,
         host: Option<String>,
         mode: XhttpMode,
+        metadata: XhttpMetadata,
+        packet: XhttpPacketOptions,
     },
     Quic {
         certificate_sha256: Option<String>,
@@ -225,12 +241,47 @@ pub enum ProxySecurity {
         server_name: String,
         allow_insecure: bool,
         alpn: AlpnProtocols,
+        fingerprint: Option<TlsFingerprint>,
     },
     Reality {
         server_name: String,
         public_key: String,
         short_id: String,
+        fingerprint: Option<TlsFingerprint>,
     },
+}
+
+impl ProxySecurity {
+    pub fn fingerprint(&self) -> Option<TlsFingerprint> {
+        match self {
+            Self::Tls { fingerprint, .. } | Self::Reality { fingerprint, .. } => *fingerprint,
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsFingerprint {
+    Firefox120,
+    Firefox148,
+}
+
+impl TlsFingerprint {
+    pub fn parse(text: &str) -> Result<Self, ClientError> {
+        match text.to_ascii_lowercase().as_str() {
+            "firefox-120" | "firefox_120" | "hellofirefox_120" => Ok(Self::Firefox120),
+            "firefox" | "firefox-148" | "firefox_148" | "firefox_auto" | "hellofirefox_auto"
+            | "hellofirefox_148" => Ok(Self::Firefox148),
+            _ => Err(ClientError::UnsupportedFeature),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Firefox120 => "firefox-120",
+            Self::Firefox148 => "firefox-148",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -295,7 +346,14 @@ pub struct CatalogProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileUnavailableReason {
     Unsupported,
+    UnsupportedXhttpUploadMethod,
     Invalid,
+}
+
+impl ProfileUnavailableReason {
+    pub fn supports_tcp_probe(self) -> bool {
+        matches!(self, Self::Unsupported | Self::UnsupportedXhttpUploadMethod)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,7 +422,7 @@ impl UnavailableProfile {
     }
 
     pub fn with_probe_endpoint(mut self, endpoint: Option<TcpProbeEndpoint>) -> Self {
-        if self.reason == ProfileUnavailableReason::Unsupported {
+        if self.reason.supports_tcp_probe() {
             self.probe_endpoint = endpoint;
         }
         self
@@ -393,9 +451,7 @@ impl UnavailableProfile {
         match (&self.probe_id, &self.probe_endpoint) {
             (None, None) => Ok(()),
             (Some(uuid), Some(_))
-                if self.reason == ProfileUnavailableReason::Unsupported
-                    && !uuid.is_empty()
-                    && uuid.len() <= 64 =>
+                if self.reason.supports_tcp_probe() && !uuid.is_empty() && uuid.len() <= 64 =>
             {
                 Ok(())
             }
@@ -509,7 +565,21 @@ pub struct ClientSettings {
     pub local_proxy_port: u16,
     pub connection_mode: ConnectionMode,
     pub send_subscription_hwid: bool,
+    pub subscription_user_agent: Option<Secret>,
     pub telemetry: TelemetrySettings,
+}
+
+pub fn validate_subscription_user_agent(value: &str) -> Result<(), ClientError> {
+    if value.len() > MAX_SUBSCRIPTION_USER_AGENT_BYTES {
+        return Err(ClientError::PayloadTooLarge);
+    }
+    if value.is_empty()
+        || value.trim() != value
+        || !value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+    {
+        return Err(ClientError::InvalidInput);
+    }
+    Ok(())
 }
 
 impl Default for ClientSettings {
@@ -519,6 +589,7 @@ impl Default for ClientSettings {
             local_proxy_port: 0,
             connection_mode: ConnectionMode::LocalProxy,
             send_subscription_hwid: true,
+            subscription_user_agent: None,
             telemetry: TelemetrySettings::default(),
         }
     }
@@ -544,6 +615,9 @@ impl Catalog {
             for profile in &subscription.unavailable_profiles {
                 profile.validate()?;
             }
+        }
+        if let Some(user_agent) = &self.settings.subscription_user_agent {
+            validate_subscription_user_agent(user_agent.expose())?;
         }
         self.settings.telemetry.validate()?;
         self.routing.validate(&self.subscriptions)

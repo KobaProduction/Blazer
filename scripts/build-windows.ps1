@@ -1,18 +1,21 @@
 #Requires -Version 7.0
 param(
-    [ValidateSet('Client', 'Demo', 'Both')]
-    [string]$Variant = 'Both',
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Debug',
     [string]$OutputDirectory,
-    [string]$ShoesPath,
-    [string]$ShoesLicensePath,
-    [string]$WintunLicensePath
+    [string]$BlazeCorePath,
+    [string]$BlazeCoreLicensePath,
+    [string]$WintunLicensePath,
+    [switch]$ReleaseArchive,
+    [switch]$PreviewArchive
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'release-version.ps1')
 $wintunLicenseSha256 = '183ADAC21E7D96C508C8FD34D394B7B6708BC81564AD1BAD61AB66143A008CD2'
+if (($ReleaseArchive -or $PreviewArchive) -and $Configuration -ne 'Release') { throw 'Release archives require -Configuration Release.' }
+if ($ReleaseArchive -and $PreviewArchive) { throw 'Select one archive channel.' }
 
 function Assert-PackageDirectory {
     param([string]$Directory)
@@ -46,11 +49,16 @@ function Publish-Package {
     Assert-PackageDirectory $Directory
     [IO.Directory]::CreateDirectory($output) | Out-Null
     $artifacts = foreach ($file in $Files) {
+        $destination = Join-Path $Directory $file.Name
+        $parent = Split-Path -Parent $destination
+        Assert-PackageDirectory $parent
+        $temporaryName = $file['TemporaryName'] ?? $file.Name
         [pscustomobject]@{
             Source = $file.Source
             ExpectedSha256 = $file['ExpectedSha256']
-            Destination = Join-Path $Directory $file.Name
-            Temporary = Join-Path $output ".blazer-$Name-$($file.Name).tmp"
+            Parent = $parent
+            Destination = $destination
+            Temporary = Join-Path $output ".blazer-$Name-$temporaryName.tmp"
         }
     }
     try {
@@ -70,13 +78,39 @@ function Publish-Package {
             }
             $artifact
         }
-        [IO.Directory]::CreateDirectory($Directory) | Out-Null
         foreach ($artifact in $staged) {
+            [IO.Directory]::CreateDirectory($artifact.Parent) | Out-Null
             [IO.File]::Move($artifact.Temporary, $artifact.Destination, $true)
         }
     } finally {
         foreach ($artifact in $artifacts) {
             [IO.File]::Delete($artifact.Temporary)
+        }
+    }
+}
+
+function Get-EngineNoticeFiles {
+    param([string]$EngineLicense)
+
+    $source = Split-Path -Parent $EngineLicense
+    $notice = Join-Path $source 'THIRD_PARTY_NOTICES.md'
+    if (Test-Path -LiteralPath $notice -PathType Leaf) {
+        @{ Name = 'THIRD_PARTY_NOTICES.md'; Source = $notice }
+    }
+
+    $licenses = Join-Path $source 'licenses'
+    if (-not (Test-Path -LiteralPath $licenses -PathType Container)) { return }
+    Assert-PackageDirectory $licenses
+    $index = 0
+    foreach ($license in (Get-ChildItem -LiteralPath $licenses -Force | Sort-Object Name)) {
+        if ($license.PSIsContainer -or ($license.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Expected a regular file in the BlazeCore license bundle: '$($license.FullName)'."
+        }
+        $index++
+        @{
+            Name = "licenses/$($license.Name)"
+            Source = $license.FullName
+            TemporaryName = "license-bundle-$index"
         }
     }
 }
@@ -116,97 +150,164 @@ function Resolve-WintunLicense {
 }
 
 function Build-Package {
-    param(
-        [string]$Name,
-        [string]$Binary,
-        [string[]]$Features = @(),
-        [string]$Engine,
-        [string]$EngineLicense,
-        [string]$EngineSha256,
-        [string]$DriverSha256
-    )
-
-    & cargo build --locked --target $target --target-dir $targetDirectory -p vpn-client --bin $Binary @profileArguments @Features
-    if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for $Binary (exit $LASTEXITCODE)." }
-
-    if ($Engine) {
-        $driver = Join-Path $buildDirectory 'wintun.dll'
-        if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
-            throw "The client build did not provide a Wintun DLL at '$driver'."
-        }
-        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $driver).Hash -ne $DriverSha256) {
-            throw "Wintun SHA-256 does not match APPROVED_WINTUN_SHA256: '$driver'."
-        }
-        $driverLicense = Resolve-WintunLicense
+    $previousVersion = $env:BLAZER_RELEASE_VERSION
+    $previousUserAgent = $env:BLAZER_RELEASE_USER_AGENT
+    $previousPreview = $env:BLAZER_PREVIEW_BUILD
+    try {
+        $env:BLAZER_RELEASE_VERSION = $releaseVersion
+        $env:BLAZER_RELEASE_USER_AGENT = if ($releaseVersion) { "Blazer/$releaseVersion" } else { $null }
+        $env:BLAZER_PREVIEW_BUILD = if ($PreviewArchive) { '1' } else { $null }
+        & cargo build --locked --target $target --target-dir $targetDirectory -p blazer --bin blazer @profileArguments
+        if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for Blazer (exit $LASTEXITCODE)." }
+    } finally {
+        $env:BLAZER_RELEASE_VERSION = $previousVersion
+        $env:BLAZER_RELEASE_USER_AGENT = $previousUserAgent
+        $env:BLAZER_PREVIEW_BUILD = $previousPreview
     }
 
-    $directory = Join-Path $output $Name
+    $driver = Join-Path $buildDirectory 'wintun.dll'
+    if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
+        throw "The client build did not provide a Wintun DLL at '$driver'."
+    }
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $driver).Hash -ne $driverSha256) {
+        throw "Wintun SHA-256 does not match APPROVED_WINTUN_SHA256: '$driver'."
+    }
+    $driverLicense = Resolve-WintunLicense
+
+    $directory = Join-Path $output 'client'
     $files = @(
         @{ Name = 'LICENSE'; Source = Join-Path $repo 'LICENSE' }
-        @{ Name = 'LICENSE-NOTO-EMOJI'; Source = Join-Path $repo 'src/presentation/desktop/assets/LICENSE-NOTO-EMOJI.txt' }
+        @{ Name = 'LICENSE-NOTO-EMOJI'; Source = Join-Path $repo 'src/presentation/client-ui/assets/LICENSE-NOTO-EMOJI.txt' }
+        @{ Name = 'LICENSE-BLAZECORE'; Source = $BlazeCoreLicensePath }
+        @{ Name = 'blazecore.exe'; Source = $BlazeCorePath; ExpectedSha256 = $engineSha256 }
+        @{ Name = 'wintun.dll'; Source = $driver; ExpectedSha256 = $driverSha256 }
+        @{ Name = 'LICENSE-WINTUN'; Source = $driverLicense; ExpectedSha256 = $wintunLicenseSha256 }
     )
-    if ($Engine) {
-        $files += @(
-            @{ Name = 'LICENSE-SHOES'; Source = $EngineLicense }
-            @{ Name = 'shoes.exe'; Source = $Engine; ExpectedSha256 = $EngineSha256 }
-            @{ Name = 'wintun.dll'; Source = $driver; ExpectedSha256 = $DriverSha256 }
-            @{ Name = 'LICENSE-WINTUN'; Source = $driverLicense; ExpectedSha256 = $wintunLicenseSha256 }
-        )
-    }
-    $executable = Join-Path $directory "$Binary.exe"
+    $files += @(Get-EngineNoticeFiles $BlazeCoreLicensePath)
+    $executable = Join-Path $directory 'blazer.exe'
     Assert-PackageDirectory $directory
     Assert-PackageFileReplaceable $executable
-    $app = @{ Name = "$Binary.exe"; Source = Join-Path $buildDirectory "$Binary.exe" }
+    $app = @{ Name = 'blazer.exe'; Source = Join-Path $buildDirectory 'blazer.exe' }
     # For an existing package, replace the executable first so a late launch blocks publication.
     # A fresh package becomes launchable only after its companion files are installed.
     $files = if ([IO.File]::Exists($executable)) { @($app) + $files } else { $files + @($app) }
-    Publish-Package $Name $directory $files
-    Write-Output $executable
+    $marker = $null
+    try {
+        if ($ReleaseArchive -or $PreviewArchive) {
+            Assert-PackageDirectory $output
+            [IO.Directory]::CreateDirectory($output) | Out-Null
+            $marker = Join-Path $output ".blazer-package-$([Guid]::NewGuid().ToString('N')).tmp"
+            $versionInfo = (Get-Item -LiteralPath $app.Source).VersionInfo.ProductVersion
+            if ($versionInfo -cne $releaseVersion) { throw 'The Windows executable version does not match the Git tag.' }
+            $channel = if ($PreviewArchive) { 'preview' } else { 'stable' }
+            $manifest = @{ version = $releaseVersion; target = 'windows-x86_64'; channel = $channel } | ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($marker, $manifest)
+            $files += @{ Name = 'blazer-package.json'; Source = $marker }
+        }
+        Publish-Package 'client' $directory $files
+        Write-Output $executable
+        if ($ReleaseArchive -or $PreviewArchive) { Write-ReleaseArchive $directory $files }
+    } finally {
+        if ($marker) { [IO.File]::Delete($marker) }
+    }
+}
+
+function Write-ReleaseArchive {
+    param([string]$Directory, [hashtable[]]$Files)
+
+    $version = (Get-Item -LiteralPath (Join-Path $Directory 'blazer.exe')).VersionInfo.ProductVersion
+    if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "Invalid X.Y version in the Blazer executable: '$version'."
+    }
+    $name = if ($PreviewArchive) { 'Blazer-preview-windows-x86_64.zip' } else { "Blazer-$version-windows-x86_64.zip" }
+    $destination = Join-Path $output $name
+    Assert-PackageFileReplaceable $destination
+    $temporary = Join-Path $output ".blazer-release-$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $archive = [IO.Compression.ZipFile]::Open($temporary, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in $Files) {
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive, (Join-Path $Directory $file.Name), $file.Name,
+                    [IO.Compression.CompressionLevel]::Optimal
+                )
+            }
+        } finally {
+            $archive.Dispose()
+        }
+        [IO.File]::Move($temporary, $destination, $true)
+        Get-FileHash -Algorithm SHA256 -LiteralPath $destination
+    } finally {
+        [IO.File]::Delete($temporary)
+    }
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
+$releaseVersion = if ($ReleaseArchive) { Get-ReleaseVersion $repo }
+    elseif ($PreviewArchive) { Get-WorkspaceAppVersion $repo 'blazer' }
+    else { $null }
 $target = 'x86_64-pc-windows-msvc'
 $targetDirectory = Join-Path $repo 'target'
 $targetPlatformDirectory = Join-Path $targetDirectory $target
 $buildDirectory = Join-Path $targetPlatformDirectory $Configuration.ToLowerInvariant()
-$profileArguments = @()
+$profileArguments = @('--features', 'demo')
 if ($Configuration -eq 'Release') { $profileArguments = @('--release') }
 $workingDirectory = (Get-Location).ProviderPath
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo 'dist/windows' }
 $output = [IO.Path]::GetFullPath($OutputDirectory, $workingDirectory)
 
-if ($Variant -ne 'Demo') {
-    if (-not $ShoesPath) { $ShoesPath = Join-Path $targetPlatformDirectory 'release/shoes.exe' }
-    $ShoesPath = [IO.Path]::GetFullPath($ShoesPath, $workingDirectory)
-    if (-not (Test-Path -LiteralPath $ShoesPath -PathType Leaf)) {
-        throw "Approved Shoes executable is missing at '$ShoesPath'. Supply it with -ShoesPath."
-    }
+function Resolve-EnginePackage {
+    $neighbor = Split-Path -Parent $repo
     $engineSource = Join-Path $repo 'src/infrastructure/client_engine'
     $engineSha256 = Get-ApprovedSha256 (Join-Path $engineSource 'mod.rs') 'APPROVED_ENGINE_SHA256'
     $driverSha256 = Get-ApprovedSha256 (Join-Path $engineSource 'windows_tunnel.rs') 'APPROVED_WINTUN_SHA256'
-    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ShoesPath).Hash -ne $engineSha256) {
-        throw "Shoes SHA-256 does not match APPROVED_ENGINE_SHA256: '$ShoesPath'."
-    }
-
-    if (-not $ShoesLicensePath) {
-        $neighbor = Split-Path -Parent $repo
+    if (-not $BlazeCorePath) {
         $candidates = @(
-            (Join-Path $neighbor 'BlazeCore/LICENSE')
-            (Join-Path $neighbor 'shoes/LICENSE')
-            (Join-Path $repo 'dist/windows/client/LICENSE-SHOES')
+            (Join-Path $neighbor "BlazeCore/downstream/artifacts/$target/release/blazecore.exe")
+            (Join-Path $neighbor "BlazeCore/target/$target/debug/blazecore.exe")
+            (Join-Path $targetPlatformDirectory 'release/blazecore.exe')
         )
-        $ShoesLicensePath = $candidates | Where-Object {
-            Test-Path -LiteralPath $_ -PathType Leaf
+        $BlazeCorePath = $candidates | Where-Object {
+            (Test-Path -LiteralPath $_ -PathType Leaf) -and
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash -eq $engineSha256
         } | Select-Object -First 1
-        if (-not $ShoesLicensePath) {
-            throw 'Shoes LICENSE is missing. Supply it with -ShoesLicensePath.'
+        if (-not $BlazeCorePath) {
+            throw 'No SHA-256-pinned BlazeCore executable was found. Supply it with -BlazeCorePath.'
         }
     }
-    $ShoesLicensePath = [IO.Path]::GetFullPath($ShoesLicensePath, $workingDirectory)
-    if (-not (Test-Path -LiteralPath $ShoesLicensePath -PathType Leaf)) {
-        throw "Shoes LICENSE is missing at '$ShoesLicensePath'. Supply it with -ShoesLicensePath."
+    $BlazeCorePath = [IO.Path]::GetFullPath($BlazeCorePath, $workingDirectory)
+    if (-not (Test-Path -LiteralPath $BlazeCorePath -PathType Leaf)) {
+        throw "Approved BlazeCore executable is missing at '$BlazeCorePath'. Supply it with -BlazeCorePath."
     }
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $BlazeCorePath).Hash -ne $engineSha256) {
+        throw "BlazeCore SHA-256 does not match APPROVED_ENGINE_SHA256: '$BlazeCorePath'."
+    }
+
+    if (-not $BlazeCoreLicensePath) {
+        $candidates = @(
+            (Join-Path (Split-Path -Parent $BlazeCorePath) 'LICENSE')
+            (Join-Path $neighbor 'BlazeCore/LICENSE')
+            (Join-Path $repo 'dist/windows/client/LICENSE-BLAZECORE')
+        )
+        $BlazeCoreLicensePath = $candidates | Where-Object {
+            Test-Path -LiteralPath $_ -PathType Leaf
+        } | Select-Object -First 1
+        if (-not $BlazeCoreLicensePath) {
+            throw 'BlazeCore LICENSE is missing. Supply it with -BlazeCoreLicensePath.'
+        }
+    }
+    $BlazeCoreLicensePath = [IO.Path]::GetFullPath($BlazeCoreLicensePath, $workingDirectory)
+    if (-not (Test-Path -LiteralPath $BlazeCoreLicensePath -PathType Leaf)) {
+        throw "BlazeCore LICENSE is missing at '$BlazeCoreLicensePath'. Supply it with -BlazeCoreLicensePath."
+    }
+    @{ Engine = $BlazeCorePath; License = $BlazeCoreLicensePath; EngineHash = $engineSha256; DriverHash = $driverSha256 }
 }
+
+$enginePackage = Resolve-EnginePackage
+$BlazeCorePath = $enginePackage.Engine
+$BlazeCoreLicensePath = $enginePackage.License
+$engineSha256 = $enginePackage.EngineHash
+$driverSha256 = $enginePackage.DriverHash
 
 $mutex = [Threading.Mutex]::new($false, 'Local\Blazer.WindowsPackage')
 $locked = $false
@@ -218,25 +319,13 @@ try {
     }
     if (-not $locked) { throw 'Another Blazer Windows package build is running. Retry after it finishes.' }
 
-    foreach ($package in @(
-        @{ Name = 'client'; Binary = 'vpn-client.exe'; Selected = $Variant -ne 'Demo' }
-        @{ Name = 'demo'; Binary = 'vpn-client-demo.exe'; Selected = $Variant -ne 'Client' }
-    )) {
-        if ($package.Selected) {
-            $directory = Join-Path $output $package.Name
-            Assert-PackageDirectory $directory
-            Assert-PackageFileReplaceable (Join-Path $directory $package.Binary)
-        }
-    }
+    $directory = Join-Path $output 'client'
+    Assert-PackageDirectory $directory
+    Assert-PackageFileReplaceable (Join-Path $directory 'blazer.exe')
 
     Push-Location -LiteralPath $repo
     try {
-        if ($Variant -ne 'Demo') {
-            Build-Package -Name client -Binary vpn-client -Engine $ShoesPath -EngineLicense $ShoesLicensePath -EngineSha256 $engineSha256 -DriverSha256 $driverSha256
-        }
-        if ($Variant -ne 'Client') {
-            Build-Package -Name demo -Binary vpn-client-demo -Features @('--no-default-features', '--features', 'demo')
-        }
+        Build-Package
     } finally {
         Pop-Location
     }

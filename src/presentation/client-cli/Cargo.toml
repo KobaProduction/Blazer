@@ -1,0 +1,16 @@
+[package]
+name = "client-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "client_cli.rs"
+
+[dependencies]
+client-core.workspace = true
+
+[lints]
+workspace = true

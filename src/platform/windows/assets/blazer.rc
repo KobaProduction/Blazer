@@ -1,0 +1,26 @@
+#include "blazer-version.h"
+
+1 ICON "blazer.ico"
+
+1 VERSIONINFO
+ FILEVERSION BLAZER_FILE_VERSION
+ PRODUCTVERSION BLAZER_FILE_VERSION
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Blazer"
+            VALUE "FileVersion", BLAZER_VERSION
+            VALUE "OriginalFilename", "blazer.exe"
+            VALUE "ProductName", "Blazer"
+            VALUE "ProductVersion", BLAZER_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -6,12 +6,20 @@ param(
     [string]$BuildToolsVersion = '35.0.1',
     [ValidateSet('x86_64', 'arm64-v8a')]
     [string[]]$Abi = @('x86_64', 'arm64-v8a'),
-    [string]$ShoesLibraries,
-    [string]$OutputPath = 'target/android/vpn-client-debug.apk'
+    [string]$BlazeCoreLibraries,
+    [switch]$TaggedVersion,
+    [ValidateSet('Development', 'Direct')]
+    [string]$Distribution = 'Development',
+    [ValidateRange(1, 2100000000)]
+    [int]$VersionCode,
+    [string]$SigningKeyStore,
+    [string]$SigningKeyAlias,
+    [string]$OutputPath = 'target/android/blazer-debug.apk'
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'release-version.ps1')
 
 function Invoke-Step {
     param([string]$Executable, [string[]]$Arguments)
@@ -59,7 +67,7 @@ function Remove-BuildStage {
     $stageDirectory = Get-Item -LiteralPath $Path -Force
     if (-not $stageDirectory.PSIsContainer -or
         $stageDirectory.Parent.FullName -ne $parentDirectory -or
-        $stageDirectory.Name -notmatch '^(package-|\.vpn-client-sign-)[0-9a-f]{32}$' -or
+        $stageDirectory.Name -notmatch '^(package-|\.blazer-sign-)[0-9a-f]{32}$' -or
         ($stageDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         throw "Refusing to remove a directory outside the current build stage: $Path"
     }
@@ -129,31 +137,69 @@ $d8 = Resolve-Tool (Join-Path $tools 'lib/d8.jar')
 $zipalign = Resolve-Tool (Join-Path $tools 'zipalign.exe')
 $signer = Resolve-Tool (Join-Path $tools 'lib/apksigner.jar')
 $repo = Split-Path -Parent $PSScriptRoot
-$package = Join-Path $repo 'src/presentation/android/packaging'
+$direct = $Distribution -eq 'Direct'
+$releaseVersion = if ($TaggedVersion -or $direct) { Get-ReleaseVersion $repo } else { $null }
+$keyAlias = 'androiddebugkey'
+$signingPasswords = @('--ks-pass', 'pass:android', '--key-pass', 'pass:android')
+if ($direct) {
+    if (-not $SigningKeyStore -or -not $SigningKeyAlias -or -not $env:BLAZER_ANDROID_STORE_PASSWORD) {
+        throw 'Direct APK signing requires SigningKeyStore, SigningKeyAlias and BLAZER_ANDROID_STORE_PASSWORD.'
+    }
+    $SigningKeyStore = (Resolve-Path -LiteralPath $SigningKeyStore).Path
+    $keyAlias = $SigningKeyAlias
+    $keyPassword = if ($env:BLAZER_ANDROID_KEY_PASSWORD) { 'BLAZER_ANDROID_KEY_PASSWORD' } else { 'BLAZER_ANDROID_STORE_PASSWORD' }
+    $signingPasswords = @('--ks-pass', 'env:BLAZER_ANDROID_STORE_PASSWORD', '--key-pass', "env:$keyPassword")
+    if (-not $PSBoundParameters.ContainsKey('OutputPath')) { $OutputPath = "target/android/Blazer-$releaseVersion-android.apk" }
+}
+$package = Join-Path $repo 'src/platform/android/packaging'
 $absOutput = [IO.Path]::GetFullPath($OutputPath, $repo)
 $work = Join-Path $repo 'target/android'
 $outputDirectory = Split-Path -Parent $absOutput
 $targets = @{ 'x86_64' = 'x86_64-linux-android'; 'arm64-v8a' = 'aarch64-linux-android' }
 $manifest = Join-Path $package 'AndroidManifest.xml'
-$keystore = Join-Path $work 'local-debug.keystore'
+$keystore = if ($direct) { $SigningKeyStore } else { Join-Path $work 'local-debug.keystore' }
 if ($absOutput -eq $keystore) { throw 'The APK output cannot replace the debug keystore.' }
-$shoesHashes = $null
-if ($ShoesLibraries) {
-    $ShoesLibraries = (Resolve-Path -LiteralPath $ShoesLibraries).Path
-    $provenance = Get-Content -Raw -LiteralPath (Join-Path $ShoesLibraries 'manifest.json') | ConvertFrom-Json -AsHashtable
+$blazeCoreHashes = $null
+if ($BlazeCoreLibraries) {
+    $BlazeCoreLibraries = (Resolve-Path -LiteralPath $BlazeCoreLibraries).Path
+    $provenance = Get-Content -Raw -LiteralPath (Join-Path $BlazeCoreLibraries 'manifest.json') | ConvertFrom-Json -AsHashtable
     if ($provenance['revision'] -ne 'cce97a2c4c1c3bd0a07807f37a7caf3876c79110' -or $provenance['version'] -ne '0.3.7') {
-        throw 'The Android Shoes bundle does not target the approved revision and version.'
+        throw 'The Android BlazeCore bundle does not target the approved revision and version.'
     }
-    $shoesHashes = $provenance['sha256']
-    if (-not $shoesHashes) { throw 'Missing Android Shoes bundle digests.' }
+    $blazeCoreHashes = $provenance['sha256']
+    if (-not $blazeCoreHashes) { throw 'Missing Android BlazeCore bundle digests.' }
 }
 
 $stage = $null
 $signingStage = $null
+$previousVersion = $env:BLAZER_RELEASE_VERSION
+$previousUserAgent = $env:BLAZER_RELEASE_USER_AGENT
 Push-Location $repo
 try {
+    $env:BLAZER_RELEASE_VERSION = $releaseVersion
+    $env:BLAZER_RELEASE_USER_AGENT = if ($releaseVersion) { "Blazer/$releaseVersion" } else { $null }
+    $version = $releaseVersion
+    if (-not $version) {
+        $version = Get-WorkspaceAppVersion $repo 'vpn-android'
+    }
+    if ($version -cnotmatch '^(?<major>0|[1-9][0-9]{0,3})\.(?<minor>0|[1-9][0-9]{0,2})$' -or
+        [int]$Matches.major -gt 2099) {
+        throw "Android APK requires a numeric version X.Y (X <= 2099, Y <= 999): '$version'."
+    }
+    $apkVersionCode = if ($VersionCode) { $VersionCode } else { 1 + [int]$Matches.major * 1000000 + [int]$Matches.minor * 1000 }
     New-Item -ItemType Directory -Force -Path $work, $outputDirectory | Out-Null
     $stage = New-BuildStage $work 'package-'
+    $linkVariant = @('--debug-mode')
+    if ($direct) {
+        $applicationManifest = [xml](Get-Content -Raw -LiteralPath $manifest)
+        $namespaces = [System.Xml.XmlNamespaceManager]::new($applicationManifest.NameTable)
+        $namespaces.AddNamespace('android', 'http://schemas.android.com/apk/res/android')
+        $channel = $applicationManifest.SelectSingleNode('/manifest/application/meta-data[@android:name="com.kobaproduction.blazer.update_channel"]', $namespaces)
+        $channel.Attributes['android:value'].Value = 'direct'
+        $manifest = Join-Path $stage 'AndroidManifest.xml'
+        $applicationManifest.Save($manifest)
+        $linkVariant = @()
+    }
     $classes = Join-Path $stage 'classes'
     $generatedSources = Join-Path $stage 'generated'
     New-Item -ItemType Directory -Path $classes, $generatedSources | Out-Null
@@ -173,17 +219,17 @@ try {
         Set-Item -Path "Env:CFLAGS_$envTarget" -Value "--target=${target}26"
 
         Invoke-Step cargo @('build', '--locked', '--release', '-p', 'vpn-android', '--target', $target)
-        $entry = "lib/$platform/libvpn_android.so"
+        $entry = "lib/$platform/libblazer_android.so"
         $destination = Join-Path $stage $entry
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $repo "target/$target/release/libvpn_android.so") -Destination $destination
+        Copy-Item -LiteralPath (Join-Path $repo "target/$target/release/libblazer_android.so") -Destination $destination
         Invoke-Step $strip @('--strip-debug', $destination)
         $apkEntries += $entry
-        if ($shoesHashes) {
-            $engineEntry = "lib/$platform/libshoes.so"
-            $engine = Resolve-Tool (Join-Path $ShoesLibraries "$platform/libshoes.so")
-            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $engine).Hash -ne $shoesHashes[$platform]) {
-                throw "Android Shoes digest mismatch for $platform."
+        if ($blazeCoreHashes) {
+            $engineEntry = "lib/$platform/libblazecore.so"
+            $engine = Resolve-Tool (Join-Path $BlazeCoreLibraries "$platform/libblazecore.so")
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $engine).Hash -ne $blazeCoreHashes[$platform]) {
+                throw "Android BlazeCore digest mismatch for $platform."
             }
             Copy-Item -LiteralPath $engine -Destination (Join-Path $stage $engineEntry)
             $apkEntries += $engineEntry
@@ -191,8 +237,9 @@ try {
     }
 
     Invoke-Step $aapt2 @('compile', '--dir', (Join-Path $package 'res'), '-o', $resources)
-    Invoke-Step $aapt2 @('link', '-I', $androidJar, '--manifest', $manifest, '--debug-mode',
-        '--java', $generatedSources, '-o', $unsigned, $resources)
+    Invoke-Step $aapt2 (@('link', '-I', $androidJar, '--manifest', $manifest) + $linkVariant + @(
+        '--version-name', $version, '--version-code', $apkVersionCode.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '--java', $generatedSources, '-o', $unsigned, $resources))
     $sources = @(Get-ChildItem -LiteralPath (Join-Path $package 'java'), $generatedSources -Recurse -Filter '*.java' -File |
         ForEach-Object { $_.FullName })
     Invoke-Step $javac (@('--release', '17', '-encoding', 'UTF-8', '-classpath', $androidJar, '-d', $classes) + $sources)
@@ -207,7 +254,7 @@ try {
         Pop-Location
     }
     Invoke-Step $zipalign @('-P', '16', '-f', '4', $unsigned, $aligned)
-    if (-not (Test-Path -LiteralPath $keystore -PathType Leaf)) {
+    if (-not $direct -and -not (Test-Path -LiteralPath $keystore -PathType Leaf)) {
         $newKeystore = Join-Path $stage 'local-debug.keystore'
         Invoke-Step $keytool @('-genkeypair', '-keystore', $newKeystore, '-storepass', 'android',
             '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-keysize', '2048',
@@ -221,10 +268,10 @@ try {
     }
 
     # Stage next to the destination so the final move stays on the same volume.
-    $signingStage = New-BuildStage $outputDirectory '.vpn-client-sign-'
+    $signingStage = New-BuildStage $outputDirectory '.blazer-sign-'
     $signed = Join-Path $signingStage 'signed.apk'
-    Invoke-Step $java @('-jar', $signer, 'sign', '--ks', $keystore, '--ks-key-alias', 'androiddebugkey',
-        '--ks-pass', 'pass:android', '--key-pass', 'pass:android', '--out', $signed, $aligned)
+    Invoke-Step $java (@('-jar', $signer, 'sign', '--ks', $keystore, '--ks-key-alias', $keyAlias) +
+        $signingPasswords + @('--out', $signed, $aligned))
     $verify = @('-jar', $signer, 'verify', '--verbose')
     if (Test-Path -LiteralPath "$signed.idsig" -PathType Leaf) {
         $verify += @('--v4-signature-file', "$signed.idsig")
@@ -233,6 +280,8 @@ try {
     Publish-VerifiedApk $signed $absOutput
     Write-Output $absOutput
 } finally {
+    $env:BLAZER_RELEASE_VERSION = $previousVersion
+    $env:BLAZER_RELEASE_USER_AGENT = $previousUserAgent
     Pop-Location
     try {
         Remove-BuildStage $signingStage $outputDirectory

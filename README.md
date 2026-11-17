@@ -1,17 +1,19 @@
 # Blazer
 
-Нативный VPN-клиент на Rust для Windows и Android.
+Нативный VPN-клиент на Rust с общим адаптивным интерфейсом egui.
+Состояние сборок Windows, Android, Linux, macOS и iOS описано в
+[платформенном контракте](docs/platforms.md).
 Репозиторий: [KobaProduction/Blazer](https://github.com/KobaProduction/Blazer).
-Собственный код — [MIT](LICENSE); приватность репозитория сейчас не меняется.
+Собственный код — [MIT](LICENSE).
 
-Цель — клиент с собственным ядром Blaze Core на базе Shoes, низким расходом ресурсов,
+Цель — клиент с собственным ядром BlazeCore, низким расходом ресурсов,
 подписками и знакомым управлением. Полный замысел и критерии:
 [product requirements](docs/product-requirements.md);
 поведение референса и границы паритета: [Happ](docs/reference-behavior.md).
 
 В Windows проверены импорт и обновление подписок, сохранение каталога
-через DPAPI и локальный SOCKS5/HTTP-прокси через Shoes. Через единый backend
-работают GUI и headless. Windows TUN с Wintun доступен для локальной приёмки
+через DPAPI и локальный SOCKS5/HTTP-прокси через BlazeCore. GUI и консольный
+интерфейс используют одно ядро клиента. Windows TUN с Wintun доступен для локальной приёмки
 по явной конфигурации. Системный прокси остаётся недоступным.
 
 ## Установка и запуск
@@ -24,29 +26,29 @@ rustup, Visual Studio Build Tools с Desktop development with C++, MSVC x64
 cd C:\Users\Koba\VPN\Blazer
 rustup toolchain install 1.95.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
 git config --local core.hooksPath .githooks
-cargo run --locked -p vpn-client --bin vpn-client
+cargo run --locked -p blazer --bin blazer
 ```
 
-Для подключения в Windows поместите закреплённый `shoes.exe` рядом с
-`vpn-client.exe`. Перед запуском ядра клиент сверяет его SHA-256.
+Для подключения в Windows поместите закреплённый `blazecore.exe` рядом с
+`blazer.exe`. Перед запуском ядра клиент сверяет его SHA-256.
 
-Откройте корень в RustRover как Cargo workspace. GUI — egui/eframe + Glow;
-JS, Electron и WebView не используются. Headless без GUI dependencies:
+Откройте корень в RustRover как Cargo workspace. GUI использует egui/eframe + Glow.
+Для консольного запуска того же приложения передайте `--cli`:
 
 ```powershell
 cd C:\Users\Koba\VPN\Blazer
-cargo run --locked -p vpn-headless -- status
+cargo run --locked -p blazer -- --cli status
 ```
 
 `status` сообщает состояние и доступность режимов, затем завершает процесс.
 `profiles`, `subscriptions`, `settings` и `diagnostics` читают состояние
-общего backend. `profile select|test|remove <uuid>` работает с каталогом,
+ядра клиента. `profile select|test|remove <uuid>` работает с каталогом,
 `subscription rename <uuid> <название>` меняет имя без скачивания подписки.
 `profiles test` и `subscription test <uuid>` проверяют TCP-доступность
 всего каталога или серверов выбранной подписки.
-Полный список команд показывает `vpn-headless --help`. URL и конфиги
+Полный список команд показывает `blazer --cli --help`. URL и конфиги
 передаются через стандартный ввод до EOF.
-Для локального прокси через проверенный Shoes есть команда `proxy`.
+Для локального прокси через проверенный BlazeCore есть команда `proxy`.
 Профиль маршрутизации для него можно сохранить и назначить из headless.
 
 ```powershell
@@ -54,10 +56,10 @@ cargo run --locked -p vpn-headless -- status
 dns automatic
 block domain blocked.example
 direct cidr 192.0.2.0/24
-'@ | cargo run --locked -p vpn-headless -- routing add "Локальная сеть"
-cargo run --locked -p vpn-headless -- routing
+'@ | cargo run --locked -p blazer -- --cli routing add "Локальная сеть"
+cargo run --locked -p blazer -- --cli routing
 $profileUuid = Read-Host 'UUID профиля из строки routing_profile'
-cargo run --locked -p vpn-headless -- routing assign global $profileUuid enabled
+cargo run --locked -p blazer -- --cli routing assign global $profileUuid enabled
 ```
 
 В последней команде укажите UUID из `routing`. Настройки применяются при
@@ -100,13 +102,20 @@ rustup target add aarch64-linux-android x86_64-linux-android
 pwsh -NoProfile -File scripts/build-android.ps1
 ```
 
-Результат находится в `target/android/vpn-client-debug.apk`. По умолчанию в
-APK входят `arm64-v8a` и `x86_64`. Можно выбрать один ABI через `-Abi`.
+Результат находится в `target/android/blazer-debug.apk`.
+Идентификатор приложения — `com.kobaproduction.blazer`. По умолчанию в APK
+входят `arm64-v8a` и `x86_64`. Можно выбрать один ABI через `-Abi`.
 Скрипт использует локальную debug-подпись. Для установки на тестовый
 эмулятор или подключённое устройство используйте `adb install -r`.
+Для проверки адаптивного интерфейса запустите тот же установленный debug APK
+с параметром запуска:
 
-Для сборки с системным VPN передайте `-ShoesLibraries <папка>`. Папка содержит
-`<ABI>/libshoes.so` из доверенной локальной сборки форка и `manifest.json`
+```powershell
+adb shell am start --activity-single-top -n com.kobaproduction.blazer/.MainActivity --ez com.kobaproduction.blazer.ADAPTIVE_LAYOUT true
+```
+
+Для сборки с системным VPN передайте `-BlazeCoreLibraries <папка>`. Папка содержит
+`<ABI>/libblazecore.so` из доверенной локальной сборки форка и `manifest.json`
 с полями `revision`, `version` и `sha256`. `sha256` содержит SHA-256 для каждого
 ABI. Скрипт сверяет ревизию, версию и дайджесты перед упаковкой. При запуске
 Android дополнительно проверяет версию загруженной библиотеки.
@@ -114,28 +123,41 @@ Android дополнительно проверяет версию загруж�
 
 ## Пакеты Windows
 
-Соберите два отдельных пакета для Windows x64:
+Соберите пакет Blazer для Windows x64:
 
 ```powershell
 cd C:\Users\Koba\VPN\Blazer
-pwsh -NoProfile -File scripts/build-windows.ps1 -Variant Both
+pwsh -NoProfile -File scripts/build-windows.ps1
 ```
 
-| Запускаемый файл | Назначение |
-| --- | --- |
-| `dist/windows/client/vpn-client.exe` | Рабочий клиент с сохранением каталога через DPAPI, загрузкой подписок и подключением через Shoes. |
-| `dist/windows/demo/vpn-client-demo.exe` | Интерактивное демо с тестовыми профилями в памяти и имитацией сетевых действий. Поддерживает [захват PNG](docs/frontend.md#проверки-и-доказанность). |
+Один `dist/windows/client/blazer.exe` запускает окно без параметров и консоль
+через `--cli`. Debug-сборка также поддерживает `--demo` и
+[захват PNG](docs/frontend.md#проверки-и-доказанность).
 
-Для одного пакета выберите `-Variant Client` или `-Variant Demo`.
 По умолчанию скрипт собирает Debug. Для Release передайте
 `-Configuration Release`.
 `-OutputDirectory` меняет общую родительскую папку пакетов.
-Оба пакета содержат `LICENSE`. Для рабочего клиента скрипт берёт закреплённый
-`shoes.exe` из `target/x86_64-pc-windows-msvc/release` или из `-ShoesPath`,
-сверяет SHA-256 и кладёт ядро рядом с клиентом. Для `LICENSE-SHOES` скрипт
-сначала ищет `../BlazeCore/LICENSE`, затем `../shoes/LICENSE` и сохранённую
-копию `dist/windows/client/LICENSE-SHOES`. Параметр `-ShoesLicensePath`
-задаёт явный путь. Для демо достаточно toolchain из раздела установки.
+Пакет содержит `LICENSE`. Скрипт ищет `blazecore.exe` с
+закреплённым SHA-256 в Windows release-пакете или debug-сборке соседнего BlazeCore
+и в `target/x86_64-pc-windows-msvc/release`. Параметр `-BlazeCorePath` задаёт
+явный путь. Скрипт кладёт ядро рядом с клиентом. Лицензии и уведомления
+берутся из поставки ядра. Путь к лицензии можно указать через `-BlazeCoreLicensePath`.
+
+## Версии и обновления
+
+Версию стабильного выпуска задаёт Git-тег `vX.Y`, например `v0.1`. В Windows её показывают `blazer --version`,
+свойства EXE и экран «О программе». Для обычных локальных сборок версия берётся
+из `Cargo.toml`. На Android `-TaggedVersion` берёт версию из тега для отладочного APK,
+`-Distribution Direct` собирает подписанный APK для GitHub. Канал Google Play
+открывает страницу приложения в магазине. iOS использует версию тега и отдельный
+номер сборки, а обновления поставляются через App Store или TestFlight.
+
+`-Configuration Release -ReleaseArchive` собирает Windows ZIP из чистого checkout
+тега для [GitHub Releases](https://github.com/KobaProduction/Blazer/releases).
+Пуш в `main` обновляет единственный [Windows prerelease](https://github.com/KobaProduction/Blazer/releases/tag/preview).
+Стабильный ZIP публикуется по тегу `vX.Y`.
+В Windows проверьте обновления в разделе «О программе», затем скачайте пакет
+и подтвердите установку. [Контракт выпусков](docs/architecture.md#версионирование-и-выпуски)
 
 ## Локальные проверки Windows
 
@@ -148,7 +170,7 @@ Gate проверяет границы слоёв и отсутствие GUI в
 формат, Clippy (сложность максимум 15), компиляцию, тесты и release-build.
 Результаты Cargo находятся в `target/x86_64-pc-windows-msvc/release`.
 Локальный pre-push обязателен.
-По решению владельца CI не используется и его ожидание не входит в разработку.
+GitHub Actions собирает и публикует релизы. Проверки разработки выполняются локально.
 Локальный быстрый цикл и отдельные этапы: [development](docs/development.md).
 
 ## Карта
@@ -158,13 +180,15 @@ Gate проверяет границы слоёв и отсутствие GUI в
 | Домен | `src/domain` |
 | Сценарии и типизированные порты | `src/application` |
 | Внешние адаптеры | `src/infrastructure` |
-| Общий backend, состояние и диагностика | `src/backend` |
+| Ядро клиента, состояние и диагностика | `src/client-core` |
 | Общие контроллеры и модели представления | `src/presentation/shared` |
-| Точки запуска | `src/presentation/desktop`, `src/presentation/android`, `src/presentation/headless` |
+| Общий нативный интерфейс и компоновки | `src/presentation/client-ui` |
+| Платформенные оболочки | `src/platform/{windows,android,linux,macos,ios}` |
+| Консольный интерфейс | `src/presentation/client-cli` |
 
 У проекта один общий каталог `src/`. В каждом пакете `Cargo.toml` явно
-указывает его входной файл. Desktop и headless запускаются из своего
-`main.rs`, Android-библиотека собирается из `src/presentation/android/android.rs`.
+указывает его входной файл. Windows выбирает режим в одном `main.rs`,
+Android-библиотека собирается из `src/platform/android/android.rs`.
 | AI-agent entry map | [AGENTS.md](AGENTS.md) |
 | Архитектура и integration boundaries | [architecture](docs/architecture.md) |
 | Windows и будущие платформы | [platforms](docs/platforms.md) |

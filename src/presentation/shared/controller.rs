@@ -108,6 +108,9 @@ fn backend_command(intent: Intent) -> ClientCommand {
         Intent::ChangeMode(mode) => ClientCommand::SetConnectionMode { mode },
         Intent::SetLocalProxyPort(port) => ClientCommand::SetLocalProxyPort { port },
         Intent::SetSubscriptionHwid(enabled) => ClientCommand::SetSubscriptionHwid { enabled },
+        Intent::SetSubscriptionUserAgent(value) => {
+            ClientCommand::SetSubscriptionUserAgent { value }
+        }
         Intent::SetTelemetrySettings {
             mode,
             endpoint,

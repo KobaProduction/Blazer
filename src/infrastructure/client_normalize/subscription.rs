@@ -51,7 +51,8 @@ impl SubscriptionProfiles {
                 .split_once('#')
                 .filter(|_| protocol.is_some())
                 .and_then(|(_, name)| links::decode_component(name).ok());
-            let endpoint = (reason == ProfileUnavailableReason::Unsupported)
+            let endpoint = reason
+                .supports_tcp_probe()
                 .then(|| links::tcp_probe_endpoint(link))
                 .flatten();
             UnavailableProfile::new(fragment.as_deref().unwrap_or_default(), protocol, reason)
@@ -74,6 +75,9 @@ impl SubscriptionProfiles {
                 let reason = match error {
                     ClientError::UnsupportedFeature | ClientError::UnsupportedFormat => {
                         ProfileUnavailableReason::Unsupported
+                    }
+                    ClientError::UnsupportedXhttpUploadMethod => {
+                        ProfileUnavailableReason::UnsupportedXhttpUploadMethod
                     }
                     ClientError::InvalidSubscription => ProfileUnavailableReason::Invalid,
                     error => return Err(error),

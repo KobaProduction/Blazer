@@ -5,5 +5,8 @@ pub mod client;
 pub mod provider;
 pub mod session;
 pub mod subscription_refresh;
+pub mod updates;
+
+pub use vpn_domain::{APP_PREVIEW, APP_VERSION};
 
 pub const MAX_SUBSCRIPTION_BYTES: usize = 1024 * 1024;

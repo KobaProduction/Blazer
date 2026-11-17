@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use crate::localization::{Key, Locale, text};
 use crate::session::{
     ClientError, ClientSnapshot, ConnectionMode, ConnectionStatus, Language, ModeCapabilities,
-    ProfileSummary, ProfileUnavailableReason, TelemetryBearerChange, TelemetryMode,
+    ProfileSummary, ProfileUnavailableReason, Secret, TelemetryBearerChange, TelemetryMode,
     UnavailableProfile,
 };
 
@@ -21,6 +21,7 @@ pub enum Intent {
     ChangeMode(ConnectionMode),
     SetLocalProxyPort(u16),
     SetSubscriptionHwid(bool),
+    SetSubscriptionUserAgent(Option<Secret>),
     SetTelemetrySettings {
         mode: TelemetryMode,
         endpoint: String,
@@ -87,6 +88,9 @@ pub fn unavailable_profile_reason(
         locale,
         match reason {
             ProfileUnavailableReason::Unsupported => Key::ProfileUnsupported,
+            ProfileUnavailableReason::UnsupportedXhttpUploadMethod => {
+                Key::ProfileUnsupportedXhttpUploadMethod
+            }
             ProfileUnavailableReason::Invalid => Key::ProfileInvalid,
         },
     )
@@ -201,6 +205,7 @@ pub fn error_key(error: ClientError) -> Key {
         ClientError::InvalidInput | ClientError::InvalidUrl => Key::InvalidInput,
         ClientError::UnsupportedFormat | ClientError::InvalidSubscription => Key::ParseFailed,
         ClientError::UnsupportedFeature | ClientError::UnsupportedMode => Key::Unsupported,
+        ClientError::UnsupportedXhttpUploadMethod => Key::ProfileUnsupportedXhttpUploadMethod,
         ClientError::PayloadTooLarge => Key::InputTooLarge,
         ClientError::Network => Key::DownloadFailed,
         ClientError::SubscriptionHttp(_) => Key::SubscriptionHttpFailed,

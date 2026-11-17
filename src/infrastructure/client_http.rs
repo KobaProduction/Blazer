@@ -7,7 +7,7 @@ use std::time::Duration;
 use percent_encoding::percent_decode_str;
 use reqwest::header::{
     CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH, LOCATION,
-    VARY,
+    USER_AGENT, VARY,
 };
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde_json::Value;
@@ -17,7 +17,7 @@ use url::{Host, Url};
 use vpn_application::MAX_SUBSCRIPTION_BYTES;
 use vpn_application::client::{Cancellation, ClientError, SubscriptionSourcePort};
 use vpn_application::provider::{FetchError, FetchOutcome, FetchRequest};
-use vpn_domain::client::{Secret, SubscriptionHttpError};
+use vpn_domain::client::{DEFAULT_SUBSCRIPTION_USER_AGENT, Secret, SubscriptionHttpError};
 use vpn_domain::provider::{MAX_METADATA_VALUE_BYTES, ProviderEndpoint, ProviderMetadata};
 
 use crate::{client_store, provider};
@@ -37,6 +37,23 @@ pub struct HttpSubscriptionSource {
 struct HttpTransport {
     client: Client,
     runtime: Runtime,
+}
+
+struct IdentityHeaders<'a> {
+    device_id: Option<&'a HeaderValue>,
+    user_agent: Option<&'a HeaderValue>,
+}
+
+impl IdentityHeaders<'_> {
+    fn appears_in(&self, detail: &str) -> bool {
+        self.device_id
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| contains_secret(detail, value))
+            || self
+                .user_agent
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| detail.contains(value))
+    }
 }
 
 impl HttpSubscriptionSource {
@@ -88,7 +105,7 @@ impl HttpTransport {
                 .pool_max_idle_per_host(0)
                 .no_proxy()
                 .referer(false)
-                .user_agent("VPN-Client/0.1")
+                .user_agent(DEFAULT_SUBSCRIPTION_USER_AGENT)
                 .build()
                 .map_err(|_| ClientError::Network)?
         };
@@ -100,7 +117,7 @@ impl HttpTransport {
         original_url: &Url,
         follow: bool,
         version: Option<HeaderValue>,
-        device_id: Option<&HeaderValue>,
+        identity: IdentityHeaders<'_>,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> Result<Response, FetchError> {
@@ -111,8 +128,11 @@ impl HttpTransport {
             if let Some(value) = condition {
                 request = request.header(IF_NONE_MATCH, value);
             }
-            if let Some(value) = device_id {
+            if let Some(value) = identity.device_id {
                 request = request.header(DEVICE_ID_HEADER, value);
+            }
+            if let Some(value) = identity.user_agent {
+                request = request.header(USER_AGENT, value);
             }
             let response = tokio::select! {
                 biased;
@@ -139,7 +159,7 @@ impl HttpTransport {
                 response,
                 original_url,
                 condition,
-                device_id,
+                &identity,
                 cancel,
                 deadline,
             )
@@ -189,6 +209,7 @@ impl SubscriptionSourcePort for HttpSubscriptionSource {
         let source = Url::parse(request.endpoint.url.expose())
             .map_err(|_| rejected(ClientError::InvalidUrl))?;
         let version = request.known_version.and_then(condition_header);
+        let user_agent = request.user_agent.map(user_agent_header).transpose()?;
         let mut request_url = source.clone();
         request_url.set_fragment(None);
         let transport = self.transport().map_err(rejected)?;
@@ -197,6 +218,10 @@ impl SubscriptionSourcePort for HttpSubscriptionSource {
         } else {
             None
         };
+        let identity = IdentityHeaders {
+            device_id,
+            user_agent: user_agent.as_ref(),
+        };
         transport.runtime.block_on(async {
             let deadline = Instant::now() + request.timeout;
             let mut response = transport
@@ -204,7 +229,7 @@ impl SubscriptionSourcePort for HttpSubscriptionSource {
                     &request_url,
                     request.follow_same_origin_redirects,
                     version,
-                    device_id,
+                    identity,
                     cancel,
                     deadline,
                 )
@@ -232,6 +257,13 @@ impl SubscriptionSourcePort for HttpSubscriptionSource {
             .map_err(|_| FetchError::Timeout)?
         })
     }
+}
+
+fn user_agent_header(value: &Secret) -> Result<HeaderValue, FetchError> {
+    let mut header =
+        HeaderValue::from_str(value.expose()).map_err(|_| rejected(ClientError::InvalidInput))?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 fn permits_device_id(url: &Url) -> bool {
@@ -280,7 +312,7 @@ async fn response_error(
     mut response: Response,
     original_url: &Url,
     condition: Option<&HeaderValue>,
-    device_id: Option<&HeaderValue>,
+    identity: &IdentityHeaders<'_>,
     cancel: &Cancellation,
     deadline: Instant,
 ) -> Result<SubscriptionHttpError, FetchError> {
@@ -297,9 +329,7 @@ async fn response_error(
             !url_secrets_appear(original_url, detail)
                 && !url_secrets_appear(response.url(), detail)
                 && !condition_secret_appears(condition, detail)
-                && !device_id
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| contains_secret(detail, value))
+                && !identity.appears_in(detail)
         });
     cancel.check().map_err(rejected)?;
     Ok(SubscriptionHttpError::new(

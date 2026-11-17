@@ -56,6 +56,7 @@ fn pinning_a_server_address_preserves_websocket_authority_and_tls_name() {
         server_name: original.host.clone(),
         allow_insecure: false,
         alpn: vpn_domain::client::AlpnProtocols::new(vec!["http/1.1".into()]).unwrap(),
+        fingerprint: None,
     };
     original.transport = ProxyTransport::WebSocket {
         path: "/tunnel".into(),
@@ -191,7 +192,7 @@ fn matching_digest_alone_does_not_trust_an_unsigned_driver() {
 }
 
 #[test]
-#[ignore = "requires a bundled Wintun DLL or signed override via VPN_CLIENT_WINTUN_*; does not activate Wintun"]
+#[ignore = "requires a bundled Wintun DLL or signed override via BLAZER_WINTUN_*; does not activate Wintun"]
 fn configured_wintun_library_passes_staging_and_cleanup() {
     let root = std::env::temp_dir().join(format!("vpn-driver-stage-{}", uuid::Uuid::new_v4()));
     let driver =
@@ -210,7 +211,7 @@ fn configured_wintun_library_passes_staging_and_cleanup() {
 fn wintun_discovery_uses_existing_bundle_unless_an_override_is_present() {
     let root = std::env::temp_dir().join(format!("vpn-wintun-discovery-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
-    let executable = root.join("vpn-client.exe");
+    let executable = root.join("blazer.exe");
     let bundle = root.join("wintun.dll");
     let external = root.join("override.dll");
     let resolve = |path, hash| Driver::resolve(path, hash, Some(&executable));
@@ -244,7 +245,7 @@ fn wintun_discovery_uses_existing_bundle_unless_an_override_is_present() {
 }
 
 #[test]
-#[ignore = "changes Windows routes during a real Wintun session; requires elevation and approved Wintun and Shoes"]
+#[ignore = "changes Windows routes during a real Wintun session; requires elevation and approved Wintun and BlazeCore"]
 fn windows_system_tun_crosses_wintun() {
     let cancellation = cancel();
     require_elevation(&cancellation).expect("Windows TUN needs an elevated process");
@@ -254,7 +255,7 @@ fn windows_system_tun_crosses_wintun() {
     let route_v6_before = selected_route(target_v6.ip(), &cancellation).ok();
     let root = std::env::temp_dir().join(format!("vpn-system-tun-{}", uuid::Uuid::new_v4()));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let mut engine = WindowsEngine::new(fixture_shoes(root.clone()));
+    let mut engine = WindowsEngine::new(fixture_blazecore(root.clone()));
     engine
         .start(
             ConnectionMode::Tun,
@@ -336,7 +337,7 @@ fn exchange_routed_payload(listener: TcpListener, target: SocketAddr, source: Ip
             tokio::join!(echo_connect(&listener, target), client);
         })
         .await
-        .expect("route traffic through Wintun and Shoes before timeout");
+        .expect("route traffic through Wintun and BlazeCore before timeout");
     });
 }
 
@@ -367,17 +368,17 @@ fn exchange_routed_dns(listener: TcpListener) {
             tokio::join!(echo_dns(&listener, dns_proxy_target()), client);
         })
         .await
-        .expect("route UDP DNS through Wintun and Shoes before timeout");
+        .expect("route UDP DNS through Wintun and BlazeCore before timeout");
     });
 }
 
 #[test]
-#[ignore = "requires the pinned VPN_CLIENT_TEST_SHOES_EXE Windows binary"]
-fn packet_bridge_carries_tcp_v4_v6_and_dns_through_real_shoes() {
+#[ignore = "requires the pinned BLAZER_TEST_BLAZECORE_EXE Windows binary"]
+fn packet_bridge_carries_tcp_v4_v6_and_dns_through_real_blazecore() {
     let root = std::env::temp_dir().join(format!("vpn-windows-packets-{}", uuid::Uuid::new_v4()));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let mut shoes = fixture_shoes(root.clone());
-    shoes
+    let mut blazecore = fixture_blazecore(root.clone());
+    blazecore
         .start(
             ConnectionMode::LocalProxy,
             &profile(listener.local_addr().unwrap()),
@@ -385,10 +386,11 @@ fn packet_bridge_carries_tcp_v4_v6_and_dns_through_real_shoes() {
             &cancel(),
         )
         .unwrap();
-    let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = shoes.poll().unwrap() else {
-        panic!("missing real Shoes loopback endpoint");
+    let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = blazecore.poll().unwrap()
+    else {
+        panic!("missing real BlazeCore loopback endpoint");
     };
-    let runtime_files = &shoes.private_directory.as_ref().unwrap().0;
+    let runtime_files = &blazecore.private_directory.as_ref().unwrap().0;
     assert!(!runtime_files.join("profile.yaml").try_exists().unwrap());
     let runtime = Builder::new_multi_thread()
         .worker_threads(1)
@@ -412,14 +414,14 @@ fn packet_bridge_carries_tcp_v4_v6_and_dns_through_real_shoes() {
         .await
         .expect("packet DNS exchange completed before timeout");
     });
-    shoes.stop().unwrap();
+    blazecore.stop().unwrap();
     remove_test_root(root);
 }
 
-fn fixture_shoes(root: PathBuf) -> ShoesProcess {
+fn fixture_blazecore(root: PathBuf) -> BlazeCoreProcess {
     let binary =
-        PathBuf::from(std::env::var_os("VPN_CLIENT_TEST_SHOES_EXE").expect("pinned engine"));
-    ShoesProcess::new(
+        PathBuf::from(std::env::var_os("BLAZER_TEST_BLAZECORE_EXE").expect("pinned engine"));
+    BlazeCoreProcess::new(
         TrustedEngineSpec {
             source_path: binary.canonicalize().unwrap(),
             expected_sha256: APPROVED_ENGINE_SHA256.into(),
@@ -431,11 +433,11 @@ fn fixture_shoes(root: PathBuf) -> ShoesProcess {
 }
 
 #[test]
-#[ignore = "requires the pinned Windows Shoes binary and the isolated local Hysteria2 UDP fixture on port 18474"]
+#[ignore = "requires the pinned Windows BlazeCore binary and the isolated local Hysteria2 UDP fixture on port 18474"]
 fn hysteria2_preserves_udp_datagrams_through_windows_packet_bridge() {
     let pin =
-        std::env::var("VPN_CLIENT_TEST_HYSTERIA2_PIN").expect("local fixture certificate SHA-256");
-    let obfs = if std::env::var_os("VPN_CLIENT_TEST_HYSTERIA2_SALAMANDER").is_some() {
+        std::env::var("BLAZER_TEST_HYSTERIA2_PIN").expect("local fixture certificate SHA-256");
+    let obfs = if std::env::var_os("BLAZER_TEST_HYSTERIA2_SALAMANDER").is_some() {
         "&obfs=salamander&obfs-password=fixture-obfs"
     } else {
         ""
@@ -448,11 +450,12 @@ fn hysteria2_preserves_udp_datagrams_through_windows_packet_bridge() {
         .unwrap()
         .remove(0);
     let root = std::env::temp_dir().join(format!("vpn-hysteria2-udp-{}", uuid::Uuid::new_v4()));
-    let mut shoes = fixture_shoes(root.clone());
-    shoes
+    let mut blazecore = fixture_blazecore(root.clone());
+    blazecore
         .start(ConnectionMode::LocalProxy, &profile, 0, &cancel())
         .unwrap();
-    let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = shoes.poll().unwrap() else {
+    let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = blazecore.poll().unwrap()
+    else {
         panic!("missing loopback endpoint");
     };
     let runtime = Builder::new_multi_thread()
@@ -473,7 +476,7 @@ fn hysteria2_preserves_udp_datagrams_through_windows_packet_bridge() {
         .await
         .expect("Hysteria2 UDP exchange completed before timeout");
     });
-    shoes.stop().unwrap();
+    blazecore.stop().unwrap();
     remove_test_root(root);
 }
 

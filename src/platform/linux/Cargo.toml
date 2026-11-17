@@ -1,0 +1,27 @@
+[package]
+name = "blazer-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blazer-linux"
+path = "main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+client-ui.workspace = true
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+eframe = { workspace = true, features = ["clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
+getrandom = "=0.4.3"
+secret-service = { version = "=5.2.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
+sha2.workspace = true
+tokio.workspace = true
+client-core.workspace = true
+vpn-infrastructure.workspace = true
+vpn-presentation.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

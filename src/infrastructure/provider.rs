@@ -1,4 +1,5 @@
 //! Happ wire metadata and normalized HTTP endpoints.
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use base64::Engine;
@@ -98,15 +99,32 @@ fn display_bool(value: &str) -> Option<bool> {
 }
 
 fn announcement(text: &str) -> Option<String> {
-    let decoded;
-    let text = if let Some(encoded) = text.strip_prefix("base64:") {
-        decoded = decode_base64(encoded).ok()?;
-        decoded.trim()
+    let text = display_message(text)?;
+    Some(text.trim().chars().take(DISPLAY_TEXT_CHARS).collect())
+}
+
+fn display_message(text: &str) -> Option<Cow<'_, str>> {
+    let text = decode_display_text(text)?;
+    let text = if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
     } else {
         text
     };
-    (!text.is_empty() && !text.chars().any(invalid_display_char))
-        .then(|| text.chars().take(DISPLAY_TEXT_CHARS).collect())
+    (!text.trim().is_empty()
+        && !text
+            .chars()
+            .any(|ch| !matches!(ch, '\n' | '\t') && invalid_display_char(ch)))
+    .then_some(text)
+}
+
+fn decode_display_text(text: &str) -> Option<Cow<'_, str>> {
+    if let Some((kind, encoded)) = text.split_once(':')
+        && kind.eq_ignore_ascii_case("base64")
+    {
+        Some(Cow::Owned(decode_base64(encoded).ok()?))
+    } else {
+        Some(Cow::Borrowed(text))
+    }
 }
 
 fn bounded_text(text: &str, max_chars: usize) -> Option<String> {
@@ -142,18 +160,23 @@ fn info_notice(metadata: &ProviderMetadata) -> Option<ProviderNotice> {
     use ProviderKey::*;
 
     let value = |key| display_value(metadata, key);
-    let text = value(SubInfoText).filter(|&text| text != "0")?;
+    let message = value(SubInfoText).and_then(display_message)?;
+    let text = message.trim();
+    if text == "0" || text.chars().count() > DISPLAY_TEXT_CHARS {
+        return None;
+    }
     let color = match value(SubInfoColor).map(str::to_ascii_lowercase).as_deref() {
         Some("red") => ProviderNoticeColor::Red,
         Some("green") => ProviderNoticeColor::Green,
         _ => ProviderNoticeColor::Blue,
     };
     let button = value(SubInfoButtonText)
-        .and_then(|label| bounded_text(label, BUTTON_LABEL_CHARS))
+        .and_then(decode_display_text)
+        .and_then(|label| bounded_text(label.trim_matches(' '), BUTTON_LABEL_CHARS))
         .zip(value(SubInfoButtonLink).and_then(display_url))
         .map(|(label, url)| ProviderNoticeButton { label, url });
     Some(ProviderNotice {
-        text: bounded_text(text, DISPLAY_TEXT_CHARS)?,
+        text: text.to_owned(),
         color,
         button,
     })
@@ -499,6 +522,69 @@ mod tests {
         let button = info.button.unwrap();
         assert_eq!(button.label, "Details");
         assert_eq!(button.url, raw[6].1);
+    }
+
+    #[test]
+    fn provider_notice_text_decodes_explicit_base64_from_headers_and_body() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = HeaderMap::new();
+        for (name, text) in [
+            ("announce", "Новости 🧪\r\n消息\nNews\rMore\tinfo"),
+            ("sub-info-text", "Плановые работы\r\nStatus\tupdate"),
+        ] {
+            let encoded = format!("BASE64:{}", STANDARD.encode(text));
+            headers.insert(name, HeaderValue::from_str(&encoded).unwrap());
+        }
+        let button = URL_SAFE_NO_PAD.encode("Подробнее");
+        let body = format!(
+            "#sub-info-button-text: base64:{button}\n#sub-info-button-link: https://provider.invalid/status\nvless://sample"
+        );
+        let source = Url::parse("https://provider.invalid/subscription").unwrap();
+        let fetched = parse_document(&source, &headers, body.into_bytes()).unwrap();
+        let display = subscription_display(&fetched.metadata, 0);
+        assert_eq!(fetched.body, b"vless://sample");
+        assert_eq!(
+            display.announcement.as_deref(),
+            Some("Новости 🧪\n消息\nNews\nMore\tinfo")
+        );
+        let info = display.info.unwrap();
+        assert_eq!(info.text, "Плановые работы\nStatus\tupdate");
+        let button = info.button.unwrap();
+        assert_eq!(button.label, "Подробнее");
+        assert_eq!(button.url, "https://provider.invalid/status");
+    }
+
+    #[test]
+    fn decoded_notice_text_obeys_display_validation() {
+        for label in ["я".repeat(BUTTON_LABEL_CHARS + 1), "\tПодробнее".to_owned()] {
+            let metadata = stored_metadata(
+                [
+                    (
+                        "announce",
+                        format!("base64:{}", STANDARD.encode("unsafe\u{202e}text")),
+                    ),
+                    ("sub-info-text", "QUJD".to_owned()),
+                    (
+                        "sub-info-button-text",
+                        format!("base64:{}", STANDARD.encode(label)),
+                    ),
+                    (
+                        "sub-info-button-link",
+                        "https://provider.invalid/status".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            )
+            .unwrap();
+            let display = subscription_display(&metadata, 0);
+            assert!(display.announcement.is_none());
+            let info = display.info.unwrap();
+            assert_eq!(info.text, "QUJD");
+            assert!(info.button.is_none());
+        }
     }
 
     #[test]

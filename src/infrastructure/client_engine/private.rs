@@ -8,6 +8,11 @@ use win_custody::{SecurityDescriptor, current_user_sid_string};
 
 use vpn_domain::client::ClientError;
 
+#[cfg(windows)]
+pub(super) const RUNTIME_EXECUTABLE: &str = "engine.exe";
+#[cfg(not(windows))]
+pub(super) const RUNTIME_EXECUTABLE: &str = "engine";
+
 pub(super) struct PrivateDirectory(pub(super) PathBuf);
 
 impl PrivateDirectory {
@@ -33,7 +38,7 @@ impl Drop for PrivateDirectory {
         if reject_reparse(&self.0).is_err() {
             return;
         }
-        for filename in ["engine.exe", "profile.yaml", "wintun.dll"] {
+        for filename in [RUNTIME_EXECUTABLE, "profile.yaml", "wintun.dll"] {
             let _ = fs::remove_file(self.0.join(filename));
         }
         let _ = fs::remove_dir(&self.0);

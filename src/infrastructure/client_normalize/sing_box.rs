@@ -212,8 +212,10 @@ fn default_disabled(value: &Value) -> Result<(), ClientError> {
 }
 
 fn parse_transport(value: &Value, server: &str, port: u16) -> Result<ProxyTransport, ClientError> {
-    if string(value, "type")? != "ws" {
-        return Err(ClientError::UnsupportedFeature);
+    match string(value, "type")? {
+        "xhttp" => return super::xhttp::json_transport(value, "type"),
+        "ws" => {}
+        _ => return Err(ClientError::UnsupportedFeature),
     }
     fields(
         value,

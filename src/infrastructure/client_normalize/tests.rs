@@ -1,4 +1,7 @@
 use super::*;
+use vpn_domain::client::{
+    XhttpMetadata, XhttpMode, XhttpPacketOptions, XhttpPacketRange, XhttpPlacement,
+};
 
 const ID: &str = "a5c41b77-fc31-4ab0-a275-1c67aa9aab31";
 
@@ -182,6 +185,7 @@ fn xray_modern_legacy_and_base64_json_have_equal_profiles() {
             server_name: "edge.example.test".to_owned(),
             allow_insecure: false,
             alpn: AlpnProtocols::default(),
+            fingerprint: None,
         }
     );
 }
@@ -333,7 +337,9 @@ fn xhttp_json_and_base64_share_links_preserve_modes_authority_and_query() {
             ProxyTransport::Xhttp {
                 path: "/sessions?trace=1".into(),
                 host: Some("gateway.example.test:8443".into()),
-                mode
+                mode,
+                metadata: XhttpMetadata::default(),
+                packet: Default::default(),
             }
         );
         assert_eq!(normalize(link), Ok(profiles.clone()));
@@ -342,6 +348,137 @@ fn xhttp_json_and_base64_share_links_preserve_modes_authority_and_query() {
             Ok(profiles)
         );
     }
+}
+
+#[test]
+fn xhttp_session_and_sequence_metadata_import_across_formats() {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+    let extra = serde_json::json!({
+        "sessionIDPlacement":"header","sessionIDKey":"X-Visit",
+        "seqPlacement":"query","seqKey":"p",
+        "scMaxEachPostBytes":"128000-256000","scMinPostsIntervalMs":"5-15","uplinkHTTPMethod":"post"
+    });
+    let uri_extra = utf8_percent_encode(&extra.to_string(), NON_ALPHANUMERIC).to_string();
+    let xray = serde_json::json!({
+        "protocol":"vless","settings":{"address":"localhost","port":7443,"id":ID},
+        "streamSettings":{"network":"xhttp","xhttpSettings":{"mode":"packet-up","extra":extra}}
+    });
+    let sing_box = serde_json::json!({
+        "type":"vless","server":"localhost","server_port":7443,"uuid":ID,
+        "transport":{"type":"xhttp","mode":"packet-up","session_placement":"header",
+            "session_key":"X-Visit","seq_placement":"query","seq_key":"p",
+            "sc_max_each_post_bytes":"128000-256000","sc_min_posts_interval_ms":"5-15",
+            "uplink_http_method":"POST"}
+    });
+    let v2rayn = serde_json::json!({
+        "add":"localhost","port":"7443","id":ID,"net":"splithttp","mode":"packet-up",
+        "session_placement":"header","session_key":"X-Visit","seqPlacement":"query","seqKey":"p",
+        "scMaxEachPostBytes":"128000-256000","scMinPostsIntervalMs":"5-15","uplinkHTTPMethod":""
+    });
+    let expected = ProxyTransport::Xhttp {
+        path: "/".into(),
+        host: None,
+        mode: XhttpMode::PacketUp,
+        metadata: XhttpMetadata {
+            session_id_placement: XhttpPlacement::Header,
+            session_id_key: Some("X-Visit".into()),
+            seq_placement: XhttpPlacement::Query,
+            seq_key: Some("p".into()),
+        },
+        packet: XhttpPacketOptions {
+            max_post_bytes: Some(XhttpPacketRange::new(128_000, 256_000).unwrap()),
+            min_post_interval_ms: Some(XhttpPacketRange::new(5, 15).unwrap()),
+        },
+    };
+    for input in [
+        format!("vless://{ID}@localhost:7443?type=xhttp&mode=packet-up&extra={uri_extra}"),
+        format!(
+            "vless://{ID}@localhost:7443?type=xhttp&mode=packet-up&sessionPlacement=header&sessionKey=X-Visit&seqPlacement=query&seqKey=p&scMaxEachPostBytes=128000-256000&scMinPostsIntervalMs=5-15&uplinkHTTPMethod=POST"
+        ),
+        xray.to_string(),
+        STANDARD.encode(xray.to_string()),
+        sing_box.to_string(),
+        format!("vmess://{}", STANDARD.encode(v2rayn.to_string())),
+    ] {
+        assert_eq!(normalize(input).unwrap()[0].transport, expected);
+    }
+}
+
+#[test]
+fn xhttp_rejects_ambiguous_and_invalid_metadata() {
+    for options in [
+        "type=xhttp&seqPlacement=query&seq_placement=query",
+        "type=xhttp&sessionIDKey=a&sessionKey=b",
+        "type=xhttp&seqPlacement=query&extra=%7B%7D",
+        "type=xhttp&seqPlacement=body",
+        "type=xhttp&seqPlacement=header&seqKey=Content-Length",
+        "type=xhttp&sessionIDPlacement=header&seqPlacement=header&seqKey=x-session",
+        "type=xhttp&seqPlacement=cookie&seqKey=bad%3Dcookie",
+        "type=xhttp&seqPlacement=query&seqKey=bad%0Dkey",
+        "type=ws&seqPlacement=header",
+        "type=ws&scMaxEachPostBytes=128000",
+        "type=xhttp&scMaxEachPostBytes=256000-128000",
+        "type=xhttp&scMinPostsIntervalMs=0-15",
+        "type=xhttp&scMinPostsIntervalMs=-1",
+        "type=xhttp&scMaxEachPostBytes=2147483648",
+        "type=xhttp&scMinPostsIntervalMs=5&sc_min_posts_interval_ms=10",
+    ] {
+        assert!(normalize(format!("vless://{ID}@localhost:7443?{options}")).is_err());
+    }
+    let conflicting = serde_json::json!({
+        "protocol":"vless","settings":{"address":"localhost","port":7443,"id":ID},
+        "streamSettings":{"network":"xhttp","xhttpSettings":{
+            "extra":{"seqPlacement":"query","seq_placement":"header"}
+        }}
+    });
+    assert_eq!(
+        normalize(conflicting.to_string()),
+        Err(ClientError::InvalidSubscription)
+    );
+}
+
+#[test]
+fn fetched_xray_wrapper_reports_xhttp_upload_method_and_keeps_tcp_probe() {
+    use vpn_application::client::ProfileUnavailableReason;
+
+    let link =
+        format!("vless://{ID}@localhost:7443?type=xhttp&mode=packet-up&uplinkHTTPMethod=GET");
+    assert_eq!(
+        normalize(link),
+        Err(ClientError::UnsupportedXhttpUploadMethod)
+    );
+    let document = serde_json::json!({
+        "remarks":"Fixture",
+        "dns":{"servers":["example.test"]},
+        "routing":{"rules":[]},
+        "outbounds":[{
+            "protocol":"vless","tag":"proxy",
+            "settings":{"address":"localhost","port":7443,"id":ID},
+            "streamSettings":{
+                "network":"xhttp","security":"tls",
+                "tlsSettings":{"fingerprint":"firefox","alpn":["h2"]},
+                "xhttpSettings":{"mode":"packet-up","extra":{
+                    "seqPlacement":"header","scMaxEachPostBytes":"128000-256000",
+                    "scMinPostsIntervalMs":"5-15","uplinkHTTPMethod":"GET",
+                    "sessionIDLength":"8-10"
+                }}
+            }
+        },{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}]
+    });
+    let result = SubscriptionNormalizer
+        .normalize_subscription(document.to_string().as_bytes())
+        .unwrap();
+    assert!(result.profiles.is_empty());
+    let row = &result.unavailable_profiles[0];
+    assert_eq!(
+        row.reason,
+        ProfileUnavailableReason::UnsupportedXhttpUploadMethod
+    );
+    assert_eq!(
+        row.probe_endpoint().map(|endpoint| endpoint.address()),
+        Some(("localhost", 7443))
+    );
 }
 
 #[test]
@@ -437,7 +574,7 @@ fn wrapped_json_subscription_preserves_order_and_checks_total_profile_count() {
 }
 
 #[test]
-fn imports_xray_server_and_the_simple_shoes_export() {
+fn imports_xray_server_and_the_simple_blazecore_export() {
     let xray = br#"{
         "log":{"loglevel":"warning"},
         "inbounds":[{"port":1080,"protocol":"socks"}],
@@ -447,12 +584,12 @@ fn imports_xray_server_and_the_simple_shoes_export() {
             {"tag":"block","protocol":"blackhole","settings":{}}
         ]
     }"#;
-    let shoes = br#"[{
+    let blazecore = br#"[{
         "address":"127.0.0.1:1080","protocol":{"type":"mixed"},
         "rules":[{"action":"allow","masks":["0.0.0.0/0","::/0"],
             "client_chain":{"address":"example.test:1081","protocol":{"type":"socks"}}}]
     }]"#;
-    for document in [xray.as_slice(), shoes.as_slice()] {
+    for document in [xray.as_slice(), blazecore.as_slice()] {
         let [server]: [ProxyProfile; 1] = SubscriptionNormalizer
             .normalize(document)
             .unwrap()
@@ -660,6 +797,7 @@ fn empty_json_tls_server_name_preserves_the_endpoint_name_default() {
             server_name: "localhost".to_owned(),
             allow_insecure: false,
             alpn: AlpnProtocols::default(),
+            fingerprint: None,
         },
     );
 }

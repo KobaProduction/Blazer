@@ -1,4 +1,4 @@
-//! Validate the pinned Shoes configuration format before a profile enters the catalog.
+//! Validate the pinned BlazeCore configuration format before a profile enters the catalog.
 
 use std::iter::Peekable;
 use std::str::Split;

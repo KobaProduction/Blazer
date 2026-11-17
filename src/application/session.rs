@@ -5,8 +5,9 @@ use std::fmt;
 
 use vpn_domain::client::TelemetrySettings;
 pub use vpn_domain::client::{
-    ClientError, ConnectionMode, Language, ProfileUnavailableReason, Secret, TelemetryMode,
-    UnavailableProfile,
+    ClientError, ConnectionMode, DEFAULT_SUBSCRIPTION_USER_AGENT, Language,
+    MAX_SUBSCRIPTION_USER_AGENT_BYTES, ProfileUnavailableReason, Secret, TelemetryMode,
+    UnavailableProfile, validate_subscription_user_agent,
 };
 pub use vpn_domain::provider::{
     ProviderChangeKind, ProviderKey, ProviderMetadataClass, SubscriptionUsage,
@@ -95,6 +96,9 @@ pub enum ClientCommand {
     },
     SetSubscriptionHwid {
         enabled: bool,
+    },
+    SetSubscriptionUserAgent {
+        value: Option<Secret>,
     },
     SetTelemetrySettings {
         mode: TelemetryMode,
@@ -326,7 +330,7 @@ pub struct RoutingSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub struct ComponentVersions {
-    pub expected_shoes: Option<String>,
+    pub expected_blazecore: Option<String>,
     pub tun2proxy: Option<String>,
     pub bundled_wintun: Option<String>,
 }
@@ -369,6 +373,7 @@ pub struct ClientSnapshot {
     pub local_proxy: Option<String>,
     pub local_proxy_port: u16,
     pub send_subscription_hwid: bool,
+    pub subscription_user_agent: Option<Secret>,
     pub subscription_hwid: Option<Secret>,
     pub http_proxy: Option<String>,
     pub busy: bool,
@@ -404,6 +409,7 @@ impl Default for ClientSnapshot {
             local_proxy: None,
             local_proxy_port: 0,
             send_subscription_hwid: true,
+            subscription_user_agent: None,
             subscription_hwid: None,
             http_proxy: None,
             busy: true,

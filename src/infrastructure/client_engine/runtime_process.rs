@@ -24,7 +24,8 @@ mod platform {
             let job = Job::create(&JobLimits::new().kill_on_close(true))?;
             let (stdout, writer) = anonymous_pipe()?;
             let null = null_device()?;
-            let mut command = Launch::new(directory.join("engine.exe"));
+            let mut command =
+                Launch::new(directory.join(super::super::private::RUNTIME_EXECUTABLE));
             command
                 .args(RUNTIME_ARGS)
                 .arg(profile)
@@ -72,12 +73,13 @@ mod platform {
             directory: &Path,
             profile: &Path,
         ) -> io::Result<(Self, impl Read + Send + 'static)> {
-            let mut child = super::super::engine_command(&directory.join("engine.exe"), directory)
+            let executable = directory.join(super::super::private::RUNTIME_EXECUTABLE);
+            let mut child = super::super::engine_command(&executable, directory)
                 .args(RUNTIME_ARGS)
                 .arg(profile)
                 .stdout(Stdio::piped())
                 .spawn()?;
-            let stdout = child.stdout.take().expect("piped Shoes stdout");
+            let stdout = child.stdout.take().expect("piped BlazeCore stdout");
             Ok((Self(child), stdout))
         }
 

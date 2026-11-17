@@ -5,7 +5,8 @@ use super::json::{
 };
 use super::{
     ClientError, ProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport, make_profile,
-    proxy_auth, reality, shadowsocks, trojan, verified_tls, vless, vmess, xhttp, xray_websocket,
+    proxy_auth, reality, shadowsocks, trojan, verified_tls, vless, vmess, with_tls_fingerprint,
+    xhttp, xray_websocket,
 };
 
 pub(super) fn parse_outbound(outbound: &Value) -> Result<ProxyProfile, ClientError> {
@@ -217,21 +218,28 @@ fn parse_transport(stream: &Value, network: &str) -> Result<ProxyTransport, Clie
     }
 }
 
-fn parse_xhttp(value: Option<&Value>) -> Result<ProxyTransport, ClientError> {
-    let Some(value) = value else {
-        return xhttp("/", None, None);
+pub(super) fn unsupported_xhttp_upload_method(outbound: &Value) -> bool {
+    let Some(stream) = outbound.get("streamSettings") else {
+        return false;
     };
-    fields(value, &["path", "host", "mode", "extra", "headers"])?;
-    for key in ["extra", "headers"] {
-        check_empty(value, key, |extra| {
-            extra.as_object().is_some_and(serde_json::Map::is_empty)
-        })?;
+    let network = only_one(stream.get("network"), stream.get("method"))
+        .ok()
+        .flatten()
+        .and_then(Value::as_str);
+    if !matches!(network, Some("xhttp" | "splithttp")) {
+        return false;
     }
-    xhttp(
-        optional_str(value, "path")?.unwrap_or("/"),
-        optional_str(value, "host")?,
-        optional_str(value, "mode")?,
-    )
+    only_one(stream.get("xhttpSettings"), stream.get("splithttpSettings"))
+        .ok()
+        .flatten()
+        .is_some_and(xhttp::unsupported_upload_method)
+}
+
+fn parse_xhttp(value: Option<&Value>) -> Result<ProxyTransport, ClientError> {
+    match value {
+        Some(value) => xhttp::json_transport(value, "extra"),
+        None => xhttp::transport("/", None, None, Default::default()),
+    }
 }
 
 fn plain_tcp(value: &Value) -> Result<(), ClientError> {
@@ -285,11 +293,17 @@ fn parse_tls(value: Option<&Value>, host: &str) -> Result<ProxySecurity, ClientE
     let Some(value) = value else {
         return verified_tls(host, false, super::AlpnProtocols::default());
     };
-    fields(value, &["serverName", "allowInsecure", "alpn"])?;
+    fields(
+        value,
+        &["serverName", "allowInsecure", "alpn", "fingerprint"],
+    )?;
     let name = optional_str(value, "serverName")?
         .filter(|name| !name.is_empty())
         .unwrap_or(host);
-    verified_tls(name, flag(value, "allowInsecure")?, tls_alpn(value)?)
+    with_tls_fingerprint(
+        verified_tls(name, flag(value, "allowInsecure")?, tls_alpn(value)?)?,
+        optional_str(value, "fingerprint")?,
+    )
 }
 
 fn parse_reality(value: &Value) -> Result<ProxySecurity, ClientError> {
@@ -297,6 +311,7 @@ fn parse_reality(value: &Value) -> Result<ProxySecurity, ClientError> {
         value,
         &[
             "serverName",
+            "fingerprint",
             "publicKey",
             "password",
             "shortId",
@@ -311,11 +326,12 @@ fn parse_reality(value: &Value) -> Result<ProxySecurity, ClientError> {
         optional_str(value, "password")?,
     )?
     .ok_or(ClientError::InvalidSubscription)?;
-    reality(
+    let security = reality(
         string(value, "serverName")?,
         key,
         optional_str(value, "shortId")?.unwrap_or(""),
-    )
+    )?;
+    with_tls_fingerprint(security, optional_str(value, "fingerprint")?)
 }
 
 fn only_one<T>(first: Option<T>, second: Option<T>) -> Result<Option<T>, ClientError> {

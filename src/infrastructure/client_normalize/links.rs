@@ -5,11 +5,11 @@ use serde_json::Value;
 use url::Url;
 use vpn_domain::client::TcpProbeEndpoint;
 
-use super::json::{check_empty, fields, optional_str, parse_value, port, string, zero};
+use super::json::{check_empty, optional_str, parse_value, port, string, zero};
 use super::{
     AlpnProtocols, ClientError, ProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport,
     decode_base64, make_profile, proxy_auth, reality, shadowsocks, trojan, verified_tls, vless,
-    vmess, xhttp, xray_websocket,
+    vmess, with_tls_fingerprint, xhttp, xray_websocket,
 };
 
 pub(super) fn parse_share_link(text: &str) -> Result<ProxyProfile, ClientError> {
@@ -164,6 +164,7 @@ impl Options {
             "type",
             "security",
             "sni",
+            "fp",
             "peer",
             "pbk",
             "sid",
@@ -177,17 +178,23 @@ impl Options {
             "mode",
             "extra",
         ];
-        Self::parse_with(query, &allowed)
+        Self::parse_fields(query, |key| {
+            allowed.contains(&key) || xhttp::is_xhttp_option(key)
+        })
     }
 
     pub(super) fn parse_with(query: &str, allowed: &[&str]) -> Result<Self, ClientError> {
+        Self::parse_fields(query, |key| allowed.contains(&key))
+    }
+
+    fn parse_fields(query: &str, allowed: impl Fn(&str) -> bool) -> Result<Self, ClientError> {
         let mut values = HashMap::new();
         for entry in query.split('&').filter(|entry| !entry.is_empty()) {
             let (key, value) = entry
                 .split_once('=')
                 .ok_or(ClientError::InvalidSubscription)?;
             let key = decode_component(key)?;
-            if !allowed.contains(&key.as_str()) {
+            if !allowed(&key) {
                 return Err(ClientError::UnsupportedFeature);
             }
             if values.insert(key, decode_component(value)?).is_some() {
@@ -261,15 +268,27 @@ fn parse_transport(options: &Options) -> Result<ProxyTransport, ClientError> {
     options.check("headerType", &["none", ""])?;
     let kind = options.get("type").unwrap_or("tcp");
     if matches!(kind, "xhttp" | "splithttp") {
-        options.check("extra", &["", "{}"])?;
-        return xhttp(
+        let extra = options
+            .get("extra")
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_value(value).map_err(|_| ClientError::UnsupportedFeature))
+            .transpose()?;
+        let transport_options = xhttp::options(
+            |key| options.get(key).map(xhttp::ValueRef::Text),
+            extra.as_ref(),
+        )?;
+        return xhttp::transport(
             options.get("path").unwrap_or("/"),
             options.get("host"),
             options.get("mode"),
+            transport_options,
         );
     }
     options.check("mode", &[""])?;
     options.check("extra", &[])?;
+    if options.0.keys().any(|key| xhttp::is_xhttp_option(key)) {
+        return Err(ClientError::UnsupportedFeature);
+    }
     match kind {
         "tcp" | "raw" | "" => {
             options.check("path", &[""])?;
@@ -307,7 +326,7 @@ fn parse_security(url: &Url, options: &Options, host: &str) -> Result<ProxySecur
     if protection != "tls" && !alpn.is_empty() {
         return Err(ClientError::UnsupportedFeature);
     }
-    match protection {
+    let security = match protection {
         "none" | "" => {
             options.check("sni", &[])?;
             options.check("peer", &[])?;
@@ -324,7 +343,8 @@ fn parse_security(url: &Url, options: &Options, host: &str) -> Result<ProxySecur
             )
         }
         _ => Err(ClientError::UnsupportedFeature),
-    }
+    }?;
+    with_tls_fingerprint(security, options.get("fp"))
 }
 
 fn link_alpn(value: Option<&str>) -> Result<AlpnProtocols, ClientError> {
@@ -346,7 +366,7 @@ pub(super) fn insecure(value: Option<&str>) -> Result<bool, ClientError> {
 fn parse_v2rayn(encoded: &str) -> Result<ProxyProfile, ClientError> {
     let bytes = decode_base64(encoded)?;
     let value = parse_value(super::document_text(&bytes)?)?;
-    fields(
+    xhttp::fields_with_options(
         &value,
         &[
             "v",
@@ -366,6 +386,7 @@ fn parse_v2rayn(encoded: &str) -> Result<ProxyProfile, ClientError> {
             "fp",
             "allowInsecure",
             "mode",
+            "extra",
         ],
     )?;
     check_empty(&value, "v", |field| {
@@ -374,11 +395,9 @@ fn parse_v2rayn(encoded: &str) -> Result<ProxyProfile, ClientError> {
     check_empty(&value, "aid", |field| {
         zero(field) || field.as_str() == Some("")
     })?;
-    for field in ["type", "fp"] {
-        check_empty(&value, field, |value| {
-            value.as_str() == Some("") || field == "type" && value.as_str() == Some("none")
-        })?;
-    }
+    check_empty(&value, "type", |value| {
+        matches!(value.as_str(), Some("" | "none"))
+    })?;
     let host = string(&value, "add")?;
     make_profile(
         optional_str(&value, "ps")?.unwrap_or(""),
@@ -389,7 +408,7 @@ fn parse_v2rayn(encoded: &str) -> Result<ProxyProfile, ClientError> {
             optional_str(&value, "scy")?.unwrap_or("auto"),
         )?,
         v2rayn_transport(&value)?,
-        v2rayn_security(&value, host)?,
+        with_tls_fingerprint(v2rayn_security(&value, host)?, optional_str(&value, "fp")?)?,
     )
 }
 
@@ -399,9 +418,14 @@ fn v2rayn_transport(value: &Value) -> Result<ProxyTransport, ClientError> {
     let kind = optional_str(value, "net")?.unwrap_or("tcp");
     let mode = optional_str(value, "mode")?.filter(|field| !field.is_empty());
     if matches!(kind, "xhttp" | "splithttp") {
-        return xhttp(path.unwrap_or("/"), host, mode);
+        return xhttp::transport(path.unwrap_or("/"), host, mode, xhttp::json_options(value)?);
     }
-    if mode.is_some() {
+    if mode.is_some()
+        || value.get("extra").is_some()
+        || value
+            .as_object()
+            .is_some_and(|object| object.keys().any(|key| xhttp::is_xhttp_option(key)))
+    {
         return Err(ClientError::UnsupportedFeature);
     }
     match kind {

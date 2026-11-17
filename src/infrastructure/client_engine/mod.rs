@@ -37,7 +37,7 @@ pub(crate) fn validate_profile(profile: &ProxyProfile) -> Result<(), ClientError
 mod import_tests;
 
 pub const APPROVED_ENGINE_SHA256: &str =
-    "950CB4FF73B588DB817ED9DE383669377102529D75C90C7F3BB580910027B192";
+    "C437B5B9D665B8117A2E70934317A6CDA0F0BDCD7BEF07469188AC25592862CB";
 pub const APPROVED_ENGINE_VERSION: &str = "0.3.7+gcce97a2c4c1c.dirty";
 pub const APPROVED_ENGINE_REVISION: &str = "cce97a2c4c1c3bd0a07807f37a7caf3876c79110";
 
@@ -48,7 +48,7 @@ pub struct TrustedEngineSpec {
     pub expected_version: String,
 }
 
-pub struct ShoesProcess {
+pub struct BlazeCoreProcess {
     spec: TrustedEngineSpec,
     data_directory: PathBuf,
     child: Option<RuntimeProcess>,
@@ -57,7 +57,7 @@ pub struct ShoesProcess {
     port_override: u16,
 }
 
-impl ShoesProcess {
+impl BlazeCoreProcess {
     pub fn new(spec: TrustedEngineSpec, data_directory: PathBuf, port_override: u16) -> Self {
         Self {
             spec,
@@ -86,10 +86,16 @@ impl ShoesProcess {
         }
         cancel.check()?;
         let directory = private::PrivateDirectory::create(&self.data_directory)?;
-        let executable = directory.0.join("engine.exe");
+        let executable = directory.0.join(private::RUNTIME_EXECUTABLE);
         fs::copy(&self.spec.source_path, &executable).map_err(|_| ClientError::EngineNotFound)?;
         if file_sha256(&executable)? != self.spec.expected_sha256.to_ascii_uppercase() {
             return Err(ClientError::EngineUntrusted);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .map_err(|_| ClientError::EngineUntrusted)?;
         }
         cancel.check()?;
         verify_version(
@@ -115,7 +121,7 @@ impl ShoesProcess {
     }
 }
 
-impl ClientEnginePort for ShoesProcess {
+impl ClientEnginePort for BlazeCoreProcess {
     fn capabilities(&self) -> vpn_application::session::ModeCapabilities {
         vpn_application::session::ModeCapabilities {
             local_proxy: true,
@@ -183,9 +189,7 @@ impl ClientEnginePort for ShoesProcess {
                 marker,
             )
         });
-        // Windows Shoes has loaded the configuration by the readiness marker and only
-        // Unix supports explicit signal-based reloads when file watching is disabled.
-        #[cfg(windows)]
+        // Blazer starts the runtime with reload disabled. Readiness confirms the config is loaded.
         let result = result
             .and_then(|()| fs::remove_file(profile_path).map_err(|_| ClientError::StorageWrite));
         if let Err(error) = result {
@@ -222,7 +226,7 @@ impl ClientEnginePort for ShoesProcess {
     }
 }
 
-impl Drop for ShoesProcess {
+impl Drop for BlazeCoreProcess {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -243,6 +247,8 @@ fn engine_command(executable: &Path, directory: &Path) -> std::process::Command 
             .env("SystemRoot", system_root)
             .env("PATH", path);
     }
+    #[cfg(unix)]
+    command.env_clear();
     command
 }
 
@@ -280,9 +286,9 @@ fn verify_version(
         .take(4096)
         .read_to_string(&mut output)
         .map_err(|_| ClientError::EngineUntrusted)?;
-    let actual = output
-        .trim()
-        .strip_prefix("shoes ")
+    let version_line = output.trim();
+    let actual = version_line
+        .strip_prefix("BlazeCore ")
         .ok_or(ClientError::EngineUntrusted)?;
     if actual != expected && actual.split_once('+').map(|(version, _)| version) != Some(expected) {
         return Err(ClientError::EngineUntrusted);
@@ -358,7 +364,7 @@ fn stop_child(child: &mut Child) -> Result<(), ClientError> {
 fn watch_readiness(stdout: impl Read + Send + 'static) -> Result<Receiver<()>, ClientError> {
     let (ready, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("vpn-shoes-readiness".to_owned())
+        .name("vpn-blazecore-readiness".to_owned())
         .spawn(move || {
             let mut stream = BufReader::new(stdout);
             for line in Read::by_ref(&mut stream)
@@ -366,7 +372,7 @@ fn watch_readiness(stdout: impl Read + Send + 'static) -> Result<Receiver<()>, C
                 .lines()
                 .map_while(Result::ok)
             {
-                // This exact marker is emitted by the pinned Shoes after it binds its servers.
+                // This exact marker is emitted by the pinned BlazeCore after it binds its servers.
                 if line == "Servers ready" {
                     let _ = ready.send(());
                     break;

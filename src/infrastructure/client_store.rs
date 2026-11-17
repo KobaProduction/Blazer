@@ -10,7 +10,9 @@ use vpn_application::client::StateStorePort;
 use vpn_domain::client::{
     AlpnProtocols, Catalog, CatalogProfile, ClientError, ClientSettings, ConnectionMode, Language,
     ProfileUnavailableReason, ProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport, Secret,
-    Subscription, TelemetryMode, TelemetrySettings, UnavailableProfile, WebSocketEarlyData,
+    Subscription, TelemetryMode, TelemetrySettings, TlsFingerprint, UnavailableProfile,
+    WebSocketEarlyData, XhttpMetadata, XhttpPacketOptions, XhttpPacketRange,
+    validate_subscription_user_agent,
 };
 use vpn_domain::routing::{
     DnsPolicy, RouteAction, RouteRule, RouteTarget, RoutingAssignment, RoutingCatalog,
@@ -258,6 +260,8 @@ struct StoredCatalog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     send_subscription_hwid: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription_user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry: Option<TelemetrySettingsDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     routing: Option<RoutingCatalogDto>,
@@ -400,6 +404,7 @@ struct StoredUnavailableProbe {
 #[serde(rename_all = "snake_case")]
 enum UnavailableReasonDto {
     Unsupported,
+    UnsupportedXhttpUploadMethod,
     Invalid,
 }
 
@@ -465,10 +470,80 @@ enum TransportDto {
         path: String,
         host: Option<String>,
         mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<XhttpMetadataDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        packet: Option<XhttpPacketDto>,
     },
     Quic {
         certificate_sha256: Option<String>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XhttpPacketDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_post_bytes: Option<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_post_interval_ms: Option<(u32, u32)>,
+}
+
+impl XhttpPacketDto {
+    fn from_options(options: &XhttpPacketOptions) -> Option<Self> {
+        (options != &XhttpPacketOptions::default()).then(|| Self {
+            max_post_bytes: options.max_post_bytes.map(XhttpPacketRange::bounds),
+            min_post_interval_ms: options.min_post_interval_ms.map(XhttpPacketRange::bounds),
+        })
+    }
+
+    fn into_options(self) -> Result<XhttpPacketOptions, ClientError> {
+        let range =
+            |(min, max)| XhttpPacketRange::new(min, max).map_err(|_| ClientError::StorageCorrupt);
+        Ok(XhttpPacketOptions {
+            max_post_bytes: self.max_post_bytes.map(range).transpose()?,
+            min_post_interval_ms: self.min_post_interval_ms.map(range).transpose()?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XhttpMetadataDto {
+    session_id_placement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id_key: Option<String>,
+    seq_placement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seq_key: Option<String>,
+}
+
+impl XhttpMetadataDto {
+    fn from_metadata(value: &XhttpMetadata) -> Option<Self> {
+        (value != &XhttpMetadata::default()).then(|| Self {
+            session_id_placement: value.session_id_placement.name().to_owned(),
+            session_id_key: value.session_id_key.clone(),
+            seq_placement: value.seq_placement.name().to_owned(),
+            seq_key: value.seq_key.clone(),
+        })
+    }
+
+    fn into_metadata(self) -> Result<XhttpMetadata, ClientError> {
+        let value = XhttpMetadata {
+            session_id_placement: self
+                .session_id_placement
+                .parse()
+                .map_err(|_| ClientError::StorageCorrupt)?,
+            session_id_key: self.session_id_key,
+            seq_placement: self
+                .seq_placement
+                .parse()
+                .map_err(|_| ClientError::StorageCorrupt)?,
+            seq_key: self.seq_key,
+        };
+        value.validate().map_err(|_| ClientError::StorageCorrupt)?;
+        Ok(value)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -487,11 +562,15 @@ enum SecurityDto {
         allow_insecure: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         alpn: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
     },
     Reality {
         server_name: String,
         public_key: String,
         short_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
     },
 }
 
@@ -533,6 +612,11 @@ impl StoredCatalog {
                 ConnectionMode::Tun => ModeDto::Tun,
             },
             send_subscription_hwid: (!catalog.settings.send_subscription_hwid).then_some(false),
+            subscription_user_agent: catalog
+                .settings
+                .subscription_user_agent
+                .as_ref()
+                .map(|value| value.expose().to_owned()),
             telemetry: TelemetrySettingsDto::from_settings(&catalog.settings.telemetry),
             routing: RoutingCatalogDto::from_catalog(&catalog.routing),
         }
@@ -541,6 +625,9 @@ impl StoredCatalog {
     fn into_catalog(self) -> Result<Catalog, ClientError> {
         if self.version != 1 {
             return Err(ClientError::StorageCorrupt);
+        }
+        if let Some(value) = &self.subscription_user_agent {
+            validate_subscription_user_agent(value).map_err(|_| ClientError::StorageCorrupt)?;
         }
         let language = match self.language.as_str() {
             "ru" => Language::Russian,
@@ -567,6 +654,7 @@ impl StoredCatalog {
                 language,
                 local_proxy_port: self.local_proxy_port,
                 send_subscription_hwid: self.send_subscription_hwid.unwrap_or(true),
+                subscription_user_agent: self.subscription_user_agent.map(Secret::new),
                 telemetry: self
                     .telemetry
                     .map(TelemetrySettingsDto::into_settings)
@@ -831,6 +919,9 @@ impl From<&UnavailableProfile> for StoredUnavailableProfile {
             protocol: profile.protocol.clone(),
             reason: match profile.reason {
                 ProfileUnavailableReason::Unsupported => UnavailableReasonDto::Unsupported,
+                ProfileUnavailableReason::UnsupportedXhttpUploadMethod => {
+                    UnavailableReasonDto::UnsupportedXhttpUploadMethod
+                }
                 ProfileUnavailableReason::Invalid => UnavailableReasonDto::Invalid,
             },
         }
@@ -843,6 +934,9 @@ impl TryFrom<StoredUnavailableProfile> for UnavailableProfile {
     fn try_from(profile: StoredUnavailableProfile) -> Result<Self, Self::Error> {
         let reason = match profile.reason {
             UnavailableReasonDto::Unsupported => ProfileUnavailableReason::Unsupported,
+            UnavailableReasonDto::UnsupportedXhttpUploadMethod => {
+                ProfileUnavailableReason::UnsupportedXhttpUploadMethod
+            }
             UnavailableReasonDto::Invalid => ProfileUnavailableReason::Invalid,
         };
         let mut row = Self::new(&profile.name, profile.protocol.as_deref(), reason);
@@ -880,10 +974,18 @@ impl StoredProfile {
                         header_name: data.header_name.clone(),
                     }),
                 },
-                ProxyTransport::Xhttp { path, host, mode } => TransportDto::Xhttp {
+                ProxyTransport::Xhttp {
+                    path,
+                    host,
+                    mode,
+                    metadata,
+                    packet,
+                } => TransportDto::Xhttp {
                     path: path.clone(),
                     host: host.clone(),
                     mode: mode.name().to_owned(),
+                    metadata: XhttpMetadataDto::from_metadata(metadata),
+                    packet: XhttpPacketDto::from_options(packet),
                 },
                 ProxyTransport::Quic { certificate_sha256 } => TransportDto::Quic {
                     certificate_sha256: certificate_sha256.clone(),
@@ -895,19 +997,23 @@ impl StoredProfile {
                     server_name,
                     allow_insecure,
                     alpn,
+                    fingerprint,
                 } => SecurityDto::Tls {
                     server_name: server_name.clone(),
                     allow_insecure: *allow_insecure,
                     alpn: alpn.as_slice().to_vec(),
+                    fingerprint: fingerprint.map(|value| value.name().to_owned()),
                 },
                 ProxySecurity::Reality {
                     server_name,
                     public_key,
                     short_id,
+                    fingerprint,
                 } => SecurityDto::Reality {
                     server_name: server_name.clone(),
                     public_key: public_key.clone(),
                     short_id: short_id.clone(),
+                    fingerprint: fingerprint.map(|value| value.name().to_owned()),
                 },
             },
         }
@@ -936,10 +1042,24 @@ impl StoredProfile {
                             header_name: data.header_name,
                         }),
                     },
-                    TransportDto::Xhttp { path, host, mode } => ProxyTransport::Xhttp {
+                    TransportDto::Xhttp {
+                        path,
+                        host,
+                        mode,
+                        metadata,
+                        packet,
+                    } => ProxyTransport::Xhttp {
                         path,
                         host,
                         mode: mode.parse().map_err(|_| ClientError::StorageCorrupt)?,
+                        metadata: metadata
+                            .map(XhttpMetadataDto::into_metadata)
+                            .transpose()?
+                            .unwrap_or_default(),
+                        packet: packet
+                            .map(XhttpPacketDto::into_options)
+                            .transpose()?
+                            .unwrap_or_default(),
                     },
                     TransportDto::Quic { certificate_sha256 } => {
                         ProxyTransport::Quic { certificate_sha256 }
@@ -951,24 +1071,35 @@ impl StoredProfile {
                         server_name,
                         allow_insecure,
                         alpn,
+                        fingerprint,
                     } => ProxySecurity::Tls {
                         server_name,
                         allow_insecure,
                         alpn: AlpnProtocols::new(alpn).map_err(|_| ClientError::StorageCorrupt)?,
+                        fingerprint: load_tls_fingerprint(fingerprint.as_deref())?,
                     },
                     SecurityDto::Reality {
                         server_name,
                         public_key,
                         short_id,
+                        fingerprint,
                     } => ProxySecurity::Reality {
                         server_name,
                         public_key,
                         short_id,
+                        fingerprint: load_tls_fingerprint(fingerprint.as_deref())?,
                     },
                 },
             },
         })
     }
+}
+
+fn load_tls_fingerprint(value: Option<&str>) -> Result<Option<TlsFingerprint>, ClientError> {
+    value
+        .map(TlsFingerprint::parse)
+        .transpose()
+        .map_err(|_| ClientError::StorageCorrupt)
 }
 
 impl ProtocolDto {
@@ -1189,7 +1320,7 @@ mod compatibility_tests {
     }
 
     #[test]
-    fn legacy_tls_profile_and_new_alpn_round_trip() {
+    fn stored_tls_profile_preserves_alpn_and_fingerprint() {
         let input = r#"{
             "profile_uuid":"test-profile","name":"TLS fixture","host":"localhost","port":443,
             "protocol":{"type":"http","username":null,"password":null},
@@ -1200,11 +1331,13 @@ mod compatibility_tests {
             .unwrap()
             .into_profile()
             .unwrap();
-        let ProxySecurity::Tls { alpn, .. } = &mut profile.profile.security else {
-            panic!("expected the legacy TLS setting");
+        let ProxySecurity::Tls { alpn, fingerprint, .. } = &mut profile.profile.security else {
+            panic!("expected the TLS setting");
         };
         assert!(alpn.is_empty());
+        assert_eq!(*fingerprint, None);
         *alpn = AlpnProtocols::new(vec!["h2".into(), "http/1.1".into()]).unwrap();
+        *fingerprint = Some(TlsFingerprint::Firefox120);
         let bytes = serde_json::to_vec(&StoredProfile::from_profile(&profile)).unwrap();
         assert_eq!(
             serde_json::from_slice::<StoredProfile>(&bytes)
@@ -1288,14 +1421,23 @@ mod compatibility_tests {
             "transport":{"type":"xhttp","path":"/proxy?cache=stable","host":"edge.example.test","mode":"stream-up"},
             "security":{"type":"tls","server_name":"localhost","allow_insecure":false,"alpn":["h3"]}
         }"#;
-        let profile = serde_json::from_str::<StoredProfile>(wire)
-            .unwrap()
-            .into_profile()
-            .unwrap();
-        let serialized = serde_json::to_value(StoredProfile::from_profile(&profile)).unwrap();
-        assert_eq!(
-            serialized,
-            serde_json::from_str::<serde_json::Value>(wire).unwrap()
-        );
+        let original: serde_json::Value = serde_json::from_str(wire).unwrap();
+        let mut named = original.clone();
+        named["transport"]["metadata"] = serde_json::json!({
+            "session_id_placement":"query","session_id_key":"visit",
+            "seq_placement":"cookie","seq_key":"packet"
+        });
+        let mut tuned = named.clone();
+        tuned["transport"]["packet"] = serde_json::json!({
+            "max_post_bytes":[128000,256000], "min_post_interval_ms":[5,15]
+        });
+        for stored in [original, named, tuned] {
+            let profile = serde_json::from_value::<StoredProfile>(stored.clone())
+                .unwrap()
+                .into_profile()
+                .unwrap();
+            let serialized = serde_json::to_value(StoredProfile::from_profile(&profile)).unwrap();
+            assert_eq!(serialized, stored);
+        }
     }
 }

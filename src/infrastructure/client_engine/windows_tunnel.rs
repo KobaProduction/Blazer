@@ -21,7 +21,7 @@ use vpn_application::session::ModeCapabilities;
 use vpn_domain::client::{ClientError, ConnectionMode, ProxyProfile, ProxyTransport};
 use vpn_domain::routing::RoutingProfile;
 
-use super::{ShoesProcess, file_sha256, private::PrivateDirectory, run_bounded, wait_child};
+use super::{BlazeCoreProcess, file_sha256, private::PrivateDirectory, run_bounded, wait_child};
 
 const DNS_SERVER: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 const TUN_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 233, 0, 1);
@@ -41,8 +41,8 @@ struct Driver {
 impl Driver {
     fn configured() -> Option<Self> {
         Self::resolve(
-            std::env::var_os("VPN_CLIENT_WINTUN_DLL"),
-            std::env::var_os("VPN_CLIENT_WINTUN_SHA256"),
+            std::env::var_os("BLAZER_WINTUN_DLL"),
+            std::env::var_os("BLAZER_WINTUN_SHA256"),
             std::env::current_exe().ok().as_deref(),
         )
     }
@@ -102,9 +102,9 @@ impl Driver {
             return Err(ClientError::EngineUntrusted);
         }
         let mut signature = powershell(
-            "if ((Get-AuthenticodeSignature -LiteralPath $env:VPN_CLIENT_DRIVER_CHECK).Status -ne 'Valid') { exit 1 }",
+            "if ((Get-AuthenticodeSignature -LiteralPath $env:BLAZER_DRIVER_CHECK).Status -ne 'Valid') { exit 1 }",
         )?;
-        signature.env("VPN_CLIENT_DRIVER_CHECK", dll);
+        signature.env("BLAZER_DRIVER_CHECK", dll);
         run_bounded(signature, cancel, ClientError::EngineUntrusted)?;
         Ok(directory)
     }
@@ -124,15 +124,15 @@ pub fn tun2proxy_version() -> Option<String> {
 }
 
 pub struct WindowsEngine {
-    shoes: ShoesProcess,
+    blazecore: BlazeCoreProcess,
     driver: Option<Driver>,
     tunnel: Option<Tunnel>,
 }
 
 impl WindowsEngine {
-    pub fn new(shoes: ShoesProcess) -> Self {
+    pub fn new(blazecore: BlazeCoreProcess) -> Self {
         Self {
-            shoes,
+            blazecore,
             driver: Driver::configured(),
             tunnel: None,
         }
@@ -145,11 +145,11 @@ impl WindowsEngine {
     ) -> Result<(), ClientError> {
         let driver = self.driver.as_ref().ok_or(ClientError::UnsupportedMode)?;
         require_elevation(cancel)?;
-        let directory = driver.stage(&self.shoes.data_directory, cancel)?;
+        let directory = driver.stage(&self.blazecore.data_directory, cancel)?;
         let (profile, bypass) = upstream(profile, cancel)?;
-        self.shoes
+        self.blazecore
             .start(ConnectionMode::LocalProxy, &profile, 0, cancel)?;
-        let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = self.shoes.poll()?
+        let EngineRuntime::Running(RunningConnection::LocalProxy(proxy)) = self.blazecore.poll()?
         else {
             return Err(ClientError::EngineReadiness);
         };
@@ -165,16 +165,16 @@ impl ClientEnginePort for WindowsEngine {
     fn capabilities(&self) -> ModeCapabilities {
         ModeCapabilities {
             tun: self.driver.is_some(),
-            ..self.shoes.capabilities()
+            ..self.blazecore.capabilities()
         }
     }
 
     fn validate_profile(&self, profile: &ProxyProfile) -> Result<(), ClientError> {
-        self.shoes.validate_profile(profile)
+        self.blazecore.validate_profile(profile)
     }
 
     fn supports_local_proxy_routing(&self) -> bool {
-        self.shoes.supports_local_proxy_routing()
+        self.blazecore.supports_local_proxy_routing()
     }
 
     fn start(
@@ -185,9 +185,9 @@ impl ClientEnginePort for WindowsEngine {
         cancel: &Cancellation,
     ) -> Result<(), ClientError> {
         if mode != ConnectionMode::Tun {
-            return self.shoes.start(mode, profile, port, cancel);
+            return self.blazecore.start(mode, profile, port, cancel);
         }
-        if self.tunnel.is_some() || self.shoes.child.is_some() {
+        if self.tunnel.is_some() || self.blazecore.child.is_some() {
             return Err(ClientError::DisconnectFirst);
         }
         let result = self.start_tunnel(profile, cancel);
@@ -202,7 +202,7 @@ impl ClientEnginePort for WindowsEngine {
             tunnel.stop()?;
         }
         self.tunnel = None;
-        self.shoes.stop()
+        self.blazecore.stop()
     }
 
     fn start_with_routing(
@@ -219,12 +219,12 @@ impl ClientEnginePort for WindowsEngine {
         if mode != ConnectionMode::LocalProxy {
             return Err(ClientError::UnsupportedMode);
         }
-        self.shoes
+        self.blazecore
             .start_with_routing(mode, profile, local_port, routing, cancel)
     }
 
     fn poll(&mut self) -> Result<EngineRuntime, ClientError> {
-        let runtime = self.shoes.poll()?;
+        let runtime = self.blazecore.poll()?;
         let Some(tunnel) = &self.tunnel else {
             return Ok(runtime);
         };
@@ -362,7 +362,7 @@ impl Tunnel {
         let mut config = tun::Configuration::default();
         // The interface name is exclusive to this session so an existing adapter is never opened.
         config
-            .tun_name(format!("VPN Client {}", uuid::Uuid::new_v4().simple()))
+            .tun_name(format!("Blazer {}", uuid::Uuid::new_v4().simple()))
             .address(TUN_ADDRESS)
             .netmask(Ipv4Addr::new(255, 255, 255, 252))
             .mtu(MTU)

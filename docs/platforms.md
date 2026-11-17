@@ -3,17 +3,76 @@
 | Платформа | Обязательство текущего этапа |
 | --- | --- |
 | Windows x64, `x86_64-pc-windows-msvc` | Локальные проверки и сборка native GUI + headless |
-| Linux | Целевая будущая платформа; отдельные build/runtime gates ещё не выполнены |
-| macOS | Целевая будущая платформа; нужен Apple build/runtime и packaging contract |
+| Linux x64 | Оболочка egui/Glow, защищённый каталог через Secret Service и локальный прокси через закреплённый BlazeCore. Проверка системного TUN отдельная |
+| macOS | Metal preview общего egui-интерфейса. Для проверки запуска нужен Mac с Xcode |
 | Android 8.0 и новее (API 26), `arm64-v8a` и `x86_64` | APK и нативный интерфейс поверх общего клиентского контроллера. Сетевой runtime принимает отдельный платформенный тест |
-| iOS | Будущая native оболочка, Apple signing и Network Extension |
-| OpenWrt / роутеры | Будущий headless backend без GUI; отдельно target/ABI/libc и ресурсный профиль |
+| iOS | Metal preview общего egui-интерфейса. Устройство, подпись и Network Extension проходят отдельную приёмку |
+| OpenWrt / роутеры | Будущий демон на `client-core` с веб-интерфейсом управления; отдельно target/ABI/libc и ресурсный профиль |
 | Другие устройства | Поддержка определяется отдельным целевым контрактом |
 
-Домен и application не привязаны к платформе. Общий backend используют desktop,
+## Каналы мобильных обновлений
+
+| Канал | Версия и установка |
+| --- | --- |
+| Android, APK с GitHub | `-Distribution Direct` пакует `Blazer-X.Y-android.apk` из тега, подписывает его заданным ключом и прописывает канал `direct`. Кнопка в Android-оболочке открывает GitHub Releases в браузере. Скачанный APK устанавливает Android с подтверждением пользователя. |
+| Android, Google Play | Установки с `com.android.vending` и сборки с метаданными `google-play` открывают карточку приложения в Google Play. Скачивание и установка идут через Play. Для выпуска ещё нужны AAB, Play App Signing и настройка треков. |
+| iOS, App Store / TestFlight | App Store Connect получает `CFBundleShortVersionString` в формате `X.Y.0` и отдельный `CFBundleVersion`. Обновление выполняет App Store или TestFlight. |
+
+Android использует одно application ID `com.kobaproduction.blazer`. Для перехода
+между каналами с сохранением данных нужны совместимая подпись и возрастающий
+`versionCode`. Upload key Google Play и app signing key выполняют разные роли.
+Решение о совместимой подписи принимается до первой публикации. Установки
+из Google Play используют обновление магазина. [Как Android обновляет приложения](https://developer.android.com/google/play/app-updates) · [Play App Signing](https://developer.android.com/studio/publish/app-signing) · [Правила обновлений Google Play](https://support.google.com/googleplay/android-developer/answer/16559646)
+
+Для прямого APK укажите `-SigningKeyStore`, `-SigningKeyAlias` и передайте
+пароль через `BLAZER_ANDROID_STORE_PASSWORD`. Если пароль ключа отличается,
+передайте его через `BLAZER_ANDROID_KEY_PASSWORD`. Отладочный APK использует
+локальный debug-ключ. Параметры `-TaggedVersion` и `-VersionCode` позволяют
+проверить версию на тестовом устройстве до публикации. [apksigner](https://developer.android.com/tools/apksigner) · [Версионирование Android](https://developer.android.com/studio/publish/versioning)
+
+`build-apple-preview.sh ios-simulator --tagged-version` проверяет перенос
+версии тега в `Info.plist`. Номер сборки задаётся через `BLAZER_APPLE_BUILD_NUMBER`.
+В подписанной iOS-цели эти значения переходят в `MARKETING_VERSION` и
+`CURRENT_PROJECT_VERSION` Xcode. Для повторной загрузки той же версии нужен
+новый номер сборки. Текущая Apple-цель собирает preview для симулятора.
+Подписанный архив и установка с App Store Connect проходят отдельную приёмку.
+[Версия и номер сборки Apple](https://developer.apple.com/documentation/Xcode/preparing-your-app-for-distribution)
+
+## Linux и Apple preview
+
+Linux запускается через пакет `blazer-linux`. По умолчанию каталог находится
+в `$XDG_DATA_HOME/blazer` или `$HOME/.local/share/blazer`. Для сохранения
+профилей требуются сессия D-Bus и разблокированный Secret Service. Ключ
+остаётся в Secret Service, каталог запечатывается через XChaCha20-Poly1305.
+Для локального прокси разместите доверенный ELF `blazecore` рядом с клиентом
+и передайте его проверенный SHA-256 и точную версию при сборке через
+`BLAZER_LINUX_CORE_SHA256` и `BLAZER_LINUX_CORE_VERSION`.
+На Linux x64 установите нативный toolchain Rust 1.95.0 и выполните из корня
+репозитория:
+
+```sh
+rustup run 1.95.0 cargo build --locked --target x86_64-unknown-linux-gnu -p blazer-linux
+```
+
+Исполняемый файл находится в `target/x86_64-unknown-linux-gnu/debug`.
+В Ubuntu x86_64 проверены открытие окна через X11, сохранение и повторное
+чтение каталога с GNOME Keyring, а также передача байтов через SOCKS5,
+BlazeCore и локальный HTTP CONNECT. Wayland и системный TUN ещё не приняты.
+
+Скрипт `scripts/build-apple-preview.sh` предназначен для Mac с Xcode и
+Rust 1.95.0 с соответствующим Apple target. Аргумент `macos` собирает
+исполняемый preview, аргумент `ios-simulator` собирает `BlazerPreview.app`
+для симулятора. Для симулятора Apple Silicon нужен `aarch64-apple-ios-sim`,
+для Intel — `x86_64-apple-ios`. Установите bundle через `xcrun simctl install`
+на запущенном симуляторе и откройте `com.kobaproduction.blazer.preview`.
+Оба preview используют общий экран egui с полем URL для проверки
+клавиатуры и масштабирования. Приёмка подписанной сборки на iPhone
+и сетевого расширения проходит отдельно.
+
+Домен и application не привязаны к платформе. Ядро клиента используют desktop,
 Android и headless. Headless dependency graph не включает GUI/window/webview библиотеки.
-Текущий `vpn-headless status` — завершающийся запрос, не daemon, IPC-сервис или
-подтверждённая сборка для OpenWrt. Политика проверок — только локальная, без CI.
+Текущий `blazer --cli status` — завершающийся запрос, не daemon, IPC-сервис или
+подтверждённая сборка для OpenWrt. Проверки разработки выполняются локально.
 
 Системные API и особенности VPN-туннеля принадлежат внешним адаптерам с
 целевыми зависимостями. Не устанавливать Windows target глобальным Cargo default.
@@ -25,7 +84,7 @@ HTTP-загрузка использует общий адаптер, а про�
 на rustls с корневыми сертификатами WebPKI.
 
 Рабочий Windows-пакет включает подписанный Wintun 0.14.1 AMD64 рядом с
-`vpn-client.exe`. `scripts/build-windows.ps1` берёт `wintun.dll` из каталога
+`blazer.exe`. `scripts/build-windows.ps1` берёт `wintun.dll` из каталога
 выбранной конфигурации сборки, сверяет закреплённый SHA-256 и сохраняет лицензию
 отдельным файлом `LICENSE-WINTUN`. Лицензия поставляется в `wintun/LICENSE.txt`
 зависимости `wintun-bindings` 0.7.40. Для сборки из другого локального кэша можно
@@ -35,7 +94,7 @@ HTTP-загрузка использует общий адаптер, а про�
 
 При запуске режима `Tun` клиент проверяет повышенные права процесса,
 SHA-256 приватной копии DLL и Authenticode. Для отдельного локального стенда
-можно задать обе переменные `VPN_CLIENT_WINTUN_DLL` и `VPN_CLIENT_WINTUN_SHA256`
+можно задать обе переменные `BLAZER_WINTUN_DLL` и `BLAZER_WINTUN_SHA256`
 с абсолютным путём и хешем проверенной DLL. Без этих переменных клиент ищет
 закреплённую DLL рядом с исполняемым файлом. Обычный запуск и `LocalProxy` не
 активируют драйвер.
@@ -44,32 +103,35 @@ SHA-256 приватной копии DLL и Authenticode. Для отдельн
 системные модули независимо от окружения PowerShell 7.
 Запрос готовности адресов проверен на системном loopback IPv4 и IPv6 без
 изменения сетевой конфигурации.
-Windows LocalProxy через закреплённый Shoes применил сохранённый профиль
+Windows LocalProxy через закреплённый BlazeCore применил сохранённый профиль
 маршрутизации из headless. Локальный стенд проверил порядок конфликтующих
 правил, прямой TCP по IPv4 и IPv6, блокировку, явный маршрут Proxy и маршрут
 Proxy по умолчанию. Разрешение тестового имени прошло через указанный TCP
-DNS. DoT и DoH прошли проверку конфигурации Shoes. Системная маршрутизация
+DNS. DoT и DoH прошли проверку конфигурации BlazeCore. Системная маршрутизация
 пользовательских правил через Wintun требует отдельной приёмки.
 Во время VPN-сессии адаптер Windows подписывается на изменения таблицы
 маршрутов. При потере обязательного маршрута клиент завершает подключение.
 Периодическая проверка состояния перечитывает таблицу только при уведомлении.
 На Windows тестовый пакетный интерфейс передал IPv4/TCP и IPv6/TCP через
-relay, реальный Shoes и локальный HTTP CONNECT. Тест сверяет байты и семейство
+relay, реальный BlazeCore и локальный HTTP CONNECT. Тест сверяет байты и семейство
 ответного пакета. UDP DNS-запрос к тестовому адресу был передан по TCP через
-тот же Shoes, а синтетический ответ вернулся как UDP-пакет. Запрос и ответ
+тот же BlazeCore, а синтетический ответ вернулся как UDP-пакет. Запрос и ответ
 проверяются байт в байт.
 Отдельный тест локального прокси после повторного чтения каталога подтвердил
 TLS ALPN `http/1.1` и передачу байтов для Xray JSON, sing-box JSON в Base64 и URI.
-Для XHTTP проверена передача байтов через локальный Shoes по HTTP/1.1 в четырёх
+Для XHTTP проверена передача байтов через локальный BlazeCore по HTTP/1.1 в четырёх
 режимах. HTTP/2 и HTTP/3 проверены в режиме `stream-one` после перезапуска
 headless-клиента и повторного чтения каталога.
-WebSocket Early Data проверен через локальный прокси и закреплённый Shoes.
+На Windows импорт Xray `extra` проверен в режиме `packet-up` с пользовательскими
+ключами XHTTP. Стенд получил точные байты в двух обменах по одному соединению
+для комбинаций размещения `header/query`, `cookie/header` и `query/cookie`.
+WebSocket Early Data проверен через локальный прокси и закреплённый BlazeCore.
 В тесте URI Xray отправил VLESS-заголовок в `Sec-WebSocket-Protocol`. Профили
 sing-box в Base64 отправили его в собственном HTTP-заголовке и в суффиксе пути.
 Стенд проверил фактический запрос и ответные данные во всех трёх сценариях.
 Импорт Xray VLESS с `encryption` прошёл локальный обмен точными байтами
-через Shoes для TCP с `native/0rtt` и WebSocket с Vision и `xorpub/1rtt`.
-Hysteria2 прошёл IPv4/TCP-обмен через QUIC между двумя экземплярами Shoes
+через BlazeCore для TCP с `native/0rtt` и WebSocket с Vision и `xorpub/1rtt`.
+Hysteria2 прошёл IPv4/TCP-обмен через QUIC между двумя экземплярами BlazeCore
 после импорта URI и sing-box JSON в Base64 и повторного чтения каталога.
 URI с правильным SHA-256 сертификата установил соединение, а с неверным
 отпечатком передача данных была отклонена.
@@ -80,24 +142,24 @@ SOCKS5-ссылки без схемы и массив с обёрнутым sing
 Windows relay, локальный SOCKS5 и Hysteria2 по QUIC. Проверены точные байты,
 исходный адрес назначения в ответе и оба UDP-порта.
 Этот тест также прошёл с Salamander. Локальный стенд проверял формат Salamander
-перед передачей пакетов серверу Shoes.
+перед передачей пакетов серверу BlazeCore.
 При отдельном прогоне release-сборки принудительно завершили headless-клиент
-с активным локальным прокси. Windows остановила принадлежащий клиенту Shoes,
+с активным локальным прокси. Windows остановила принадлежащий клиенту BlazeCore,
 и его loopback-порт освободился.
 
 Для отдельной проверки системного интерфейса используйте изолированную
-Windows x64 с повышенным терминалом. Задайте `VPN_CLIENT_WINTUN_DLL`,
-`VPN_CLIENT_WINTUN_SHA256` и `VPN_CLIENT_TEST_SHOES_EXE` с абсолютным путём
-к закреплённому `shoes.exe`. В примере репозиторий находится в `C:\work\vpn-client`.
+Windows x64 с повышенным терминалом. Задайте `BLAZER_WINTUN_DLL`,
+`BLAZER_WINTUN_SHA256` и `BLAZER_TEST_BLAZECORE_EXE` с абсолютным путём
+к закреплённому `blazecore.exe`. В примере репозиторий находится в `C:\work\Blazer`.
 
 ```powershell
-Set-Location -LiteralPath 'C:\work\vpn-client'
+Set-Location -LiteralPath 'C:\work\Blazer'
 cargo test --locked --target x86_64-pc-windows-msvc -p vpn-infrastructure client_engine::windows_tunnel::tests::windows_system_tun_crosses_wintun -- --ignored --exact
 ```
 
 Тест меняет маршруты на время сессии. Он проверяет выбор Wintun для тестовых
 адресов IPv4 и IPv6, локальные адреса TCP-сокетов, точные ответы по TCP и UDP DNS
-через Wintun и Shoes, отключение клиента после удаления одного маршрута
+через Wintun и BlazeCore, отключение клиента после удаления одного маршрута
 туннеля и восстановление исходной маршрутизации.
 Эта проверка требует повышенных прав и изолированной Windows-среды.
 
@@ -124,16 +186,16 @@ cargo test --locked --target x86_64-pc-windows-msvc -p vpn-infrastructure client
 при открытии и системное задание после завершения процесса отправили
 `If-None-Match` и получили два ответа `304` с нулём байт тела.
 Сборка содержит ARM64 ABI, проверка на ARM64-устройстве ещё предстоит.
-В APK с библиотекой Shoes доступен Android-адаптер `VpnService`. Он запрашивает
+В APK с библиотекой BlazeCore доступен Android-адаптер `VpnService`. Он запрашивает
 системное согласие и запускает foreground-службу на время соединения. При
-открытии сессии адаптер проверяет наличие `libshoes.so` в каталоге установленных
-библиотек приложения. Версия и инициализация Shoes проверяются на worker при
+открытии сессии адаптер проверяет наличие `libblazecore.so` в каталоге установленных
+библиотек приложения. Версия и инициализация BlazeCore проверяются на worker при
 первом подключении, до открытия TUN. Импорт и обновление подписок используют
-общий Rust backend без загрузки Shoes. Маршруты
-IPv4 и IPv6 принадлежат ОС; клиент использует DNS Shoes через выбранный прокси.
+ядро клиента на Rust без загрузки BlazeCore. Маршруты
+IPv4 и IPv6 принадлежат ОС; клиент использует DNS BlazeCore через выбранный прокси.
 В текущей конфигурации адрес DNS-резолвера фиксирован (`1.1.1.1`).
 На эмуляторе API 35 x86_64 получено системное согласие и подтверждён обмен
-точными байтами через TUN, Shoes и локальный HTTP CONNECT. После отключения
+точными байтами через TUN, BlazeCore и локальный HTTP CONNECT. После отключения
 тестовый ответ через этот маршрут не получался. Этот тест покрывает IPv4/TCP.
 В дополнительном прогоне с TLS-профилем, импортированным из URI, локальный
 сервер согласовал ALPN `http/1.1` и получил подтверждение приёма точного ответа
@@ -141,17 +203,17 @@ IPv4 и IPv6 принадлежат ОС; клиент использует DNS 
 VLESS XHTTP `stream-one` по HTTP/2 также проверен через системный Android TUN
 после импорта URI. Приложение получило точный ответ и штатно отключилось.
 Для VLESS Vision с `encryption` отдельный прогон API 35 x86_64 проверил URI,
-IPv4/TCP через системный TUN и Shoes с `native/1rtt` и ML-KEM-768 для
+IPv4/TCP через системный TUN и BlazeCore с `native/1rtt` и ML-KEM-768 для
 аутентификации сервера. Удалённая сторона получила подтверждение точного ответа,
 а после отключения пробный адрес стал недоступен.
 Hysteria2 URI с закреплённым сертификатом также прошёл IPv4/TCP через
-системный Android TUN и QUIC до Shoes. После штатного отключения тестовый
+системный Android TUN и QUIC до BlazeCore. После штатного отключения тестовый
 адрес стал недоступен.
 В отдельном прогоне тот же APK передал обычную IPv4 UDP-датаграмму с точным
 ответом через Android TUN и Hysteria2 по QUIC. Синтетический адрес был
 недоступен до подключения и после отключения.
 На API 35 x86_64 APK также передал UDP с Salamander через системный TUN.
-Стенд использовал отдельную реализацию формата пакетов Salamander и сервер Shoes.
+Стенд использовал отдельную реализацию формата пакетов Salamander и сервер BlazeCore.
 На API 26 x86_64 проверен также VLESS WebSocket Early Data через системный
 Android TUN. Стенд получил VLESS-заголовок в `Sec-WebSocket-Protocol`, сверил
 двусторонний TCP-обмен и подтвердил восстановление маршрута после отключения.

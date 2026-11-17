@@ -1,0 +1,20 @@
+[package]
+name = "blazer-ios-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blazer-ios-preview"
+path = "main.rs"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+client-ui.workspace = true
+eframe = { workspace = true, features = ["default_fonts", "links", "wgpu_no_default_features"] }
+vpn-presentation.workspace = true
+wgpu = { version = "=30.0.1", default-features = false, features = ["metal", "std", "wgsl"] }
+
+[lints]
+workspace = true

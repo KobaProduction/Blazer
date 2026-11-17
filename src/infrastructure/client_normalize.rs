@@ -8,15 +8,16 @@ use vpn_application::MAX_SUBSCRIPTION_BYTES;
 use vpn_application::client::{ClientError, ClientNormalizerPort, MAX_PROFILES};
 use vpn_domain::client::{
     AlpnProtocols, ProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport, Secret,
-    WebSocketEarlyData, XhttpMode,
+    TlsFingerprint, WebSocketEarlyData,
 };
 
+mod blazecore;
 mod hysteria2;
 mod json;
 mod links;
-mod shoes;
 mod sing_box;
 mod subscription;
+mod xhttp;
 mod xray;
 
 #[cfg(test)]
@@ -128,6 +129,9 @@ fn make_profile(
         return Err(ClientError::InvalidSubscription);
     }
     let host = endpoint_host(host)?;
+    if matches!(transport, ProxyTransport::Quic { .. }) && security.fingerprint().is_some() {
+        return Err(ClientError::UnsupportedFeature);
+    }
     if let ProxyTransport::WebSocket {
         host: authority,
         early_data: Some(_),
@@ -272,6 +276,7 @@ fn verified_tls(
         server_name: endpoint_host(server_name)?,
         allow_insecure: insecure,
         alpn,
+        fingerprint: None,
     })
 }
 
@@ -288,7 +293,30 @@ fn reality(server_name: &str, key: &str, short_id: &str) -> Result<ProxySecurity
         server_name: endpoint_host(server_name)?,
         public_key: URL_SAFE_NO_PAD.encode(key),
         short_id: short_id.to_ascii_lowercase(),
+        fingerprint: None,
     })
+}
+
+fn with_tls_fingerprint(
+    mut security: ProxySecurity,
+    value: Option<&str>,
+) -> Result<ProxySecurity, ClientError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(security);
+    };
+    let fingerprint = Some(TlsFingerprint::parse(value)?);
+    match &mut security {
+        ProxySecurity::Tls {
+            fingerprint: selected,
+            ..
+        }
+        | ProxySecurity::Reality {
+            fingerprint: selected,
+            ..
+        } => *selected = fingerprint,
+        ProxySecurity::None => return Err(ClientError::UnsupportedFeature),
+    }
+    Ok(security)
 }
 
 fn websocket(
@@ -353,32 +381,6 @@ fn xray_websocket(path: &str, host: Option<&str>) -> Result<ProxyTransport, Clie
         header_name: Some("sec-websocket-protocol".into()),
     });
     websocket(&path, host, early_data)
-}
-
-fn xhttp(
-    path: &str,
-    host: Option<&str>,
-    mode: Option<&str>,
-) -> Result<ProxyTransport, ClientError> {
-    if path.len() > 4096
-        || path.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-        || path.contains('#')
-    {
-        return Err(ClientError::InvalidSubscription);
-    }
-    let mode = mode
-        .filter(|value| !value.is_empty())
-        .unwrap_or("auto")
-        .parse::<XhttpMode>()?;
-    let host = http_authority(host)?;
-    if host.as_ref().is_some_and(|value| !value.is_ascii()) {
-        return Err(ClientError::InvalidSubscription);
-    }
-    Ok(ProxyTransport::Xhttp {
-        path: path.to_owned(),
-        host,
-        mode,
-    })
 }
 
 fn http_authority(host: Option<&str>) -> Result<Option<String>, ClientError> {

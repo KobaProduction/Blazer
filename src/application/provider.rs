@@ -2,7 +2,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vpn_domain::client::{ClientError, Secret, SubscriptionHttpError};
+use vpn_domain::client::{ClientError, ClientSettings, Secret, SubscriptionHttpError};
 use vpn_domain::provider::{
     PendingProviderChange, ProviderChangeKind, ProviderEndpoint, ProviderKey, ProviderMetadata,
     ProviderState,
@@ -46,6 +46,7 @@ pub struct FetchRequest<'a> {
     pub follow_same_origin_redirects: bool,
     pub known_version: Option<&'a Secret>,
     pub send_hwid: bool,
+    pub user_agent: Option<&'a Secret>,
 }
 
 pub struct FetchedSubscription {
@@ -77,7 +78,7 @@ pub(crate) fn fetch_update(
     source: &dyn SubscriptionSourcePort,
     primary: &ProviderEndpoint,
     state: &ProviderState,
-    send_hwid: bool,
+    settings: &ClientSettings,
     cancel: &Cancellation,
 ) -> Result<(FetchOutcome, bool), ClientError> {
     let prior_metadata = state
@@ -94,7 +95,8 @@ pub(crate) fn fetch_update(
         timeout,
         follow_same_origin_redirects: fallback.is_none(),
         known_version: state.cached_version.as_ref(),
-        send_hwid,
+        send_hwid: settings.send_subscription_hwid,
+        user_agent: settings.subscription_user_agent.as_ref(),
     };
     match source.fetch(request, cancel) {
         Ok(result) => Ok((result, false)),
@@ -106,7 +108,8 @@ pub(crate) fn fetch_update(
                 timeout,
                 follow_same_origin_redirects: false,
                 known_version: None,
-                send_hwid,
+                send_hwid: settings.send_subscription_hwid,
+                user_agent: settings.subscription_user_agent.as_ref(),
             };
             Ok((source.fetch(request, cancel)?, true))
         }

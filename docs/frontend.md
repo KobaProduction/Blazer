@@ -25,22 +25,23 @@ WebView или Tauri. [Продуктовые требования](product-requ
 Загрузка или сохранение начинается после подтверждения в форме.
 Переносимая сборка не регистрирует URL-схему в Windows.
 
-## Структура desktop
+## Общий egui-интерфейс
 
-- `native/` создаёт окно eframe и подключает сессию и уведомления о
-  перерисовке. Захват кадров использует отдельную демо-сессию.
-- `presentation/view_model.rs` хранит маршрут и черновик формы.
-  `presentation/settings_state.rs` хранит настройки внешнего вида и локальные
-  черновики неподключённых параметров.
-- `presentation/widgets/` отображает снимок backend и возвращает намерение.
-  Здесь находятся каркас окна, компоненты и отдельные экраны.
-- `../shared/controller.rs` преобразует намерение в типизированную команду,
+- `src/presentation/client-ui` содержит экраны, модели, тему и общие компоненты.
+  Компоновка вычисляется на каждом кадре по доступной логической ширине:
+  ниже 600 — mobile с нижней навигацией, от 600 до 899 — tablet с узкой
+  боковой панелью, от 900 — desktop с разворачиваемой боковой панелью.
+  Короткое окно переводит подключения и каталог в общую прокрутку.
+  Смена компоновки сохраняет маршрут, поиск, выбор сервера и черновики.
+- `src/platform/windows` создаёт окно eframe, подключает сессию и уведомления
+  о перерисовке. Захват кадров использует отдельную демо-сессию.
+- `src/presentation/shared/controller.rs` преобразует намерение в типизированную команду,
   отправляет её через `ClientHandle` и обновляет снимок.
 
 ## Команды и состояние
 
-GUI вызывает только общий backend через `ClientHandle`: bounded `send`,
-cached `snapshot` и notifier. Загрузка подписки, parse, storage и Shoes lifecycle
+GUI вызывает ядро клиента через `ClientHandle`: bounded `send`,
+cached `snapshot` и notifier. Загрузка подписки, parse, storage и BlazeCore lifecycle
 не выполняются в UI-потоке. Snapshot меняется по revision; notifier запрашивает
 repaint при изменении состояния. Atomic dirty-флаг не позволяет клонировать списки snapshot на каждом input-only кадре. Постоянного status-poll/repaint timer нет.
 Native title обновляется при изменении языка.
@@ -59,7 +60,7 @@ Native title обновляется при изменении языка.
 домены и предупреждение о передаче полного URL при обновлении. Скрытие данных
 конфига относится к серверам данной подписки. TCP-проба возвращает задержку
 или отказ для конкретного профиля. Профили маршрутизации, упорядоченные правила,
-DNS и назначение подписке используют общий backend. Сохранённая версия правил
+DNS и назначение подписке используют ядро клиента. Сохранённая версия правил
 вступает в силу при следующем соединении LocalProxy. Глобальные настройки
 фонового расписания, дополнительные методы пинга и счётчики статистики
 показываются как черновики или недоступные действия.
@@ -68,11 +69,11 @@ DNS и назначение подписке используют общий bac
 не зависят от переведённых строк и позиции в списке. Профили можно фильтровать
 по подписке и имени; protocol/server/user names являются данными, а не переводами.
 
-Connecting допускает отмену через backend Disconnect только по согласованному
+Connecting допускает отмену через команду ядра Disconnect только по согласованному
 cancellation contract. Disconnecting остаётся pending до подтверждения.
-Ошибки очереди/остановленного backend и typed operation errors отображаются
+Ошибки очереди/остановленного ядра и typed operation errors отображаются
 по текущему языку, без Debug dumps или raw URI. Журнал использует только bounded
-safe enum events backend. Close вызывает bounded backend shutdown вне render.
+типизированные события ядра. Close вызывает остановку ядра с ограничением по времени вне render.
 
 Доступность режимов определяется `mode_capabilities`. Выбор сохраняется
 командой `SetConnectionMode`, затем Connect использует подтверждённый
@@ -81,7 +82,7 @@ safe enum events backend. Close вызывает bounded backend shutdown вне
 можно сохранить порт общего слушателя LocalProxy для следующего подключения.
 Порт `0` выбирается автоматически. Порт уже активного соединения показан отдельно. При
 `cleanup_required` основная кнопка повторяет отключение. Изменение маршрутов
-и локального DNS требует поддержки backend.
+и локального DNS требует поддержки в ядре клиента.
 
 ## RU и EN
 
@@ -91,8 +92,8 @@ safe enum events backend. Close вызывает bounded backend shutdown вне
 named parameters. Вставленные пользовательские значения не интерпретируются
 как новый шаблон. Протоколы, UUID, адреса и пользовательские названия сохраняются.
 
-Язык меняется через backend `SetLanguage` и его persistent settings.
-UI не создаёт backend заново, не переимпортирует данные и не меняет выбор
+Язык меняется через команду ядра `SetLanguage` и его persistent settings.
+UI не создаёт новую сессию ядра, не переимпортирует данные и не меняет выбор
 профиля/маршруты/consent ради перевода. До acknowledgement snapshot остаётся
 источником подтверждённого языка. Каталог имеет deterministic English fallback
 для неизвестного language tag и видимый fallback key для отсутствующего
@@ -100,22 +101,22 @@ dynamic message ID. В production widgets используются typed keys.
 
 ## Проверки и доказанность
 
-Для просмотра интерфейса запустите отдельный бинарник `vpn-client-demo`.
-Он открывает те же экраны с тестовыми профилями в памяти. Импорт, обновление
+Для просмотра интерфейса запустите debug-сборку `blazer --demo`.
+Демо открывает те же экраны с тестовыми профилями в памяти. Импорт, обновление
 подписок, пинг и подключение имитируются. После перезапуска демо снова
 загружает исходные примеры. Рабочий клиент сохраняет каталог через DPAPI
-и выполняет эти действия через обычный backend.
+и выполняет эти действия через ядро клиента.
 
 Команды интерактивного запуска и захвата PNG из рендера egui:
 
 ```powershell
 cd C:\Users\Koba\VPN\Blazer
-cargo run --locked -p vpn-client --no-default-features --features demo --bin vpn-client-demo
-cargo run --locked -p vpn-client --no-default-features --features demo --bin vpn-client-demo -- --screenshot layout.png home
+cargo run --locked -p blazer --features demo -- --demo
+cargo run --locked -p blazer --features demo -- --demo --screenshot layout.png home
 ```
 
 Тот же параметр `--screenshot <file.png> [screen]` поддерживает
-[пакет Windows для демо](../README.md#пакеты-windows).
+[Debug-пакет Windows](../README.md#пакеты-windows) в режиме `--demo`.
 
 Для захвата доступны `home`, `home-sample`, `home-expanded`, `home-compact`,
 `home-connecting`, `home-connected`, `add-compact`, `excluded-routes-edit`,
@@ -137,5 +138,5 @@ Scoped Cargo tests/Clippy относятся только к desktop package и 
 затронутому поведению. Полный финальный gate выполняется одним интегратором
 после стабилизации. Source/build проверки не заменяют видимый GUI runtime,
 keyboard/focus, Windows DPI 100/150/200%, long-name layout и реальную интеграцию.
-Подписки/engine/persistence доказываются совместными backend-сценариями;
+Подписки/engine/persistence доказываются интеграционными сценариями ядра;
 наличие кнопки само по себе не означает работу функции.

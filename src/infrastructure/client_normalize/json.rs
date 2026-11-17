@@ -7,8 +7,8 @@ use vpn_domain::client::TcpProbeEndpoint;
 
 use super::subscription::{SubscriptionProfiles, is_tcp_transport, protocol_label};
 use super::{
-    AlpnProtocols, ClientError, MAX_PROFILES, ProxyProfile, endpoint_host, links, shoes, sing_box,
-    xray,
+    AlpnProtocols, ClientError, MAX_PROFILES, ProxyProfile, blazecore, endpoint_host, links,
+    sing_box, xray,
 };
 
 pub(super) fn parse_document(text: &str) -> Result<Vec<ProxyProfile>, ClientError> {
@@ -96,7 +96,7 @@ fn static_xray_outbound(outbound: &Value, xray: bool) -> Result<bool, ClientErro
 fn parse_outbound(value: &Value) -> Result<ProxyProfile, ClientError> {
     match (value.get("protocol"), value.get("type")) {
         (Some(protocol), None) if protocol.is_string() => xray::parse_outbound(value),
-        (Some(protocol), None) if protocol.is_object() => shoes::parse(value),
+        (Some(protocol), None) if protocol.is_object() => blazecore::parse(value),
         (None, Some(_)) => sing_box::parse_outbound(value),
         (Some(_), Some(_)) => Err(ClientError::UnsupportedFeature),
         (_, None) => Err(ClientError::UnsupportedFormat),
@@ -147,17 +147,7 @@ fn append_subscription_wrapper(
         .filter(|outbound| is_proxy_outbound(outbound))
         .all(|outbound| outbound.get("protocol").is_some_and(Value::is_string));
     if !independent_outbounds(document, outbounds, xray)? {
-        let protocol = wrapper_protocol(outbounds);
-        return profiles.append(Err(ClientError::UnsupportedFeature), true, |reason| {
-            let mut proxies = outbounds
-                .iter()
-                .filter(|outbound| is_proxy_outbound(outbound));
-            let endpoint = proxies
-                .next()
-                .filter(|_| proxies.next().is_none())
-                .and_then(tcp_probe_endpoint);
-            UnavailableProfile::new(name, protocol, reason).with_probe_endpoint(endpoint)
-        });
+        return append_unavailable_wrapper(outbounds, name, profiles);
     }
     let single_proxy = outbounds
         .iter()
@@ -170,6 +160,27 @@ fn append_subscription_wrapper(
         }
     }
     Ok(())
+}
+
+fn append_unavailable_wrapper(
+    outbounds: &[Value],
+    name: &str,
+    profiles: &mut SubscriptionProfiles,
+) -> Result<(), ClientError> {
+    let protocol = wrapper_protocol(outbounds);
+    let mut proxies = outbounds
+        .iter()
+        .filter(|outbound| is_proxy_outbound(outbound));
+    let only_proxy = proxies.next().filter(|_| proxies.next().is_none());
+    let error = if only_proxy.is_some_and(xray::unsupported_xhttp_upload_method) {
+        ClientError::UnsupportedXhttpUploadMethod
+    } else {
+        ClientError::UnsupportedFeature
+    };
+    profiles.append(Err(error), true, |reason| {
+        UnavailableProfile::new(name, protocol, reason)
+            .with_probe_endpoint(only_proxy.and_then(tcp_probe_endpoint))
+    })
 }
 
 fn independent_outbounds(
@@ -248,7 +259,7 @@ fn append_subscription_outbound(
             outbound_protocol(outbound),
             reason,
         );
-        if reason == ProfileUnavailableReason::Unsupported {
+        if reason.supports_tcp_probe() {
             return row.with_probe_endpoint(tcp_probe_endpoint(outbound));
         }
         row

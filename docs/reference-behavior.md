@@ -8,9 +8,8 @@
 
 ## Отличия Blazer
 
-- В целевой архитектуре один режим TUN обеспечивается собственным ядром
-  Shoes, будущее название — Blazecore. Платформенный адаптер предоставляет
-  интерфейс ОС. Список реализаций TUN в Happ служит материалом для
+- В целевой архитектуре один режим TUN обеспечивает BlazeCore. Платформенный
+  адаптер предоставляет интерфейс ОС. Список реализаций TUN в Happ служит материалом для
   сопоставления.
 - При изменении маршрутизации активного соединения Blazer предлагает
   применить правила сейчас с переподключением либо при следующем подключении.
@@ -62,7 +61,7 @@ D не означает runtime-совместимость нашего клие
 | Настройки VPN и logging как самостоятельные экраны | U для локальной версии; T | C07/C08: capability-aware UI и ограниченная диагностика |
 | Сворачивание/фон/tray/автозапуск | U для конкретной версии | C07/C11/C15: lifecycle и энергия до обещания паритета |
 | Внешний вид, темы, accessibility, навигация | U для конкретной версии; T: простой native UI | Проверить размеры/touch/keyboard без копирования бренда |
-| Device/session control, Shoes modules, OTel | Не установлено как Happ parity; наши T | Отдельные требования продукта и core authority |
+| Device/session control, BlazeCore modules, OTel | Не установлено как Happ parity; наши T | Отдельные требования продукта и core authority |
 
 Официальная страница app management содержит много platform/provider-specific
 параметров. Группы ниже сохраняют охват исследования, но не подменяют тесты
@@ -110,7 +109,7 @@ D не означает runtime-совместимость нашего клие
 `subscriptions-sort-type`. Qt-методы модели различают
 `subscriptionParamsUpdate`, `subscriptionStateUpdate` и
 `subscriptionUpdatedDone`. В каталоге Blazer состояние подписки и статусы
-операций тоже проходят через снимок backend. Кнопки перехода используют
+операций тоже проходят через снимок состояния ядра. Кнопки перехода используют
 проверенные HTTP(S)-ссылки и открываются по действию пользователя.
 
 Blazer читает известные HTTP-заголовки и начальные комментарии текстовой
@@ -135,10 +134,10 @@ Blazer читает известные HTTP-заголовки и начальн
 | `fallback-url`, `new-url`, `new-domain`, `hide-settings` | Резервный источник, миграция с проверкой origin и скрытие сведений профиля |
 | `profile-title`, `name` | Определяют название при добавлении и обновлении подписки с автоматическим именем. При отсутствии этих полей клиент проверяет параметр `name` в URL, затем использует имя хоста. Пустое поле имени включает этот режим. Имя, заданное вручную, сохраняется |
 | `providerid`, `subscription-auto-update-enable`, `change-user-agent`, `manual-block-user-agent`, `dont-use-filter` | Проводные значения распознаются. Глобальные настройки и фильтры сохраняют существующее поведение |
-| `notification-subs-expire`, `subscription-ping-onopen-enabled`, `ping-type`, `check-url-via-proxy`, `proxy-ping-mode`, `proxy-ping-timeout` | Будущие отдельные сценарии системного уведомления, автопинга и измерения через Shoes. Текущий прямой TCP-пинг использует общий backend |
+| `notification-subs-expire`, `subscription-ping-onopen-enabled`, `ping-type`, `check-url-via-proxy`, `proxy-ping-mode`, `proxy-ping-timeout` | Будущие отдельные сценарии системного уведомления, автопинга и измерения через BlazeCore. Текущий прямой TCP-пинг использует ядро клиента |
 | `color-profile`, `subscription-autoconnect*`, `app-auto-start`, `subscription-*-hwid-*`, `no-limit-*` | Документированные параметры Happ без применения к настройкам и полномочиям приложения Blazer |
 | `routing*`, `*-auth-*`, `custom-tunnel-config`, `tun-*`, `proxy-enable`, `xray-tun-*`, `inbound-http-enable`, `exclude-routes*`, `include-all-networks-enable`, `exclude-*-enable`, `per-app-proxy-*`, `block-bind-to-tunnel-enable`, `hide-vpn-icon` | Платформенные настройки Happ. Реальные операции туннеля и маршрутизации Blazer используют собственные типизированные команды |
-| `fragmentation-*`, `noises-*`, `mux-*`, `sniffing-enable`, `server-address-resolve-*`, `dns-from-json-enable`, `user-agent-geo-files` | Параметры сетевого ядра Happ. Совместимость определяется возможностями Shoes |
+| `fragmentation-*`, `noises-*`, `mux-*`, `sniffing-enable`, `server-address-resolve-*`, `dns-from-json-enable`, `user-agent-geo-files` | Параметры сетевого ядра Happ. Совместимость определяется возможностями BlazeCore |
 | `encrypt-tag`, `happ://crypt4/`, `happ://crypt5/` | Отдельные защищённые форматы отложены |
 
 Сводный и подписочный журнал Blazer получают результат обновления, сбой и
@@ -166,7 +165,7 @@ Blazer читает известные HTTP-заголовки и начальн
 Полезные идеи для самостоятельного проектирования: отдельное ядро и client
 application, headless entrypoints, platform hooks и явная диагностика
 неподдержанных возможностей. Эти идеи не являются доказательством реализации
-аналогичных функций у нас или замены выбранного Shoes.
+аналогичных функций у нас или замены выбранного BlazeCore.
 
 **Граница владельца: наш код — только MIT, из Unbihex берём только концепции
 и идеи, никакой код не переносится.** Его BSL не становится лицензией или

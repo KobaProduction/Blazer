@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use vpn_domain::routing::{DnsPolicy, RouteAction, RouteRule, RouteTarget, RoutingInput};
 
-const PROXY_GROUP: &str = "vpn-client-outbound";
+const PROXY_GROUP: &str = "blazer-outbound";
 
 pub(super) fn proxy_group(proxy: Value) -> Value {
     json!({"client_group": PROXY_GROUP, "client_chains": [{"chain": [proxy]}]})
