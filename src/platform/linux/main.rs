@@ -2,8 +2,6 @@
 mod app;
 #[cfg(target_os = "linux")]
 mod catalog;
-#[cfg(target_os = "linux")]
-mod catalog_cipher;
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>com.kobaproduction.blazer.packet-tunnel</string>
+    <key>CFBundleIdentifier</key><string>com.kobaproduction.blazer.packet-tunnel</string>
+    <key>CFBundleName</key><string>Blazer Packet Tunnel</string>
+    <key>CFBundlePackageType</key><string>SYSX</string>
+    <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.packet-tunnel</key><string>BlazerPacketTunnelProvider</string>
+        </dict>
+    </dict>
+</dict>
+</plist>

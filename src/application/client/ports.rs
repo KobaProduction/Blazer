@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::{Cancellation, Catalog, ClientError, ConnectionMode, ProxyProfile, UnavailableProfile};
 use crate::provider::{FetchError, FetchOutcome, FetchRequest};
 use crate::session::{ModeCapabilities, RoutingProfile};
+use vpn_domain::client::ProbeSettings;
 use vpn_domain::provider::{ProviderEndpoint, ProviderMetadata};
 
 pub trait StateStorePort: Send {
@@ -46,10 +47,14 @@ pub trait UuidPort: Send {
 }
 
 pub trait ProfileProbePort: Send {
+    fn supports_icmp(&self) -> bool {
+        false
+    }
     /// Each result corresponds to the endpoint at the same index.
     fn connect_times(
         &self,
         endpoints: &[(&str, u16)],
+        settings: &ProbeSettings,
         cancel: &Cancellation,
     ) -> Result<Vec<Result<Duration, ClientError>>, ClientError>;
 }
@@ -88,6 +93,23 @@ pub trait ClientEnginePort: Send {
     fn capabilities(&self) -> ModeCapabilities;
     /// Checks that this engine can represent the profile without starting a connection.
     fn validate_profile(&self, profile: &ProxyProfile) -> Result<(), ClientError>;
+    fn supports_tunnel_probe(&self) -> bool {
+        false
+    }
+    /// Can measure the current TUN connection without starting another tunnel.
+    fn supports_active_tunnel_probe(&self) -> bool {
+        false
+    }
+    fn probe_tunnel(
+        &self,
+        _profile: &ProxyProfile,
+        _active: Option<&ProxyProfile>,
+        _reuse_active_proxy: bool,
+        _settings: &ProbeSettings,
+        _cancel: &Cancellation,
+    ) -> Result<Duration, ClientError> {
+        Err(ClientError::UnsupportedFeature)
+    }
     fn start(
         &mut self,
         mode: ConnectionMode,
@@ -95,7 +117,7 @@ pub trait ClientEnginePort: Send {
         local_port: u16,
         cancel: &Cancellation,
     ) -> Result<(), ClientError>;
-    fn supports_local_proxy_routing(&self) -> bool {
+    fn supports_routing(&self, _mode: ConnectionMode) -> bool {
         false
     }
     fn start_with_routing(

@@ -433,12 +433,11 @@ fn strip_metadata(body: Vec<u8>, metadata: &mut ProviderMetadata) -> Result<Vec<
 }
 
 fn parse_comment(comment: &str, metadata: &mut ProviderMetadata) -> Result<(), ClientError> {
-    let pair = comment
-        .split_once(':')
-        .or_else(|| comment.split_once(char::is_whitespace));
-    if let Some((name, value)) = pair
-        && let Some(key) = ProviderKey::from_wire(name.trim())
+    if let Some(separator) = comment.find(|ch: char| ch == ':' || ch.is_whitespace())
+        && let Some(key) = ProviderKey::from_wire(&comment[..separator])
     {
+        let value = comment[separator..].trim_start();
+        let value = value.strip_prefix(':').unwrap_or(value);
         insert(metadata, key, value.trim())?;
     }
     Ok(())

@@ -195,15 +195,6 @@ impl ClientHandle {
         let component_versions = ComponentVersions {
             expected_blazecore: (!options.expected_engine_version.is_empty())
                 .then(|| options.expected_engine_version.clone()),
-            #[cfg(windows)]
-            tun2proxy: vpn_infrastructure::client_engine::tun2proxy_version(),
-            #[cfg(not(windows))]
-            tun2proxy: None,
-            #[cfg(windows)]
-            bundled_wintun: vpn_infrastructure::client_engine::bundled_wintun_version()
-                .map(str::to_owned),
-            #[cfg(not(windows))]
-            bundled_wintun: None,
         };
         Self::spawn_worker(
             options.subscription_refresh,
@@ -374,6 +365,9 @@ fn validate_command(command: &ClientCommand) -> Result<(), ClientError> {
             }
             Subscription::validate_title(name)?;
         }
+        ClientCommand::UpdateProfile { profile_uuid, text } => {
+            validate_profile_update(profile_uuid, text)?;
+        }
         ClientCommand::AddSubscription { title: name, url }
         | ClientCommand::UpdateSubscription {
             title: name, url, ..
@@ -422,6 +416,7 @@ fn validate_command(command: &ClientCommand) -> Result<(), ClientError> {
         ClientCommand::SetSubscriptionUserAgent { value: Some(value) } => {
             validate_subscription_user_agent(value.expose())?;
         }
+        ClientCommand::SetProbeSettings { settings } => settings.validate()?,
         ClientCommand::SetTelemetrySettings {
             endpoint, bearer, ..
         } if endpoint.len() > 8192
@@ -430,6 +425,16 @@ fn validate_command(command: &ClientCommand) -> Result<(), ClientError> {
             return Err(ClientError::PayloadTooLarge);
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_profile_update(profile_uuid: &str, text: &Secret) -> Result<(), ClientError> {
+    if profile_uuid.len() > 64 {
+        return Err(ClientError::InvalidInput);
+    }
+    if text.expose().len() > MAX_SUBSCRIPTION_BYTES {
+        return Err(ClientError::PayloadTooLarge);
     }
     Ok(())
 }
@@ -594,8 +599,6 @@ fn application(options: &ClientCoreOptions) -> Result<LoadedApplication, ClientE
         options.data_dir.clone(),
         options.local_proxy_port,
     );
-    #[cfg(windows)]
-    let engine = vpn_infrastructure::client_engine::WindowsEngine::new(engine);
     application_with_adapters(store, Box::new(engine))
 }
 
@@ -757,7 +760,16 @@ impl WorkerState {
         schedule: &mut AutomaticRefresh,
     ) {
         let handled_subscription = refresh_or_removal(&command).map(str::to_owned);
-        if self.handle(application, context, command, id).is_ok()
+        let result = match command {
+            ClientCommand::ReconnectRouting { pending } => {
+                self.handle_routing_reconnect(application, context, &pending, id)
+            }
+            ClientCommand::ProbeProfile { .. } | ClientCommand::ProbeProfiles { .. } => {
+                self.handle_probe(application, context, command, id)
+            }
+            _ => self.handle(application, context, command, id),
+        };
+        if result.is_ok()
             && let Some(uuid) = handled_subscription
         {
             schedule.forget(&uuid);
@@ -949,20 +961,20 @@ impl WorkerState {
         let profiles = catalog
             .profiles
             .iter()
-            .map(|item| ProfileSummary {
-                profile_uuid: item.profile.profile_uuid.clone(),
-                name: item.profile.name.clone(),
-                protocol: item.profile.protocol.name().to_owned(),
-                server: if provider_subscriptions.iter().any(|subscription| {
-                    subscription.raw_config_hidden
-                        && item.subscription_uuid.as_deref()
-                            == Some(&subscription.subscription_uuid)
-                }) {
-                    String::new()
-                } else {
-                    format!("{}:{}", item.profile.host, item.profile.port)
-                },
-                subscription_uuid: item.subscription_uuid.clone(),
+            .map(|item| {
+                let hidden = application.profile_source_hidden(item);
+                ProfileSummary {
+                    profile_uuid: item.profile.profile_uuid.clone(),
+                    name: item.profile.name.clone(),
+                    protocol: item.profile.protocol.name().to_owned(),
+                    server: if hidden {
+                        String::new()
+                    } else {
+                        format!("{}:{}", item.profile.host, item.profile.port)
+                    },
+                    source: item.profile.source.clone().filter(|_| !hidden),
+                    subscription_uuid: item.subscription_uuid.clone(),
+                }
             })
             .collect();
         let subscriptions = catalog
@@ -972,6 +984,7 @@ impl WorkerState {
                 subscription_uuid: item.subscription_uuid.clone(),
                 title: item.title.clone(),
                 auto_title: item.auto_title,
+                url: item.url.clone(),
                 profile_count: catalog
                     .profiles
                     .iter()
@@ -989,8 +1002,10 @@ impl WorkerState {
         context.publish(|snapshot| {
             snapshot.profiles = profiles;
             snapshot.profile_latencies = application.profile_latencies().clone();
-            snapshot.tcp_probe_available =
+            snapshot.profile_probe_available =
                 !self.cleanup_required && application.can_probe_profile();
+            snapshot.probe_settings.clone_from(&catalog.settings.probe);
+            snapshot.probe_icmp_available = application.supports_icmp_probe();
             snapshot.subscriptions = subscriptions;
             snapshot.unavailable_profiles = catalog
                 .subscriptions
@@ -1057,11 +1072,9 @@ impl WorkerState {
         command: ClientCommand,
         request_id: RequestId,
     ) -> Result<(), ClientError> {
-        if let ClientCommand::ReconnectRouting { pending } = command {
-            return self.handle_routing_reconnect(application, context, &pending, request_id);
-        }
-        let connecting = matches!(&command, ClientCommand::Connect { mode }
-            if application.capabilities().supports(*mode))
+        let starts_supported_mode = matches!(&command, ClientCommand::Connect { mode }
+            if application.capabilities().supports(*mode));
+        let connecting = starts_supported_mode
             && self.connection != ConnectionStatus::Connected
             && !self.cleanup_required;
         let is_disconnect = matches!(command, ClientCommand::Disconnect);
@@ -1079,18 +1092,18 @@ impl WorkerState {
         let configure_telemetry = matches!(&command, ClientCommand::SetTelemetrySettings { .. });
         let cancel = Cancellation::new(context.cancellation.clone(), request_id.0);
         let started = Instant::now();
-        let result = if self.cleanup_required && needs_clean_connection(&command, application) {
+        let result = if self.cleanup_required && starts_supported_mode {
             Err(ClientError::DisconnectFirst)
         } else {
             execute(application, command, &cancel)
         };
-        let result = if connecting {
-            self.finish_connect(application, result)
-        } else {
-            if is_disconnect {
+        let result = match (connecting, is_disconnect) {
+            (true, _) => self.finish_connect(application, result),
+            (_, true) => {
                 self.finish_disconnect(result);
+                result
             }
-            result
+            _ => result,
         };
         let event = final_command_event(
             application,
@@ -1110,6 +1123,38 @@ impl WorkerState {
                 .record_with_duration(event, Some(started.elapsed()));
         }
         self.publish(application, context, false, result.err(), Some(request_id));
+        result
+    }
+
+    fn handle_probe(
+        &mut self,
+        application: &mut ClientApplication,
+        context: &WorkerContext,
+        command: ClientCommand,
+        request_id: RequestId,
+    ) -> Result<(), ClientError> {
+        let started = Instant::now();
+        let cancel = Cancellation::new(context.cancellation.clone(), request_id.0);
+        let result = if self.cleanup_required {
+            Err(ClientError::DisconnectFirst)
+        } else {
+            execute(application, command, &cancel)
+        };
+        if let Err(error) = result {
+            self.telemetry
+                .record_with_duration(ClientEventKind::Failed(error), Some(started.elapsed()));
+        }
+        context.publish(|snapshot| {
+            snapshot
+                .profile_latencies
+                .clone_from(application.profile_latencies());
+            snapshot.completed_request = Some(request_id);
+            snapshot.last_error = result.err();
+            if result.is_err() {
+                snapshot.diagnostics = self.telemetry.summary();
+                snapshot.diagnostic_events = self.telemetry.events();
+            }
+        });
         result
     }
 
@@ -1297,6 +1342,9 @@ fn execute(
         ClientCommand::ImportText { title, text } => {
             application.import_text(&title, text.as_bytes())
         }
+        ClientCommand::UpdateProfile { profile_uuid, text } => {
+            application.update_profile(&profile_uuid, text.expose().as_bytes(), cancel)
+        }
         ClientCommand::SelectProfile { profile_uuid } => application.select_profile(&profile_uuid),
         ClientCommand::ProbeProfile { profile_uuid } => {
             application.probe_profile(&profile_uuid, cancel)
@@ -1313,6 +1361,7 @@ fn execute(
         ClientCommand::SetLanguage { language } => application.set_language(language),
         ClientCommand::SetConnectionMode { mode } => application.set_connection_mode(mode),
         ClientCommand::SetLocalProxyPort { port } => application.set_local_proxy_port(port),
+        ClientCommand::SetProbeSettings { settings } => application.set_probe_settings(settings),
         ClientCommand::SetSubscriptionHwid { enabled } => {
             application.set_subscription_hwid(enabled)
         }
@@ -1378,13 +1427,6 @@ fn refresh_or_removal(command: &ClientCommand) -> Option<&str> {
     }
 }
 
-fn needs_clean_connection(command: &ClientCommand, application: &ClientApplication) -> bool {
-    matches!(
-        command,
-        ClientCommand::ProbeProfile { .. } | ClientCommand::ProbeProfiles { .. }
-    ) || matches!(command, ClientCommand::Connect { mode } if application.capabilities().supports(*mode))
-}
-
 fn refresh_event(
     application: &ClientApplication,
     subscription_uuid: &str,
@@ -1443,6 +1485,7 @@ fn command_event(command: &ClientCommand) -> Option<ClientEventKind> {
         }
         ClientCommand::RemoveSubscription { .. } => ClientEventKind::SubscriptionRemoved,
         ClientCommand::ImportText { .. } => ClientEventKind::ProfilesImported,
+        ClientCommand::UpdateProfile { .. } => ClientEventKind::ProfileUpdated,
         ClientCommand::SelectProfile { .. } => ClientEventKind::ProfileSelected,
         ClientCommand::ProbeProfile { .. }
         | ClientCommand::ProbeProfiles { .. }
@@ -1453,6 +1496,7 @@ fn command_event(command: &ClientCommand) -> Option<ClientEventKind> {
         ClientCommand::SetLanguage { .. }
         | ClientCommand::SetConnectionMode { .. }
         | ClientCommand::SetLocalProxyPort { .. }
+        | ClientCommand::SetProbeSettings { .. }
         | ClientCommand::SetSubscriptionHwid { .. }
         | ClientCommand::SetSubscriptionUserAgent { .. }
         | ClientCommand::SetTelemetrySettings { .. }
@@ -1484,7 +1528,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsupported_modes_leave_the_selection_and_runtime_untouched() {
+    fn windows_modes_can_be_selected_without_starting_a_connection() {
         use vpn_infrastructure::client_store::UserSecretProtection;
 
         let data_dir = std::env::temp_dir().join(format!(
@@ -1511,15 +1555,10 @@ mod tests {
         client.set_notifier(Arc::new(move || {
             let _ = update.try_send(());
         }));
-        for command in [
-            ClientCommand::SetConnectionMode {
-                mode: ConnectionMode::SystemProxy,
-            },
-            ClientCommand::Connect {
-                mode: ConnectionMode::Tun,
-            },
-        ] {
-            let request = client.send(command).expect("enqueue unsupported mode");
+        for mode in [ConnectionMode::SystemProxy, ConnectionMode::Tun] {
+            let request = client
+                .send(ClientCommand::SetConnectionMode { mode })
+                .expect("enqueue supported mode");
             let snapshot = loop {
                 let snapshot = client.snapshot();
                 if snapshot.completed_request == Some(request) {
@@ -1529,17 +1568,17 @@ mod tests {
                     .recv_timeout(Duration::from_secs(10))
                     .expect("complete the request");
             };
-            assert_eq!(snapshot.last_error, Some(ClientError::UnsupportedMode));
-            assert_eq!(snapshot.selected_mode, ConnectionMode::LocalProxy);
+            assert_eq!(snapshot.last_error, None);
+            assert_eq!(snapshot.selected_mode, mode);
             assert_eq!(snapshot.active_mode, None);
             assert_eq!(snapshot.connection, ConnectionStatus::Disconnected);
             assert!(snapshot.local_proxy.is_none() && snapshot.http_proxy.is_none());
-            assert!(!snapshot.mode_capabilities.system_proxy);
-            assert!(!snapshot.mode_capabilities.tun);
+            assert!(snapshot.mode_capabilities.system_proxy);
+            assert!(snapshot.mode_capabilities.tun);
             assert!(!snapshot.cleanup_required);
         }
         client.shutdown().expect("shutdown isolated backend");
-        assert!(!data_dir.join("catalog.sealed").exists());
+        std::fs::remove_file(data_dir.join("catalog.sealed")).expect("remove isolated catalog");
         std::fs::remove_file(data_dir.join("catalog.lock")).expect("remove isolated lock");
         std::fs::remove_file(data_dir.join("subscription-device-id"))
             .expect("remove isolated subscription HWID");

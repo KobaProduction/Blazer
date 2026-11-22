@@ -3,14 +3,16 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::client_engine::{render_android_tunnel, validate_profile};
+use crate::client_engine::{
+    ObservatoryMonitor, PreparedObservatory, render_android_tunnel_records,
+    validate_android_profile,
+};
 use jni::jni_str;
 use vpn_application::client::{
     Cancellation, ClientEnginePort, ClientError, ConnectionMode, EngineRuntime, ProxyProfile,
     RunningConnection,
 };
 use vpn_application::session::ModeCapabilities;
-use vpn_domain::client::ProxyTransport;
 
 use super::AndroidPlatform;
 
@@ -18,6 +20,7 @@ pub struct AndroidEngine {
     hooks: Arc<AndroidPlatform>,
     available: bool,
     started: bool,
+    observer: Option<ObservatoryMonitor>,
 }
 
 impl AndroidEngine {
@@ -26,6 +29,7 @@ impl AndroidEngine {
             hooks,
             available,
             started: false,
+            observer: None,
         }
     }
 
@@ -59,9 +63,19 @@ impl AndroidEngine {
         if descriptor < 0 {
             return Err(ClientError::EngineStart);
         }
-        let config = render_android_tunnel(profile, descriptor, readiness.port())?;
+        let mut observer = PreparedObservatory::for_embedded_profile(profile)?;
+        let mut records = render_android_tunnel_records(profile, descriptor, readiness.port())?;
+        if let Some(prepared) = &observer {
+            prepared.decorate_embedded(&mut records)?;
+        }
+        let config = zeroize::Zeroizing::new(
+            serde_json::to_string(&records).map_err(|_| ClientError::EngineInvalid)?,
+        );
         cancel.check()?;
         drop(reservation);
+        if let Some(prepared) = &mut observer {
+            prepared.release_ports();
+        }
         if !self
             .hooks
             .start_tunnel(&config)
@@ -70,7 +84,14 @@ impl AndroidEngine {
             return Err(ClientError::EngineStart);
         }
         self.started = true;
-        self.await_readiness(readiness, cancel)
+        self.await_readiness(readiness, cancel)?;
+        if let Some(prepared) = observer {
+            let control = Arc::new(super::observatory::AndroidSelectorControl::new(
+                Arc::clone(&self.hooks),
+            )?);
+            self.observer = Some(prepared.start_with_control(cancel, control)?);
+        }
+        Ok(())
     }
 
     fn await_readiness(
@@ -127,12 +148,11 @@ impl ClientEnginePort for AndroidEngine {
     }
 
     fn validate_profile(&self, profile: &ProxyProfile) -> Result<(), ClientError> {
-        // Alternate placement is enabled for the verified Windows engine.
-        if matches!(&profile.transport, ProxyTransport::Xhttp { metadata, .. } if !metadata.is_default())
-        {
-            return Err(ClientError::UnsupportedFeature);
-        }
-        validate_profile(profile)
+        let selector_available = self
+            .hooks
+            .boolean_hook(jni_str!("selectorControlAvailable"))
+            .unwrap_or(false);
+        validate_android_profile(profile, selector_available)
     }
 
     fn start(
@@ -156,6 +176,10 @@ impl ClientEnginePort for AndroidEngine {
     }
 
     fn stop(&mut self) -> Result<(), ClientError> {
+        if let Some(observer) = &mut self.observer {
+            observer.stop()?;
+        }
+        self.observer = None;
         if !self
             .hooks
             .boolean_hook(jni_str!("stopTunnel"))
@@ -168,6 +192,13 @@ impl ClientEnginePort for AndroidEngine {
     }
 
     fn poll(&mut self) -> Result<EngineRuntime, ClientError> {
+        if let Some(observer) = &self.observer
+            && observer.is_finished()
+        {
+            let error = observer.failure();
+            self.stop()?;
+            return Err(error);
+        }
         if self.started {
             if self.is_running()? {
                 return Ok(EngineRuntime::Running(RunningConnection::Tun));

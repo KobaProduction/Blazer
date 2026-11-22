@@ -1,5 +1,6 @@
 //! Android adapters for the application ports.
 
+mod observatory;
 mod tunnel;
 
 use std::sync::Arc;
@@ -62,6 +63,43 @@ impl AndroidPlatform {
                 jni_str!("startTunnel"),
                 jni_sig!("(Ljava/lang/String;)Z"),
                 &[JValue::Object(&config)],
+            )?
+            .z()
+        })
+    }
+
+    fn tunnel_handle(&self) -> jni::errors::Result<i64> {
+        self.vm.attach_current_thread(|env| {
+            env.call_static_method(&*self.hooks, jni_str!("tunnelHandle"), jni_sig!("()J"), &[])?
+                .j()
+        })
+    }
+
+    fn selector_ready(&self, handle: i64) -> jni::errors::Result<bool> {
+        self.vm.attach_current_thread(|env| {
+            env.call_static_method(
+                &*self.hooks,
+                jni_str!("selectorControlReady"),
+                jni_sig!("(J)Z"),
+                &[JValue::Long(handle)],
+            )?
+            .z()
+        })
+    }
+
+    fn select_outbound(&self, handle: i64, group: &str, member: &str) -> jni::errors::Result<bool> {
+        self.vm.attach_current_thread(|env| {
+            let group = env.new_string(group)?;
+            let member = env.new_string(member)?;
+            env.call_static_method(
+                &*self.hooks,
+                jni_str!("selectOutbound"),
+                jni_sig!("(JLjava/lang/String;Ljava/lang/String;)Z"),
+                &[
+                    JValue::Long(handle),
+                    JValue::Object(&group),
+                    JValue::Object(&member),
+                ],
             )?
             .z()
         })

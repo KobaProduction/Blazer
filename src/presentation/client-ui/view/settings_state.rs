@@ -2,7 +2,8 @@
 
 use vpn_presentation::localization::{self, Key, Locale};
 use vpn_presentation::session::{
-    ClientSnapshot, DnsPolicy, RequestId, RouteRule, RoutingInput, RoutingProfile,
+    ClientError, ClientSnapshot, DnsPolicy, ProbeSettings, RequestId, RouteRule, RoutingInput,
+    RoutingProfile,
 };
 
 use super::view_model::SettingsPage;
@@ -140,12 +141,6 @@ impl Default for SubscriptionSettings {
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum PingMethod {
-    #[default]
-    Tcp,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum PingDisplay {
     #[default]
     Time,
@@ -154,8 +149,121 @@ pub(super) enum PingDisplay {
 
 #[derive(Default)]
 pub(super) struct PingSettings {
-    pub method: PingMethod,
+    pub draft: Option<ProbeSettingsDraft>,
     pub display_override: Option<PingDisplay>,
+}
+
+pub(super) struct ProbeSettingsDraft {
+    saved: ProbeSettings,
+    pub value: ProbeSettings,
+    pub pending: Option<RequestId>,
+    pub outcome: Option<Result<(), ClientError>>,
+}
+
+impl ProbeSettingsDraft {
+    pub fn new(saved: &ProbeSettings) -> Self {
+        Self {
+            saved: saved.clone(),
+            value: saved.clone(),
+            pending: None,
+            outcome: None,
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.saved != self.value
+    }
+
+    pub fn synchronize(&mut self, snapshot: &ClientSnapshot) {
+        if let Some((pending, done)) = self.pending.zip(snapshot.completed_request)
+            && done.0 >= pending.0
+        {
+            self.pending = None;
+            if done == pending {
+                if let Some(error) = snapshot.last_error {
+                    self.saved.clone_from(&snapshot.probe_settings);
+                    self.outcome = Some(Err(error));
+                    return;
+                }
+                *self = Self::new(&snapshot.probe_settings);
+                self.outcome = Some(Ok(()));
+                return;
+            }
+            if self.value == snapshot.probe_settings {
+                *self = Self::new(&snapshot.probe_settings);
+                self.outcome = Some(Ok(()));
+                return;
+            }
+            self.outcome = None;
+        }
+        if self.pending.is_none() && self.saved != snapshot.probe_settings {
+            let dirty = self.is_dirty();
+            self.saved.clone_from(&snapshot.probe_settings);
+            if !dirty {
+                self.value.clone_from(&snapshot.probe_settings);
+                self.outcome = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_settings_tests {
+    use super::*;
+
+    #[test]
+    fn dirty_probe_settings_survive_unrelated_updates_and_failed_save() {
+        let mut snapshot = ClientSnapshot::default();
+        let mut draft = ProbeSettingsDraft::new(&snapshot.probe_settings);
+        let original_attempts = draft.value.attempts;
+        draft.value.url = "https://probe.example/check".into();
+        snapshot.probe_settings.attempts = 3;
+        draft.synchronize(&snapshot);
+        assert_eq!(draft.value.url, "https://probe.example/check");
+        assert_eq!(draft.value.attempts, original_attempts);
+        assert!(draft.is_dirty());
+        draft.pending = Some(RequestId(4));
+        snapshot.completed_request = Some(RequestId(4));
+        snapshot.last_error = Some(ClientError::StorageWrite);
+        draft.synchronize(&snapshot);
+        assert_eq!(draft.outcome, Some(Err(ClientError::StorageWrite)));
+        assert!(draft.pending.is_none());
+        assert_eq!(draft.value.url, "https://probe.example/check");
+        assert!(draft.is_dirty());
+    }
+
+    #[test]
+    fn acknowledged_probe_settings_refresh_saved_values_and_clear_dirty_state() {
+        let mut snapshot = ClientSnapshot::default();
+        let mut draft = ProbeSettingsDraft::new(&snapshot.probe_settings);
+        draft.value.attempts = 3;
+        draft.pending = Some(RequestId(7));
+        snapshot.completed_request = Some(RequestId(6));
+        draft.synchronize(&snapshot);
+        assert_eq!(draft.pending, Some(RequestId(7)));
+        assert!(draft.is_dirty());
+        snapshot.completed_request = Some(RequestId(7));
+        snapshot.probe_settings = draft.value.clone();
+        draft.synchronize(&snapshot);
+        assert!(draft.pending.is_none());
+        assert!(!draft.is_dirty());
+        assert_eq!(draft.outcome, Some(Ok(())));
+    }
+
+    #[test]
+    fn later_request_error_is_not_attributed_to_a_saved_probe_form() {
+        let mut snapshot = ClientSnapshot::default();
+        let mut draft = ProbeSettingsDraft::new(&snapshot.probe_settings);
+        draft.value.warmup = false;
+        draft.pending = Some(RequestId(2));
+        snapshot.probe_settings = draft.value.clone();
+        snapshot.completed_request = Some(RequestId(3));
+        snapshot.last_error = Some(ClientError::Network);
+        draft.synchronize(&snapshot);
+        assert_eq!(draft.outcome, Some(Ok(())));
+        assert!(!draft.is_dirty());
+        assert!(draft.pending.is_none());
+    }
 }
 
 #[derive(Default)]

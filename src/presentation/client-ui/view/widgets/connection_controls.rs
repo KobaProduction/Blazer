@@ -1,4 +1,4 @@
-use vpn_presentation::session::{ConnectionMode, ConnectionStatus};
+use vpn_presentation::session::{ConnectionMode, ConnectionStatus, ModeCapabilities};
 
 use super::ViewFrame;
 use super::controls::{selector, selector_option};
@@ -10,21 +10,20 @@ pub(super) const CONNECTION_CONTROL_WIDTH: f32 = 296.0;
 impl ViewFrame<'_> {
     pub(super) fn mode_picker(&mut self, ui: &mut egui::Ui) {
         let selected = self.tr(picker_mode_key(self.snapshot.selected_mode));
+        let modes = picker_modes(self.snapshot.mode_capabilities);
+        if modes.is_empty() || (modes.len() == 1 && modes.contains(&self.snapshot.selected_mode)) {
+            ui.label(selected);
+            return;
+        }
         selector(
             ui,
             "connection-mode",
             CONNECTION_CONTROL_WIDTH,
             selected,
             |ui| {
-                self.mode_option(ui, ConnectionMode::LocalProxy);
-                if self.snapshot.mode_capabilities.system_proxy
-                    || self.snapshot.selected_mode == ConnectionMode::SystemProxy
-                {
-                    self.mode_option(ui, ConnectionMode::SystemProxy);
+                for mode in modes {
+                    self.mode_option(ui, mode);
                 }
-                ui.separator();
-                ui.weak(self.tr(Key::ModeTun));
-                ui.indent("tun-modes", |ui| self.mode_option(ui, ConnectionMode::Tun));
             },
         );
     }
@@ -87,10 +86,72 @@ impl ViewFrame<'_> {
     }
 }
 
+fn picker_modes(capabilities: ModeCapabilities) -> Vec<ConnectionMode> {
+    let proxy = if capabilities.system_proxy {
+        Some(ConnectionMode::SystemProxy)
+    } else if capabilities.supports(ConnectionMode::LocalProxy) {
+        Some(ConnectionMode::LocalProxy)
+    } else {
+        None
+    };
+    proxy
+        .into_iter()
+        .chain(capabilities.tun.then_some(ConnectionMode::Tun))
+        .collect()
+}
+
 fn picker_mode_key(mode: ConnectionMode) -> Key {
     match mode {
-        ConnectionMode::LocalProxy => Key::CatalogProxyMode,
-        ConnectionMode::Tun => Key::CatalogBlazeCoreTun,
+        ConnectionMode::LocalProxy => Key::ModeProxy,
         ConnectionMode::SystemProxy => Key::ModeSystemProxy,
+        ConnectionMode::Tun => Key::CatalogBlazeCoreTun,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_proxy_is_a_distinct_action_with_a_truthful_label() {
+        let capabilities = ModeCapabilities {
+            local_proxy: true,
+            local_http_proxy: true,
+            system_proxy: true,
+            tun: true,
+        };
+        assert_eq!(
+            picker_modes(capabilities),
+            [ConnectionMode::SystemProxy, ConnectionMode::Tun]
+        );
+        assert_eq!(picker_mode_key(ConnectionMode::LocalProxy), Key::ModeProxy);
+        assert_eq!(
+            picker_mode_key(ConnectionMode::SystemProxy),
+            Key::ModeSystemProxy
+        );
+        assert_eq!(
+            picker_mode_key(ConnectionMode::Tun),
+            Key::CatalogBlazeCoreTun
+        );
+    }
+
+    #[test]
+    fn local_proxy_remains_available_on_platforms_without_system_proxy() {
+        assert_eq!(
+            picker_modes(ModeCapabilities {
+                local_http_proxy: true,
+                tun: true,
+                ..ModeCapabilities::default()
+            }),
+            [ConnectionMode::LocalProxy, ConnectionMode::Tun]
+        );
+        assert_eq!(
+            picker_modes(ModeCapabilities {
+                system_proxy: true,
+                ..ModeCapabilities::default()
+            }),
+            [ConnectionMode::SystemProxy]
+        );
+        assert!(picker_modes(ModeCapabilities::default()).is_empty());
     }
 }

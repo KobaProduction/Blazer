@@ -22,7 +22,7 @@ public final class ClientVpnService extends VpnService {
     private static volatile ClientVpnService active;
     private volatile boolean revoked;
     private ParcelFileDescriptor descriptor;
-    private long engineHandle;
+    private volatile long engineHandle;
     private long startRequest;
     private RouteObserver routeObserver;
 
@@ -65,7 +65,7 @@ public final class ClientVpnService extends VpnService {
 
     private void disconnect() {
         revoked = true;
-        NativeSession.dispatch("{\"type\":\"disconnect\"}");
+        NativeSession.disconnect();
     }
 
     static int openTunnel() {
@@ -104,6 +104,27 @@ public final class ClientVpnService extends VpnService {
     static boolean tunnelRunning() {
         ClientVpnService service = active;
         return service != null && !service.revoked && service.engineHandle > 0 && BlazeCoreNative.isRunning();
+    }
+
+    static long tunnelHandle() {
+        ClientVpnService service = active;
+        return service == null || service.revoked ? 0 : service.engineHandle;
+    }
+
+    static boolean selectorControlReady(long expectedHandle) {
+        return expectedHandle > 0 && tunnelHandle() == expectedHandle
+            && BlazeCoreNative.selectorControlAvailable() && tunnelRunning();
+    }
+
+    static boolean selectOutbound(long expectedHandle, String group, String member) {
+        ClientVpnService service = active;
+        if (service == null || service.revoked || expectedHandle <= 0 || service.engineHandle != expectedHandle
+                || !BlazeCoreNative.selectorControlAvailable()) return false;
+        try {
+            return BlazeCoreNative.selectOutbound(expectedHandle, group, member) == 0;
+        } catch (UnsatisfiedLinkError unavailableAbi) {
+            return false;
+        }
     }
 
     static boolean tunnelRouted() {

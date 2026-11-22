@@ -4,6 +4,15 @@ use crate::view::theme::{BUTTON_TEXT, DISABLED_BUTTON};
 
 pub(super) const SELECTOR_HEIGHT: f32 = 34.0;
 
+pub(super) fn action_button<'a>(ui: &egui::Ui, label: &'a str, width: f32) -> egui::Button<'a> {
+    egui::Button::new(label)
+        .min_size(egui::vec2(
+            width.min(ui.available_width()).max(0.0),
+            SELECTOR_HEIGHT,
+        ))
+        .wrap()
+}
+
 pub(super) fn paint_spinner(ui: &egui::Ui, center: egui::Pos2, size: f32) {
     egui::Spinner::new().paint_at(
         ui,

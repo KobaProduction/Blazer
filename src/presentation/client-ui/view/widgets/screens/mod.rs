@@ -5,7 +5,7 @@ mod provider_settings;
 mod settings;
 mod subscriptions;
 
-pub(super) use settings::toggle;
+pub(super) use settings::{toggle, toggle_width};
 
 use super::ViewFrame;
 use crate::view::view_model::{Screen, SettingsPage};

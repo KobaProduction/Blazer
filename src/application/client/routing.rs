@@ -37,7 +37,11 @@ impl ClientApplication {
                 .map(RoutingSelection::from),
             pending_reconnect: active_routing
                 .and_then(|(active, target)| self.pending_routing_change(active, target)),
-            local_proxy_available: self.services.engine.supports_local_proxy_routing(),
+            local_proxy_available: self
+                .services
+                .engine
+                .supports_routing(ConnectionMode::LocalProxy),
+            tun_available: self.services.engine.supports_routing(ConnectionMode::Tun),
             last_saved_profile_uuid: self.last_saved_routing_uuid.clone(),
             catalog: self.catalog.routing.clone(),
         }
@@ -67,8 +71,7 @@ impl ClientApplication {
         active: &ActiveConnection,
         target: Option<&RoutingProfile>,
     ) -> Option<RoutingReconnect> {
-        if active.mode != ConnectionMode::LocalProxy
-            || !self.services.engine.supports_local_proxy_routing()
+        if !self.services.engine.supports_routing(active.mode)
             || !self.capabilities().supports(active.mode)
         {
             return None;

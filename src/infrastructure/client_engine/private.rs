@@ -38,7 +38,7 @@ impl Drop for PrivateDirectory {
         if reject_reparse(&self.0).is_err() {
             return;
         }
-        for filename in [RUNTIME_EXECUTABLE, "profile.yaml", "wintun.dll"] {
+        for filename in [RUNTIME_EXECUTABLE, "profile.yaml"] {
             let _ = fs::remove_file(self.0.join(filename));
         }
         let _ = fs::remove_dir(&self.0);

@@ -2,6 +2,7 @@
 /dist/windows/
 /.idea/
 /.vscode/
+__pycache__/
 .env
 .env.*
 !.env.example

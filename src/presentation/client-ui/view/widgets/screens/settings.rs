@@ -1,3 +1,4 @@
+mod ping;
 mod routing;
 mod sections;
 mod telemetry;
@@ -10,12 +11,13 @@ use vpn_presentation::session::{ConnectionMode, Language};
 use super::ViewFrame;
 use crate::view::settings_state::{DesktopSettings, DesktopTheme, PreferredIp};
 use crate::view::view_model::{Screen, SettingsPage};
-use crate::view::widgets::controls::{roomy_input, select_value, selector};
+use crate::view::widgets::controls::{SELECTOR_HEIGHT, roomy_input, select_value, selector};
 use crate::view::widgets::layout::modal_content_width;
 
 pub(super) const ROW_HEIGHT: f32 = 44.0;
 const GROUP_GAP: f32 = 14.0;
 const CONTROL_WIDTH: f32 = 205.0;
+const TOGGLE_WIDTH: f32 = 34.0;
 const ENTRY_WIDTH: f32 = 220.0;
 const GROUP_MARGIN: i8 = 12;
 const COMPACT_ROW_WIDTH: f32 = 335.0;
@@ -113,7 +115,7 @@ impl ViewFrame<'_> {
 
     fn advanced_links(&mut self, ui: &mut egui::Ui) {
         let locale = self.view.locale;
-        group(ui, Some(self.tr(Key::AdvancedSettings)), |ui| {
+        group(ui, None, |ui| {
             self.page_link(ui, Key::AdvancedSettings, SettingsPage::Advanced);
             divider(ui);
             self.page_link(ui, Key::Subscriptions, SettingsPage::Subscriptions);
@@ -318,7 +320,11 @@ pub(super) fn setting_row(ui: &mut egui::Ui, label: &str, value: impl FnOnce(&mu
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(label).wrap());
                 ui.add_space(4.0);
-                ui.with_layout(value_layout.with_main_wrap(true), value);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, SELECTOR_HEIGHT),
+                    value_layout.with_main_wrap(true),
+                    value,
+                );
                 ui.add_space(4.0);
                 return;
             }
@@ -351,7 +357,8 @@ pub(in crate::view::widgets) fn toggle(
     key: Key,
     value: &mut bool,
 ) -> egui::Response {
-    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(34.0, 19.0), egui::Sense::click());
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(TOGGLE_WIDTH, 19.0), egui::Sense::click());
     if response.clicked() {
         *value = !*value;
         response.mark_changed();
@@ -380,13 +387,29 @@ pub(in crate::view::widgets) fn toggle(
         .rect(rect, 10, fill, stroke, egui::StrokeKind::Inside);
     ui.painter()
         .circle_filled(egui::pos2(thumb_x, rect.center().y), 6.5, thumb);
-    let state = if *value {
+    ui.label(toggle_state(locale, *value));
+    response
+}
+
+pub(in crate::view::widgets) fn toggle_width(ui: &egui::Ui, locale: Locale, value: bool) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let text = ui.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(
+            toggle_state(locale, value).to_owned(),
+            font,
+            egui::Color32::WHITE,
+        )
+    });
+    TOGGLE_WIDTH + ui.spacing().item_spacing.x + text.size().x.ceil()
+}
+
+fn toggle_state(locale: Locale, value: bool) -> &'static str {
+    let state = if value {
         Key::SettingEnabled
     } else {
         Key::SettingDisabled
     };
-    ui.label(localization::text(locale, state));
-    response
+    localization::text(locale, state)
 }
 
 fn choice<T: Copy + PartialEq>(ui: &mut egui::Ui, id: &str, value: &mut T, options: &[(T, &str)]) {
@@ -430,4 +453,41 @@ fn text_row(ui: &mut egui::Ui, locale: Locale, key: Key, value: &mut String) {
                 .hint_text(label),
         );
     });
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn compact_setting_row_does_not_expand_with_viewport_height() {
+        let render = |height| {
+            let context = egui::Context::default();
+            let mut rows_height = 0.0;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(310.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let start = ui.cursor().top();
+                    setting_row(ui, "Язык", |ui| {
+                        selector(ui, "language", CONTROL_WIDTH, "Русский", |_| {});
+                    });
+                    setting_row(ui, "Параметр", |ui| {
+                        ui.label("Значение");
+                    });
+                    rows_height = ui.cursor().top() - start;
+                },
+            );
+            output.textures_delta.clear();
+            rows_height
+        };
+        let short = render(260.0);
+        assert_eq!(short, render(800.0));
+        assert!(short < 180.0);
+    }
 }

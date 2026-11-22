@@ -6,8 +6,9 @@ use std::fmt;
 use vpn_domain::client::TelemetrySettings;
 pub use vpn_domain::client::{
     ClientError, ConnectionMode, DEFAULT_SUBSCRIPTION_USER_AGENT, Language,
-    MAX_SUBSCRIPTION_USER_AGENT_BYTES, ProfileUnavailableReason, Secret, TelemetryMode,
-    UnavailableProfile, validate_subscription_user_agent,
+    MAX_SUBSCRIPTION_USER_AGENT_BYTES, ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy,
+    ProfileUnavailableReason, Secret, TelemetryMode, UnavailableProfile,
+    validate_subscription_user_agent,
 };
 pub use vpn_domain::provider::{
     ProviderChangeKind, ProviderKey, ProviderMetadataClass, SubscriptionUsage,
@@ -66,6 +67,10 @@ pub enum ClientCommand {
         title: String,
         text: String,
     },
+    UpdateProfile {
+        profile_uuid: String,
+        text: Secret,
+    },
     SelectProfile {
         profile_uuid: String,
     },
@@ -93,6 +98,9 @@ pub enum ClientCommand {
     },
     SetLocalProxyPort {
         port: u16,
+    },
+    SetProbeSettings {
+        settings: ProbeSettings,
     },
     SetSubscriptionHwid {
         enabled: bool,
@@ -182,6 +190,7 @@ pub struct SubscriptionSummary {
     pub subscription_uuid: String,
     pub title: String,
     pub auto_title: bool,
+    pub url: Secret,
     pub profile_count: usize,
     pub last_error: Option<ClientError>,
 }
@@ -261,6 +270,7 @@ pub struct ProfileSummary {
     pub name: String,
     pub protocol: String,
     pub server: String,
+    pub source: Option<Secret>,
     pub subscription_uuid: Option<String>,
 }
 
@@ -269,6 +279,8 @@ pub enum ProfileLatency {
     Reachable { milliseconds: u64 },
     TimedOut,
     Unreachable,
+    CheckUnreachable,
+    Failed(ClientError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +293,7 @@ pub enum ClientEventKind {
     SubscriptionSettingsFailed(ClientError),
     SubscriptionRemoved,
     ProfilesImported,
+    ProfileUpdated,
     ProfileSelected,
     ProfileRemoved,
     ConnectionStarting,
@@ -325,14 +338,13 @@ pub struct RoutingSnapshot {
     pub active: Option<RoutingSelection>,
     pub pending_reconnect: Option<RoutingReconnect>,
     pub local_proxy_available: bool,
+    pub tun_available: bool,
     pub last_saved_profile_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ComponentVersions {
     pub expected_blazecore: Option<String>,
-    pub tun2proxy: Option<String>,
-    pub bundled_wintun: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -362,7 +374,9 @@ pub struct ClientSnapshot {
     pub profiles: Vec<ProfileSummary>,
     pub unavailable_profiles: HashMap<String, Vec<UnavailableProfile>>,
     pub profile_latencies: HashMap<String, ProfileLatency>,
-    pub tcp_probe_available: bool,
+    pub profile_probe_available: bool,
+    pub probe_settings: ProbeSettings,
+    pub probe_icmp_available: bool,
     pub selected_profile_uuid: Option<String>,
     pub active_profile_uuid: Option<String>,
     pub connection: ConnectionStatus,
@@ -398,7 +412,9 @@ impl Default for ClientSnapshot {
             profiles: Vec::new(),
             unavailable_profiles: HashMap::new(),
             profile_latencies: HashMap::new(),
-            tcp_probe_available: false,
+            profile_probe_available: false,
+            probe_settings: ProbeSettings::default(),
+            probe_icmp_available: false,
             selected_profile_uuid: None,
             active_profile_uuid: None,
             connection: ConnectionStatus::Disconnected,

@@ -1,11 +1,64 @@
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use super::ClientError;
+use super::{ClientError, XhttpMode};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct XhttpPacketOptions {
     pub max_post_bytes: Option<XhttpPacketRange>,
     pub min_post_interval_ms: Option<XhttpPacketRange>,
+    pub wire: XhttpWireOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum XhttpWireField {
+    UplinkMethod,
+    UplinkPlacement,
+    UplinkKey,
+    UplinkChunkSize,
+    SessionTable,
+    SessionLength,
+    PaddingBytes,
+    PaddingObfuscation,
+    PaddingKey,
+    PaddingHeader,
+    PaddingPlacement,
+    PaddingMethod,
+    Xmux,
+    MaxConnections,
+    MaxConcurrency,
+    MaxConnectionReuses,
+    MaxHttpRequests,
+    MaxHttpReuseSeconds,
+    HttpKeepAliveSeconds,
+}
+
+pub type XhttpWireOptions = BTreeMap<XhttpWireField, XhttpWireValue>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XhttpWireValue {
+    Text(String),
+    Range(u32, u32),
+    Flag(bool),
+    Seconds(i64),
+    Xmux(XhttpWireOptions),
+}
+
+impl XhttpPacketOptions {
+    pub fn validate_mode(&self, mode: XhttpMode) -> Result<(), ClientError> {
+        if mode == XhttpMode::PacketUp {
+            return Ok(());
+        }
+        if matches!(self.wire.get(&XhttpWireField::UplinkMethod), Some(XhttpWireValue::Text(method)) if method == "GET")
+        {
+            return Err(ClientError::UnsupportedXhttpUploadMethod);
+        }
+        if matches!(self.wire.get(&XhttpWireField::UplinkPlacement), Some(XhttpWireValue::Text(placement)) if placement == "header" || placement == "cookie")
+        {
+            return Err(ClientError::UnsupportedFeature);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

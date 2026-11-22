@@ -148,7 +148,7 @@ impl ViewFrame<'_> {
 
     fn show_sidebar_progress(&self) -> bool {
         let home_action_pending = self.view.screen == Screen::Home
-            && (self.view.catalog_operation.is_some()
+            && (self.view.subscription_refresh.is_some()
                 || self.saving_mode
                 || matches!(
                     self.snapshot.connection,
@@ -188,13 +188,17 @@ impl ViewFrame<'_> {
             }
             ViewportLayout::Desktop => egui::Layout::left_to_right(egui::Align::Center),
         };
-        ui.with_layout(layout, |ui| {
-            if let Screen::Settings(page) = screen {
-                self.settings_crumbs(ui, page);
-            } else {
-                title(ui, self.tr(screen.key()), false);
-            }
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), HEADING_SIZE),
+            layout,
+            |ui| {
+                if let Screen::Settings(page) = screen {
+                    self.settings_crumbs(ui, page);
+                } else {
+                    title(ui, self.tr(screen.key()), false);
+                }
+            },
+        );
         ui.add_space(10.0);
     }
 

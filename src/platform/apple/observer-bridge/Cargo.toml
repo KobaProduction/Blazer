@@ -1,0 +1,30 @@
+[package]
+name = "observer-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "bridge.rs"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+headers = ["safer-ffi/headers"]
+
+[[bin]]
+name = "observer-header"
+path = "header.rs"
+required-features = ["headers"]
+
+[dependencies]
+vpn-application.workspace = true
+vpn-infrastructure.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+safer-ffi = { version = "=0.1.13", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

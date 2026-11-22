@@ -7,6 +7,7 @@ param(
     [ValidateSet('x86_64', 'arm64-v8a')]
     [string[]]$Abi = @('x86_64', 'arm64-v8a'),
     [string]$BlazeCoreLibraries,
+    [switch]$Acceptance,
     [switch]$TaggedVersion,
     [ValidateSet('Development', 'Direct')]
     [string]$Distribution = 'Development',
@@ -19,6 +20,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($Acceptance -and $Distribution -ne 'Development') { throw 'Acceptance instrumentation is restricted to local Development APKs.' }
+if ($Acceptance -and -not $PSBoundParameters.ContainsKey('OutputPath')) { $OutputPath = 'target/android/acceptance/blazer-acceptance.apk' }
 . (Join-Path $PSScriptRoot 'release-version.ps1')
 
 function Invoke-Step {
@@ -163,11 +166,29 @@ $blazeCoreHashes = $null
 if ($BlazeCoreLibraries) {
     $BlazeCoreLibraries = (Resolve-Path -LiteralPath $BlazeCoreLibraries).Path
     $provenance = Get-Content -Raw -LiteralPath (Join-Path $BlazeCoreLibraries 'manifest.json') | ConvertFrom-Json -AsHashtable
-    if ($provenance['revision'] -ne 'cce97a2c4c1c3bd0a07807f37a7caf3876c79110' -or $provenance['version'] -ne '0.3.7') {
-        throw 'The Android BlazeCore bundle does not target the approved revision and version.'
+    if ($provenance['schema_version'] -ne 1 -or
+        $provenance['revision'] -ne '10512be664e2100bb4a0ad3bb95f6c70a184ee2d' -or
+        $provenance['source_tree'] -ne 'ef9a083e67fe74e044e65735cff471c58e902f4b' -or
+        $provenance['version'] -ne '0.3.7' -or $provenance['capabilities_bits'] -ne 1) {
+        throw 'The Android BlazeCore bundle does not target the approved source tree, version and selector contract.'
     }
-    $blazeCoreHashes = $provenance['sha256']
-    if (-not $blazeCoreHashes) { throw 'Missing Android BlazeCore bundle digests.' }
+    $approvedHashes = @{
+        'x86_64' = '064DA9243AD53DEB60C1AC464EDF2724118EA6AF5E957E6CBE7B9611E85E170A'
+        'arm64-v8a' = '03470F1976B1286ECF7DFC4FB33BBF24272B29052965D8DEA5282FFFEE443298'
+    }
+    $blazeCoreHashes = @{}
+    foreach ($platform in $Abi) {
+        $artifact = @($provenance['artifacts'] | Where-Object { $_['abi'] -eq $platform })
+        if (-not $approvedHashes[$platform] -or $artifact.Count -ne 1 -or
+            $artifact[0]['target'] -ne $targets[$platform] -or
+            $artifact[0]['file'] -ne "$platform/libblazecore.so" -or
+            $artifact[0]['source_revision'] -ne $provenance['revision'] -or
+            $artifact[0]['jni_version'] -ne $provenance['version'] -or
+            $artifact[0]['sha256'].ToUpperInvariant() -ne $approvedHashes[$platform]) {
+            throw "The Android BlazeCore artifact for $platform does not match its approved pin."
+        }
+        $blazeCoreHashes[$platform] = $approvedHashes[$platform]
+    }
 }
 
 $stage = $null
@@ -190,6 +211,15 @@ try {
     New-Item -ItemType Directory -Force -Path $work, $outputDirectory | Out-Null
     $stage = New-BuildStage $work 'package-'
     $linkVariant = @('--debug-mode')
+    if ($Acceptance) {
+        $acceptanceManifest = [xml](Get-Content -Raw -LiteralPath $manifest)
+        $instrumentation = $acceptanceManifest.CreateElement('instrumentation')
+        $null = $instrumentation.SetAttribute('name', 'http://schemas.android.com/apk/res/android', 'com.kobaproduction.blazer.AcceptanceInstrumentation')
+        $null = $instrumentation.SetAttribute('targetPackage', 'http://schemas.android.com/apk/res/android', 'com.kobaproduction.blazer')
+        $null = $acceptanceManifest.DocumentElement.AppendChild($instrumentation)
+        $manifest = Join-Path $stage 'AndroidManifest.xml'
+        $acceptanceManifest.Save($manifest)
+    }
     if ($direct) {
         $applicationManifest = [xml](Get-Content -Raw -LiteralPath $manifest)
         $namespaces = [System.Xml.XmlNamespaceManager]::new($applicationManifest.NameTable)
@@ -218,11 +248,14 @@ try {
         Set-Item -Path "Env:AR_$envTarget" -Value $archiver
         Set-Item -Path "Env:CFLAGS_$envTarget" -Value "--target=${target}26"
 
-        Invoke-Step cargo @('build', '--locked', '--release', '-p', 'vpn-android', '--target', $target)
+        $cargoBuild = @('build', '--locked', '-p', 'vpn-android', '--target', $target)
+        $rustProfile = if ($Acceptance) { 'debug' } else { 'release' }
+        if ($Acceptance) { $cargoBuild += @('--features', 'acceptance') } else { $cargoBuild += '--release' }
+        Invoke-Step cargo $cargoBuild
         $entry = "lib/$platform/libblazer_android.so"
         $destination = Join-Path $stage $entry
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $repo "target/$target/release/libblazer_android.so") -Destination $destination
+        Copy-Item -LiteralPath (Join-Path $repo "target/$target/$rustProfile/libblazer_android.so") -Destination $destination
         Invoke-Step $strip @('--strip-debug', $destination)
         $apkEntries += $entry
         if ($blazeCoreHashes) {
@@ -242,6 +275,7 @@ try {
         '--java', $generatedSources, '-o', $unsigned, $resources))
     $sources = @(Get-ChildItem -LiteralPath (Join-Path $package 'java'), $generatedSources -Recurse -Filter '*.java' -File |
         ForEach-Object { $_.FullName })
+    if ($Acceptance) { $sources += @(Get-ChildItem -LiteralPath (Join-Path $repo 'tests/android-native/java') -Recurse -Filter '*.java' -File | ForEach-Object { $_.FullName }) }
     Invoke-Step $javac (@('--release', '17', '-encoding', 'UTF-8', '-classpath', $androidJar, '-d', $classes) + $sources)
     $code = Join-Path $stage 'classes.zip'
     [IO.Compression.ZipFile]::CreateFromDirectory($classes, $code)

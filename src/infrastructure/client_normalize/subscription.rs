@@ -10,7 +10,11 @@ pub(super) fn parse(input: &[u8]) -> Result<NormalizedSubscription, ClientError>
 
 fn parse_document(text: &str) -> Result<NormalizedSubscription, ClientError> {
     let mut profiles = SubscriptionProfiles::default();
-    if text.starts_with(['{', '[']) {
+    if super::wireguard::recognizes(text) {
+        profiles.append(super::wireguard::parse(text), true, |reason| {
+            UnavailableProfile::new("", Some("wireguard"), reason)
+        })?;
+    } else if text.starts_with(['{', '[']) || json::recognizes_native_yaml(text) {
         json::append_subscription_entries(text, &mut profiles)?;
     } else {
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -40,7 +44,8 @@ impl SubscriptionProfiles {
             (
                 _,
                 Some(
-                    "vless" | "vmess" | "trojan" | "socks5" | "http" | "shadowsocks" | "hysteria2",
+                    "vless" | "vmess" | "trojan" | "socks5" | "http" | "shadowsocks" | "hysteria2"
+                    | "amnezia",
                 ),
             ) => links::parse_share_link(link),
             (Some(_), _) => Err(ClientError::UnsupportedFormat),
@@ -123,6 +128,11 @@ pub(super) fn protocol_label(protocol: &str) -> Option<&'static str> {
         "ssr" => Some("ssr"),
         "tuic" => Some("tuic"),
         "wireguard" | "wg" => Some("wireguard"),
+        "vpn" => Some("amnezia"),
+        "amneziawg" | "awg" => Some("amneziawg"),
+        "snell" => Some("snell"),
+        "anytls" => Some("anytls"),
+        "naiveproxy" => Some("naive"),
         "mieru" => Some("mieru"),
         "naive" => Some("naive"),
         "ssh" => Some("ssh"),

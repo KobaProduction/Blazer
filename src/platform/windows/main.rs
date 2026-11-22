@@ -7,22 +7,38 @@ mod demo_launch;
 #[cfg(windows)]
 fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     use std::process::ExitCode;
+    use vpn_presentation::localization::{Key, Locale, text};
 
+    let title = text(Locale::Russian, Key::AppName);
     let mut arguments = std::env::args_os().skip(1);
     match arguments.next() {
-        None => blazer::run()?,
+        None => {
+            recover_proxy_for_window()?;
+            blazer::run()?;
+        }
+        Some(argument) if argument == "--system-proxy-guard" && arguments.len() == 0 => {
+            return Ok(if client_core::run_system_proxy_guard().is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
         Some(argument) if argument == "--version" && arguments.len() == 0 => {
             attach_parent_console();
-            println!("Blazer {}", vpn_application::APP_VERSION);
+            println!("{title} {}", vpn_application::APP_VERSION);
         }
         Some(argument) if argument == "--cli" => {
             attach_parent_console();
+            if let Err(error) = client_core::recover_system_proxy() {
+                println!("error={error:?}");
+                return Ok(ExitCode::FAILURE);
+            }
             return Ok(client_cli::launch(arguments));
         }
         Some(argument) if argument == "--apply-update" => {
             if let Err(error) = blazer::apply_update(arguments) {
                 rfd::MessageDialog::new()
-                    .set_title("Blazer")
+                    .set_title(title)
                     .set_description(format!("Не удалось установить обновление.\n{error}"))
                     .set_level(rfd::MessageLevel::Error)
                     .show();
@@ -30,6 +46,7 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             }
         }
         Some(argument) if argument == "--finish-update" && arguments.len() == 1 => {
+            recover_proxy_for_window()?;
             blazer::run_after_update(arguments.next().expect("one update directory argument"))?;
         }
         #[cfg(all(debug_assertions, feature = "demo"))]
@@ -42,10 +59,25 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
                 attach_parent_console();
                 return Err("usage: blazer [--version | --cli | blazer://add/{url}]".into());
             };
+            recover_proxy_for_window()?;
             blazer::run_import(import.into_owned())?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(windows)]
+fn recover_proxy_for_window() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) = client_core::recover_system_proxy() {
+        use vpn_presentation::localization::{Key, Locale, text};
+        rfd::MessageDialog::new()
+            .set_title(text(Locale::Russian, Key::AppName))
+            .set_description(text(Locale::Russian, Key::SystemProxyRestoreFailed))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        return Err(format!("Windows proxy recovery failed: {error:?}").into());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

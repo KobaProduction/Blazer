@@ -10,12 +10,13 @@ use vpn_image_import::{Error, MAX_IMAGE_BYTES};
 use vpn_presentation::import::payload;
 use vpn_presentation::localization::Key;
 
-use super::host::{CaptureQrImage, ImportResult, PickQrImage};
+use super::host::{CaptureQrImage, ImportResult, PickImportFile};
 
 #[derive(Default)]
 pub(super) struct ImportSource {
     clipboard: Option<Instant>,
     image: Option<mpsc::Receiver<ImportResult>>,
+    worker_error: Option<Key>,
     pub screenshot_help: bool,
     pub error: Option<Key>,
 }
@@ -32,8 +33,14 @@ impl ImportSource {
         ctx.request_repaint_after(Duration::from_millis(30));
     }
 
-    pub fn pick_file(&mut self, ctx: &egui::Context, title: &'static str, pick: PickQrImage) {
-        self.read_image(ctx, move || pick(title));
+    pub fn pick_file(
+        &mut self,
+        ctx: &egui::Context,
+        title: &'static str,
+        error: Key,
+        pick: PickImportFile,
+    ) {
+        self.read_async(ctx, error, move || pick(title));
     }
 
     pub fn open_file(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -75,7 +82,9 @@ impl ImportSource {
         let result = match self.image.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err(Key::QrUnreadableImage),
+            Err(TryRecvError::Disconnected) => {
+                Err(self.worker_error.unwrap_or(Key::QrUnreadableImage))
+            }
         };
         self.image = None;
         Some(result)
@@ -126,17 +135,29 @@ impl ImportSource {
         ctx: &egui::Context,
         operation: impl FnOnce() -> ImportResult + Send + 'static,
     ) {
+        self.read_async(ctx, Key::QrUnreadableImage, operation);
+    }
+
+    fn read_async(
+        &mut self,
+        ctx: &egui::Context,
+        error: Key,
+        operation: impl FnOnce() -> ImportResult + Send + 'static,
+    ) {
         self.error = None;
         let (send, receive) = mpsc::channel();
         let ctx = ctx.clone();
         match std::thread::Builder::new()
-            .name("decode-qr".to_owned())
+            .name("read-import".to_owned())
             .spawn(move || {
                 let _ = send.send(operation());
                 ctx.request_repaint();
             }) {
-            Ok(_) => self.image = Some(receive),
-            Err(_) => self.error = Some(Key::QrUnreadableImage),
+            Ok(_) => {
+                self.image = Some(receive);
+                self.worker_error = Some(error);
+            }
+            Err(_) => self.error = Some(error),
         }
     }
 }

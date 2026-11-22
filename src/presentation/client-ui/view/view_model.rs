@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use vpn_presentation::localization::{Key, Locale};
 use vpn_presentation::model::{ErrorNotice, Removal, locale};
 use vpn_presentation::session::{
-    ClientError, ClientEvent, ClientEventKind, ClientSnapshot, Language, RequestId,
+    ClientError, ClientEvent, ClientEventKind, ClientSnapshot, Language, ProfileSummary, RequestId,
     RoutingReconnect, TelemetryMode, TelemetrySettingsSummary,
 };
 
@@ -72,7 +72,8 @@ impl SettingsPage {
 pub(super) struct ProviderSettingsDraft {
     pub subscription_uuid: String,
     pub title: Option<String>,
-    pub url: String,
+    pub url: Option<String>,
+    pub url_visible: bool,
     pub fallback_url: String,
     pub pending: Option<RequestId>,
 }
@@ -177,10 +178,9 @@ pub(super) struct ConfigurationDraft {
 }
 
 #[derive(PartialEq, Eq)]
-pub(super) enum CatalogOperation {
-    Refresh(String),
-    ProbeGroup(Option<String>),
-    ProbeProfile(String),
+pub(super) enum ProbeScope {
+    Group(Option<String>),
+    Profile(String),
 }
 
 #[derive(Default)]
@@ -271,8 +271,9 @@ impl SubscriptionErrors {
 
 pub(super) struct ProfileEditor {
     pub uuid: String,
-    pub json: String,
-    pub invalid: bool,
+    pub text: String,
+    pub pending: Option<RequestId>,
+    pub feedback: Option<(u64, ErrorNotice)>,
 }
 
 pub struct ViewState {
@@ -289,8 +290,8 @@ pub struct ViewState {
     pub removal: Option<Removal>,
     pub(super) configuration: Option<ConfigurationDraft>,
     pub(super) profile_editor: Option<ProfileEditor>,
-    pub(super) profile_drafts: HashMap<String, String>,
-    pub(super) catalog_operation: Option<(CatalogOperation, RequestId)>,
+    pub(super) subscription_refresh: Option<(String, RequestId)>,
+    pub(super) probe: Option<(ProbeScope, RequestId)>,
     pub(super) routing_reconnect: RoutingReconnectPrompt,
     pub(super) refreshed_subscription: Option<(String, Instant)>,
     pub(super) subscription_errors: SubscriptionErrors,
@@ -318,8 +319,8 @@ impl Default for ViewState {
             removal: None,
             configuration: None,
             profile_editor: None,
-            profile_drafts: HashMap::new(),
-            catalog_operation: None,
+            subscription_refresh: None,
+            probe: None,
             routing_reconnect: RoutingReconnectPrompt::default(),
             refreshed_subscription: None,
             subscription_errors: SubscriptionErrors::default(),
@@ -424,12 +425,17 @@ impl ViewState {
             self.refreshed_subscription = None;
         }
         let done = snapshot.completed_request?;
-        if self.catalog_operation.as_ref()?.1.0 > done.0 {
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|(_, pending)| pending.0 <= done.0)
+        {
+            self.probe = None;
+        }
+        if self.subscription_refresh.as_ref()?.1.0 > done.0 {
             return None;
         }
-        let (CatalogOperation::Refresh(uuid), pending) = self.catalog_operation.take()? else {
-            return None;
-        };
+        let (uuid, pending) = self.subscription_refresh.take()?;
         if pending != done {
             return None;
         }
@@ -447,8 +453,8 @@ impl ViewState {
                 .iter()
                 .any(|provider| &provider.subscription_uuid == uuid && provider.display.expand_now)
         });
-        let refreshed = match (&self.catalog_operation, snapshot.completed_request) {
-            (Some((CatalogOperation::Refresh(uuid), pending)), Some(done))
+        let refreshed = match (&self.subscription_refresh, snapshot.completed_request) {
+            (Some((uuid, pending)), Some(done))
                 if *pending == done && snapshot.last_error.is_none() =>
             {
                 Some(uuid.as_str())
@@ -472,29 +478,37 @@ impl ViewState {
         }
     }
 
-    pub(super) fn open_profile_editor(&mut self, uuid: &str) {
-        let json = self.profile_drafts.get(uuid).cloned().unwrap_or_else(|| {
-            r#"[
-  {
-    "address": "127.0.0.1:1080",
-    "protocol": { "type": "mixed" },
-    "rules": [{
-      "masks": ["0.0.0.0/0", "::/0"],
-      "action": "allow",
-      "client_chain": {
-        "address": "203.0.113.4:1080",
-        "protocol": { "type": "socks" }
-      }
-    }]
-  }
-]"#
-            .to_owned()
-        });
+    pub(super) fn open_profile_editor(&mut self, profile: &ProfileSummary) {
         self.profile_editor = Some(ProfileEditor {
-            uuid: uuid.to_owned(),
-            json,
-            invalid: false,
+            uuid: profile.profile_uuid.clone(),
+            text: profile
+                .source
+                .as_ref()
+                .map_or_else(String::new, |source| source.expose().to_owned()),
+            pending: None,
+            feedback: None,
         });
+    }
+
+    pub(super) fn update_profile_request(&mut self, snapshot: &ClientSnapshot) {
+        let Some(draft) = &mut self.profile_editor else {
+            return;
+        };
+        let Some((pending, done)) = draft.pending.zip(snapshot.completed_request) else {
+            return;
+        };
+        if pending.0 > done.0 {
+            return;
+        }
+        draft.pending = None;
+        if pending != done {
+            return;
+        }
+        if let Some(error) = snapshot.last_error {
+            draft.feedback = Some((snapshot.revision, ErrorNotice::Client(error)));
+        } else {
+            self.profile_editor = None;
+        }
     }
 
     pub fn open_subscription_routing(&mut self, subscription_uuid: &str) {
@@ -511,7 +525,8 @@ impl ViewState {
             self.provider_settings = Some(ProviderSettingsDraft {
                 subscription_uuid: subscription_uuid.to_owned(),
                 title: None,
-                url: String::new(),
+                url: None,
+                url_visible: false,
                 fallback_url: String::new(),
                 pending: None,
             });
@@ -529,6 +544,40 @@ impl ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_editor_prefills_the_source_and_retains_edits_after_failure() {
+        let profile = ProfileSummary {
+            profile_uuid: "profile".into(),
+            name: "Server".into(),
+            protocol: "SOCKS5".into(),
+            server: "127.0.0.1:1080".into(),
+            source: Some(vpn_presentation::session::Secret::new(
+                "socks5://127.0.0.1:1080",
+            )),
+            subscription_uuid: None,
+        };
+        let mut state = ViewState::default();
+        state.open_profile_editor(&profile);
+        let draft = state.profile_editor.as_mut().unwrap();
+        assert_eq!(draft.text, "socks5://127.0.0.1:1080");
+        draft.text = "edited text".into();
+        draft.pending = Some(RequestId(1));
+        let mut snapshot = ClientSnapshot {
+            completed_request: Some(RequestId(1)),
+            last_error: Some(ClientError::InvalidSubscription),
+            ..Default::default()
+        };
+        state.update_profile_request(&snapshot);
+        let draft = state.profile_editor.as_mut().unwrap();
+        assert_eq!(draft.text, "edited text");
+        assert!(draft.feedback.is_some());
+        draft.pending = Some(RequestId(2));
+        snapshot.completed_request = Some(RequestId(2));
+        snapshot.last_error = None;
+        state.update_profile_request(&snapshot);
+        assert!(state.profile_editor.is_none());
+    }
 
     #[test]
     fn routing_reconnect_prompt_requires_a_successful_edit_to_the_effective_route() {
@@ -615,29 +664,48 @@ mod tests {
         let mut state = ViewState::default();
         let now = Instant::now();
         let request = RequestId(2);
-        state.catalog_operation = Some((CatalogOperation::Refresh("sub".into()), request));
+        state.subscription_refresh = Some(("sub".into(), request));
         let mut snapshot = ClientSnapshot {
             completed_request: Some(RequestId(1)),
             ..ClientSnapshot::default()
         };
         assert_eq!(state.update_catalog_request(&snapshot, now), None);
-        assert!(state.catalog_operation.is_some());
+        assert!(state.subscription_refresh.is_some());
         assert_eq!(state.refreshed_subscription, None);
 
         snapshot.completed_request = Some(request);
         assert_eq!(state.update_catalog_request(&snapshot, now), None);
-        assert!(state.catalog_operation.is_none());
+        assert!(state.subscription_refresh.is_none());
         assert_eq!(
             state.refreshed_subscription,
             Some(("sub".into(), now + REFRESH_SUCCESS_DURATION))
         );
 
-        state.catalog_operation = Some((CatalogOperation::Refresh("sub".into()), RequestId(3)));
+        state.subscription_refresh = Some(("sub".into(), RequestId(3)));
         snapshot.completed_request = Some(RequestId(3));
         snapshot.last_error = Some(ClientError::Network);
         assert_eq!(
             state.update_catalog_request(&snapshot, now),
             Some(ClientError::Network)
+        );
+        assert_eq!(state.refreshed_subscription, None);
+    }
+
+    #[test]
+    fn probe_completion_leaves_a_queued_subscription_refresh_pending() {
+        let mut state = ViewState::default();
+        let now = Instant::now();
+        state.probe = Some((ProbeScope::Profile("server".into()), RequestId(1)));
+        state.subscription_refresh = Some(("sub".into(), RequestId(2)));
+        let snapshot = ClientSnapshot {
+            completed_request: Some(RequestId(1)),
+            ..ClientSnapshot::default()
+        };
+        assert_eq!(state.update_catalog_request(&snapshot, now), None);
+        assert!(state.probe.is_none());
+        assert_eq!(
+            state.subscription_refresh,
+            Some(("sub".into(), RequestId(2)))
         );
         assert_eq!(state.refreshed_subscription, None);
     }

@@ -1,12 +1,24 @@
-//! Typed client catalog. Secrets are redacted from Debug and never enter view models.
+//! Typed client catalog. Secrets are redacted from Debug and require explicit access.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
+mod graph;
+mod probe;
+pub use graph::{
+    GraphGroup, GraphMatch, GraphNetwork, GraphObservatory, GraphOutbound, GraphOutboundKind,
+    GraphRule, GraphStrategy, GraphTarget, ProbeReport, ProxyGraph, record_graph_probe,
+    select_least_ping,
+};
 mod xhttp;
-pub use xhttp::{XhttpMetadata, XhttpPacketOptions, XhttpPacketRange, XhttpPlacement};
+pub use probe::{ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy};
+mod xray_tls_profiles;
+pub use xhttp::{
+    XhttpMetadata, XhttpPacketOptions, XhttpPacketRange, XhttpPlacement, XhttpWireField,
+    XhttpWireOptions, XhttpWireValue,
+};
 
 pub const MAX_PROFILES: usize = 256;
 pub const MAX_SUBSCRIPTIONS: usize = 64;
@@ -60,6 +72,7 @@ pub enum ClientError {
     InvalidInput,
     UnsupportedFormat,
     UnsupportedFeature,
+    ProbeConnectionNotReusable,
     UnsupportedXhttpUploadMethod,
     PayloadTooLarge,
     InvalidUrl,
@@ -80,6 +93,10 @@ pub enum ClientError {
     EngineUntrusted,
     EngineInvalid,
     EngineStart,
+    SystemProxyUnavailable,
+    SystemProxyRestoreFailed,
+    TunServiceUnavailable,
+    LinuxTunUnavailable,
     EngineReadiness,
     EngineStopped,
     UnsupportedMode,
@@ -130,6 +147,8 @@ impl fmt::Debug for SubscriptionHttpError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    Graph(Box<ProxyGraph>),
+    Native(NativeProxy),
     Socks5 {
         username: Option<Secret>,
         password: Option<Secret>,
@@ -164,6 +183,8 @@ pub enum ProxyProtocol {
 impl ProxyProtocol {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Graph(_) => "Xray graph",
+            Self::Native(proxy) => proxy.kind.name(),
             Self::Socks5 { .. } => "SOCKS5",
             Self::Http { .. } => "HTTP",
             Self::Vless { .. } => "VLESS",
@@ -176,8 +197,55 @@ impl ProxyProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProxy {
+    pub kind: NativeProxyKind,
+    pub settings: Secret,
+    pub dns_servers: Vec<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeProxyKind {
+    WireGuard,
+    AmneziaWg,
+    Hysteria2,
+    Tuic,
+    Http,
+    Socks5,
+    Shadowsocks,
+    Snell,
+    Vless,
+    Vmess,
+    Trojan,
+    AnyTls,
+    NaiveProxy,
+    PortForward,
+}
+
+impl NativeProxyKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WireGuard => "WireGuard",
+            Self::AmneziaWg => "AmneziaWG",
+            Self::Hysteria2 => "Hysteria2",
+            Self::Tuic => "TUIC",
+            Self::Http => "HTTP",
+            Self::Socks5 => "SOCKS5",
+            Self::Shadowsocks => "Shadowsocks",
+            Self::Snell => "Snell",
+            Self::Vless => "VLESS",
+            Self::Vmess => "VMess",
+            Self::Trojan => "Trojan",
+            Self::AnyTls => "AnyTLS",
+            Self::NaiveProxy => "NaiveProxy",
+            Self::PortForward => "Port forward",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyTransport {
     Tcp,
+    Udp,
     WebSocket {
         path: String,
         host: Option<String>,
@@ -193,6 +261,12 @@ pub enum ProxyTransport {
     Quic {
         certificate_sha256: Option<String>,
     },
+}
+
+impl ProxyTransport {
+    pub const fn has_tcp_endpoint(&self) -> bool {
+        !matches!(self, Self::Udp | Self::Quic { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +338,7 @@ impl ProxySecurity {
 pub enum TlsFingerprint {
     Firefox120,
     Firefox148,
+    Xray(&'static str),
 }
 
 impl TlsFingerprint {
@@ -272,7 +347,9 @@ impl TlsFingerprint {
             "firefox-120" | "firefox_120" | "hellofirefox_120" => Ok(Self::Firefox120),
             "firefox" | "firefox-148" | "firefox_148" | "firefox_auto" | "hellofirefox_auto"
             | "hellofirefox_148" => Ok(Self::Firefox148),
-            _ => Err(ClientError::UnsupportedFeature),
+            name => xray_tls_profiles::canonical_name(name)
+                .map(Self::Xray)
+                .ok_or(ClientError::UnsupportedFeature),
         }
     }
 
@@ -280,6 +357,7 @@ impl TlsFingerprint {
         match self {
             Self::Firefox120 => "firefox-120",
             Self::Firefox148 => "firefox-148",
+            Self::Xray(name) => name,
         }
     }
 }
@@ -315,6 +393,7 @@ impl AlpnProtocols {
 pub struct ProxyProfile {
     pub profile_uuid: String,
     pub name: String,
+    pub source: Option<Secret>,
     pub host: String,
     pub port: u16,
     pub protocol: ProxyProtocol,
@@ -561,6 +640,7 @@ impl TelemetrySettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSettings {
+    pub probe: ProbeSettings,
     pub language: Language,
     pub local_proxy_port: u16,
     pub connection_mode: ConnectionMode,
@@ -585,6 +665,7 @@ pub fn validate_subscription_user_agent(value: &str) -> Result<(), ClientError> 
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
+            probe: ProbeSettings::default(),
             language: Language::Russian,
             local_proxy_port: 0,
             connection_mode: ConnectionMode::LocalProxy,
@@ -609,6 +690,19 @@ impl Catalog {
         if self.profile_count() > MAX_PROFILES || self.subscriptions.len() > MAX_SUBSCRIPTIONS {
             return Err(ClientError::PayloadTooLarge);
         }
+        let mut endpoint_count = 0usize;
+        for item in &self.profiles {
+            let count = if let ProxyProtocol::Graph(graph) = &item.profile.protocol {
+                graph.validate()?;
+                graph.outbounds.len()
+            } else {
+                1
+            };
+            endpoint_count = endpoint_count.saturating_add(count);
+        }
+        if endpoint_count > MAX_PROFILES {
+            return Err(ClientError::PayloadTooLarge);
+        }
         for subscription in &self.subscriptions {
             Subscription::validate_title(&subscription.title)?;
             subscription.provider.metadata.validate()?;
@@ -620,6 +714,7 @@ impl Catalog {
             validate_subscription_user_agent(user_agent.expose())?;
         }
         self.settings.telemetry.validate()?;
+        self.settings.probe.validate()?;
         self.routing.validate(&self.subscriptions)
     }
 

@@ -1,11 +1,51 @@
 //! Manual import and catalog profile commands.
 
 use super::{
-    Catalog, CatalogProfile, ClientApplication, ClientError, MAX_PROFILES, ProxyProfile,
-    Subscription,
+    Cancellation, Catalog, CatalogProfile, ClientApplication, ClientError, MAX_PROFILES,
+    ProxyProfile, Subscription,
 };
 
 impl ClientApplication {
+    pub fn update_profile(
+        &mut self,
+        profile_uuid: &str,
+        input: &[u8],
+        cancel: &Cancellation,
+    ) -> Result<(), ClientError> {
+        cancel.check()?;
+        if self.active_profile_uuid() == Some(profile_uuid) {
+            return Err(ClientError::DisconnectFirst);
+        }
+        let index = self
+            .catalog
+            .profiles
+            .iter()
+            .position(|item| item.profile.profile_uuid == profile_uuid)
+            .ok_or(ClientError::ProfileNotFound)?;
+        if self.profile_source_hidden(&self.catalog.profiles[index]) {
+            return Err(ClientError::UnsupportedFeature);
+        }
+        let [mut profile]: [ProxyProfile; 1] = self
+            .normalize_profiles(input)?
+            .try_into()
+            .map_err(|_| ClientError::InvalidSubscription)?;
+        profile.profile_uuid = profile_uuid.to_owned();
+        let mut candidate = self.catalog.clone();
+        candidate.profiles[index].profile = profile;
+        cancel.check()?;
+        self.commit(candidate)?;
+        self.profile_latencies.remove(profile_uuid);
+        Ok(())
+    }
+
+    pub fn profile_source_hidden(&self, profile: &CatalogProfile) -> bool {
+        profile.subscription_uuid.as_deref().is_some_and(|uuid| {
+            self.catalog.subscriptions.iter().any(|subscription| {
+                subscription.subscription_uuid == uuid && subscription.provider.raw_config_hidden()
+            })
+        })
+    }
+
     pub fn import_text(&mut self, title: &str, input: &[u8]) -> Result<(), ClientError> {
         Subscription::validate_title(title)?;
         if input.len() > crate::MAX_SUBSCRIPTION_BYTES {

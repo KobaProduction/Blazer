@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use crate::localization::{Key, Locale, text};
 use crate::session::{
     ClientError, ClientSnapshot, ConnectionMode, ConnectionStatus, Language, ModeCapabilities,
-    ProfileSummary, ProfileUnavailableReason, Secret, TelemetryBearerChange, TelemetryMode,
-    UnavailableProfile,
+    ProbeSettings, ProfileSummary, ProfileUnavailableReason, Secret, TelemetryBearerChange,
+    TelemetryMode, UnavailableProfile,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub enum Intent {
     Disconnect,
     ChangeMode(ConnectionMode),
     SetLocalProxyPort(u16),
+    SetProbeSettings(ProbeSettings),
     SetSubscriptionHwid(bool),
     SetSubscriptionUserAgent(Option<Secret>),
     SetTelemetrySettings {
@@ -50,6 +51,10 @@ pub enum Intent {
     ImportProfiles {
         title: String,
         text: String,
+    },
+    UpdateProfile {
+        profile_uuid: String,
+        text: Secret,
     },
     SaveSubscription {
         subscription_uuid: Option<String>,
@@ -206,6 +211,7 @@ pub fn error_key(error: ClientError) -> Key {
         ClientError::UnsupportedFormat | ClientError::InvalidSubscription => Key::ParseFailed,
         ClientError::UnsupportedFeature | ClientError::UnsupportedMode => Key::Unsupported,
         ClientError::UnsupportedXhttpUploadMethod => Key::ProfileUnsupportedXhttpUploadMethod,
+        ClientError::ProbeConnectionNotReusable => Key::ProbeConnectionNotReusable,
         ClientError::PayloadTooLarge => Key::InputTooLarge,
         ClientError::Network => Key::DownloadFailed,
         ClientError::SubscriptionHttp(_) => Key::SubscriptionHttpFailed,
@@ -224,6 +230,10 @@ pub fn error_key(error: ClientError) -> Key {
         ClientError::EngineInvalid => Key::EngineInvalid,
         ClientError::EngineUntrusted => Key::EngineUntrusted,
         ClientError::EngineStart => Key::EngineFailed,
+        ClientError::SystemProxyUnavailable => Key::SystemProxyUnavailable,
+        ClientError::SystemProxyRestoreFailed => Key::SystemProxyRestoreFailed,
+        ClientError::TunServiceUnavailable => Key::TunServiceUnavailable,
+        ClientError::LinuxTunUnavailable => Key::LinuxTunUnavailable,
         ClientError::EngineReadiness => Key::EngineReadiness,
         ClientError::EngineStopped => Key::EngineStopped,
         ClientError::Cancelled => Key::Cancelled,
@@ -256,6 +266,7 @@ mod tests {
             name: "Server".to_owned(),
             protocol: "SOCKS5".to_owned(),
             server: "127.0.0.1:1080".to_owned(),
+            source: None,
             subscription_uuid: Some("hidden".to_owned()),
         };
         assert!(profile_details_hidden(&snapshot, &profile));

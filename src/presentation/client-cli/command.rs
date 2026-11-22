@@ -2,7 +2,8 @@ use std::io::Read;
 
 use client_core::{
     ClientCommand, ClientError, ConnectionMode, DnsPolicy, Language, MAX_SUBSCRIPTION_BYTES,
-    RouteAction, RouteRule, RouteTarget, RoutingAssignment, RoutingCatalog, RoutingInput,
+    ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy, RouteAction, RouteRule,
+    RouteTarget, RoutingAssignment, RoutingCatalog, RoutingInput,
 };
 
 const MAX_SUBSCRIPTION_URL_BYTES: usize = 8192;
@@ -12,6 +13,7 @@ pub enum Action {
     Profiles,
     Subscriptions,
     Settings,
+    PingSettings,
     Diagnostics,
     Routing(Option<String>),
     Serve(ConnectionMode),
@@ -25,6 +27,7 @@ pub enum Operation {
     SetFallback(String),
     Probe(String),
     ProbeProfiles(Option<String>),
+    SetProbeSettings(ProbeSettings),
     SaveRoutingProfile { uuid: Option<String>, title: String },
     CopyRoutingProfile { source_uuid: String, title: String },
     Submit(ClientCommand),
@@ -47,6 +50,10 @@ impl Action {
             ["profiles", "test"] => Self::Execute(Operation::ProbeProfiles(None)),
             ["subscriptions"] => Self::Subscriptions,
             ["settings"] => Self::Settings,
+            ["ping-settings"] => Self::PingSettings,
+            ["ping-settings", rest @ ..] => {
+                Self::Execute(Operation::SetProbeSettings(parse_probe_settings(rest)?))
+            }
             ["local-proxy-port", port] => {
                 Self::Execute(Operation::Submit(ClientCommand::SetLocalProxyPort {
                     port: port.parse().map_err(|_| ())?,
@@ -86,6 +93,47 @@ fn profile_command(action: &str, uuid: &str) -> Result<Operation, ()> {
             profile_uuid,
         })),
         "test" => Ok(Operation::Probe(profile_uuid)),
+        _ => Err(()),
+    }
+}
+
+fn parse_probe_settings(args: &[&str]) -> Result<ProbeSettings, ()> {
+    let [method, http_method, timeout_ms, warmup, attempts, strategy] = args else {
+        return Err(());
+    };
+    let settings = ProbeSettings {
+        method: match *method {
+            "auto" => ProbeMethod::Automatic,
+            "tcp" => ProbeMethod::Tcp,
+            "icmp" => ProbeMethod::Icmp,
+            "proxy" => ProbeMethod::Proxy,
+            _ => return Err(()),
+        },
+        http_method: match *http_method {
+            "get" => ProbeHttpMethod::Get,
+            "head" => ProbeHttpMethod::Head,
+            _ => return Err(()),
+        },
+        timeout_ms: timeout_ms.parse().map_err(|_| ())?,
+        warmup: match *warmup {
+            "warmup" => true,
+            "cold" => false,
+            _ => return Err(()),
+        },
+        attempts: attempts.parse().map_err(|_| ())?,
+        strategy: parse_probe_strategy(strategy)?,
+        ..ProbeSettings::default()
+    };
+    settings.validate().map_err(|_| ())?;
+    Ok(settings)
+}
+
+fn parse_probe_strategy(value: &str) -> Result<ProbeStrategy, ()> {
+    match value {
+        "last" => Ok(ProbeStrategy::Last),
+        "min" => Ok(ProbeStrategy::Minimum),
+        "average" => Ok(ProbeStrategy::Average),
+        "median" => Ok(ProbeStrategy::Median),
         _ => Err(()),
     }
 }
@@ -278,6 +326,11 @@ impl Operation {
                 subscription_uuid: uuid,
                 url: Some(read_url(stdin)?),
             },
+            Self::SetProbeSettings(mut settings) => {
+                settings.url = read_url(stdin)?;
+                settings.validate()?;
+                ClientCommand::SetProbeSettings { settings }
+            }
             Self::SaveRoutingProfile { uuid, title } => ClientCommand::SaveRoutingProfile {
                 uuid,
                 profile: read_routing(stdin, title)?,
@@ -341,4 +394,148 @@ fn read_text(input: impl Read, limit: usize) -> Result<String, ClientError> {
         return Err(ClientError::PayloadTooLarge);
     }
     String::from_utf8(bytes).map_err(|_| ClientError::InvalidInput)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_command(args: &[&str], input: &[u8]) -> Result<ProbeSettings, ClientError> {
+        let Action::Execute(operation) = Action::parse(args).unwrap().unwrap() else {
+            panic!("expected a settings operation");
+        };
+        let (command, _) = operation.request(input, &RoutingCatalog::default())?;
+        let ClientCommand::SetProbeSettings { settings } = command else {
+            panic!("expected the core probe-settings command");
+        };
+        Ok(settings)
+    }
+
+    #[test]
+    fn ping_settings_reads_without_consuming_stdin_and_updates_all_preferences() {
+        assert!(matches!(
+            Action::parse(&["ping-settings"]),
+            Ok(Some(Action::PingSettings))
+        ));
+        for (method, expected_method, strategy, expected_strategy) in [
+            ("auto", ProbeMethod::Automatic, "last", ProbeStrategy::Last),
+            ("tcp", ProbeMethod::Tcp, "min", ProbeStrategy::Minimum),
+            ("icmp", ProbeMethod::Icmp, "average", ProbeStrategy::Average),
+            ("proxy", ProbeMethod::Proxy, "median", ProbeStrategy::Median),
+        ] {
+            let settings = probe_command(
+                &[
+                    "ping-settings",
+                    method,
+                    "head",
+                    "1200",
+                    "cold",
+                    "3",
+                    strategy,
+                ],
+                b"https://connectivity.example/check?expected=204\r\n",
+            )
+            .unwrap();
+            assert_eq!(settings.method, expected_method);
+            assert_eq!(settings.http_method, ProbeHttpMethod::Head);
+            assert_eq!(settings.timeout_ms, 1200);
+            assert_eq!(settings.attempts, 3);
+            assert!(!settings.warmup);
+            assert!(settings.http_warmup_required());
+            assert_eq!(
+                settings.url,
+                "https://connectivity.example/check?expected=204"
+            );
+            assert_eq!(settings.strategy, expected_strategy);
+        }
+        let settings = probe_command(
+            &["ping-settings", "icmp", "get", "250", "warmup", "1", "last"],
+            b"http://connectivity.example/check",
+        )
+        .unwrap();
+        assert_eq!(settings.method, ProbeMethod::Icmp);
+        assert_eq!(settings.http_method, ProbeHttpMethod::Get);
+        assert!(settings.warmup);
+    }
+
+    #[test]
+    fn ping_settings_rejects_invalid_syntax_bounds_and_stdin_urls() {
+        for args in [
+            [
+                "ping-settings",
+                "unknown",
+                "get",
+                "5000",
+                "warmup",
+                "1",
+                "last",
+            ],
+            [
+                "ping-settings",
+                "auto",
+                "post",
+                "5000",
+                "warmup",
+                "1",
+                "last",
+            ],
+            ["ping-settings", "auto", "get", "249", "warmup", "1", "last"],
+            [
+                "ping-settings",
+                "auto",
+                "get",
+                "10001",
+                "warmup",
+                "1",
+                "last",
+            ],
+            ["ping-settings", "auto", "get", "5000", "hot", "1", "last"],
+            [
+                "ping-settings",
+                "auto",
+                "get",
+                "5000",
+                "warmup",
+                "0",
+                "last",
+            ],
+            [
+                "ping-settings",
+                "auto",
+                "get",
+                "5000",
+                "warmup",
+                "6",
+                "last",
+            ],
+            [
+                "ping-settings",
+                "auto",
+                "get",
+                "5000",
+                "warmup",
+                "1",
+                "unknown",
+            ],
+        ] {
+            assert!(Action::parse(&args).is_err());
+        }
+        for url in ["file:///private", "https://user:password@host/check"] {
+            assert_eq!(
+                probe_command(
+                    &[
+                        "ping-settings",
+                        "auto",
+                        "get",
+                        "5000",
+                        "warmup",
+                        "1",
+                        "last"
+                    ],
+                    url.as_bytes(),
+                ),
+                Err(ClientError::InvalidUrl)
+            );
+        }
+    }
 }

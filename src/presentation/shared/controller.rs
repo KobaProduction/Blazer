@@ -107,6 +107,7 @@ fn backend_command(intent: Intent) -> ClientCommand {
         Intent::Disconnect => ClientCommand::Disconnect,
         Intent::ChangeMode(mode) => ClientCommand::SetConnectionMode { mode },
         Intent::SetLocalProxyPort(port) => ClientCommand::SetLocalProxyPort { port },
+        Intent::SetProbeSettings(settings) => ClientCommand::SetProbeSettings { settings },
         Intent::SetSubscriptionHwid(enabled) => ClientCommand::SetSubscriptionHwid { enabled },
         Intent::SetSubscriptionUserAgent(value) => {
             ClientCommand::SetSubscriptionUserAgent { value }
@@ -148,6 +149,9 @@ fn backend_command(intent: Intent) -> ClientCommand {
         },
         Intent::ReconnectRouting(pending) => ClientCommand::ReconnectRouting { pending },
         Intent::ImportProfiles { title, text } => ClientCommand::ImportText { title, text },
+        Intent::UpdateProfile { profile_uuid, text } => {
+            ClientCommand::UpdateProfile { profile_uuid, text }
+        }
         Intent::SaveSubscription {
             subscription_uuid: Some(subscription_uuid),
             title,
@@ -200,5 +204,28 @@ fn backend_command(intent: Intent) -> ClientCommand {
         Intent::ConfirmRemoval(Removal::Profile(profile_uuid)) => {
             ClientCommand::RemoveProfile { profile_uuid }
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_settings_tests {
+    use super::*;
+    use crate::session::{ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy};
+
+    #[test]
+    fn saving_probe_settings_sends_all_fields_to_the_shared_client_core() {
+        let settings = ProbeSettings {
+            method: ProbeMethod::Proxy,
+            http_method: ProbeHttpMethod::Head,
+            url: "https://probe.example/check".into(),
+            timeout_ms: 700,
+            attempts: 4,
+            warmup: false,
+            strategy: ProbeStrategy::Median,
+        };
+        let command = backend_command(Intent::SetProbeSettings(settings.clone()));
+        assert!(
+            matches!(command, ClientCommand::SetProbeSettings { settings: saved } if saved == settings)
+        );
     }
 }

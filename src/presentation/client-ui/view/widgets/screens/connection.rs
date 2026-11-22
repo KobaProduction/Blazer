@@ -30,7 +30,7 @@ impl<'a> ViewFrame<'a> {
             ui.visuals().widgets.noninteractive.bg_stroke,
         );
         let inset = f32::from(self.layout.content_inset());
-        let mut list_ui = pane_ui(ui, "catalog", catalog.shrink(inset));
+        let mut list_ui = pane_ui(ui, "catalog", catalog);
         self.home_catalog(&mut list_ui);
         let mut right_ui = pane_ui(ui, "connection-pane", pane.shrink(inset));
         self.connection_pane(&mut right_ui);
@@ -50,26 +50,20 @@ impl<'a> ViewFrame<'a> {
     }
 
     fn compact_connection(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .inner_margin(self.layout.content_inset())
-            .show(ui, |ui| {
-                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-                egui::ScrollArea::vertical()
-                    .id_salt("compact-server-screen")
-                    .max_height(ui.available_height())
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.connection_mode_row(ui);
-                        ui.vertical_centered(|ui| {
-                            self.primary_control(ui, ui.available_width().min(76.0));
-                            self.connection_status(ui);
-                            self.selected_server(ui, false);
-                        });
-                        ui.separator();
-                        self.catalog_header(ui);
-                        self.catalog_contents(ui);
-                    });
+        let layout = self.layout;
+        layout.scroll_frame().show(ui, |ui| {
+            layout.vertical_scroll(ui, "compact-server-screen", |ui| {
+                self.connection_mode_row(ui);
+                ui.vertical_centered(|ui| {
+                    self.primary_control(ui, ui.available_width().min(76.0));
+                    self.connection_status(ui);
+                    self.selected_server(ui, false);
+                });
+                ui.separator();
+                self.catalog_header(ui);
+                self.catalog_contents(ui);
             });
+        });
     }
 
     fn connection_mode_row(&mut self, ui: &mut egui::Ui) {

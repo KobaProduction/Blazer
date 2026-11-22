@@ -8,20 +8,23 @@ use client_core::{
 use jni::objects::{Global, JByteArray, JClass, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{Env, JavaVM, NativeMethod, jni_sig, jni_str, native_method};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use vpn_infrastructure::android::{AndroidEngine, AndroidPlatform, AndroidProtection};
 use vpn_presentation::Controller;
-use vpn_presentation::import::{self, ImportKind};
-use vpn_presentation::localization::{Key, text};
-use vpn_presentation::model::{self, ErrorNotice, Intent};
+use vpn_presentation::localization::text;
+use vpn_presentation::model::{self, Intent};
 use vpn_presentation::session::{
     ClientCommand, ClientError, ClientSession, ClientSnapshot, ConnectionMode, Language, RequestId,
     SubmitError,
 };
 
 static SESSION: Mutex<Option<AndroidSession>> = Mutex::new(None);
-const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
+
+#[cfg(all(feature = "acceptance", not(debug_assertions)))]
+compile_error!("The Android acceptance bridge is restricted to local debug builds");
+#[cfg(all(feature = "acceptance", debug_assertions))]
+#[path = "acceptance.rs"]
+mod acceptance;
 
 struct AndroidSession {
     client: Arc<ClientHandle>,
@@ -59,12 +62,7 @@ const _: NativeMethod = native_method! {
 
 const _: NativeMethod = native_method! {
     java_type = "com.kobaproduction.blazer.NativeSession",
-    static extern fn snapshot() -> JString,
-};
-
-const _: NativeMethod = native_method! {
-    java_type = "com.kobaproduction.blazer.NativeSession",
-    static extern fn dispatch(request: JString) -> jboolean,
+    static extern fn disconnect(),
 };
 
 const _: NativeMethod = native_method! {
@@ -114,46 +112,6 @@ const _: NativeMethod = native_method! {
     name = "refreshSchedule",
     static extern fn refresh_schedule() -> JString,
 };
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Action {
-    Primary,
-    Disconnect,
-    Import { title: String, text: String },
-    AutoImport { text: String },
-    Subscribe { title: String, url: String },
-    Refresh { uuid: String },
-    Select { uuid: String },
-    ToggleLanguage,
-}
-
-impl Action {
-    fn intent(self, controller: &Controller) -> Option<Intent> {
-        let language = controller.snapshot().language;
-        Some(match self {
-            Self::Primary => {
-                return model::primary_action(controller.snapshot(), controller.is_saving_mode()).1;
-            }
-            Self::Disconnect => Intent::Disconnect,
-            Self::Import { title, text } => {
-                ImportKind::Configuration.intent(model::locale(language), &title, &text)
-            }
-            Self::AutoImport { text } => {
-                import::detect(&text).intent(model::locale(language), "", &text)
-            }
-            Self::Subscribe { title, url } => {
-                ImportKind::Subscription.intent(model::locale(language), &title, &url)
-            }
-            Self::Refresh { uuid } => Intent::RefreshSubscription(uuid),
-            Self::Select { uuid } => Intent::SelectProfile(uuid),
-            Self::ToggleLanguage => Intent::ChangeLanguage(match language {
-                Language::Russian => Language::English,
-                Language::English => Language::Russian,
-            }),
-        })
-    }
-}
 
 fn open<'local>(
     env: &mut Env<'local>,
@@ -208,42 +166,10 @@ fn notify_observer(vm: &JavaVM, observer: &Global<JClass<'static>>) {
     });
 }
 
-fn snapshot<'local>(
-    env: &mut Env<'local>,
-    _class: JClass<'local>,
-) -> jni::errors::Result<JString<'local>> {
-    let result = with_controller(|controller| {
-        controller.refresh();
-        view(controller)
-    });
-    let payload = result.map_or_else(|| "{}".to_owned(), |view| view.to_string());
-    env.new_string(&payload)
+fn disconnect(_: &mut Env<'_>, _: JClass<'_>) -> jni::errors::Result<()> {
+    let _ = with_controller(|controller| controller.dispatch(Intent::Disconnect));
+    Ok(())
 }
-
-fn dispatch<'local>(
-    env: &mut Env<'local>,
-    _class: JClass<'local>,
-    request: JString<'local>,
-) -> jni::errors::Result<jboolean> {
-    let request = request.mutf8_chars(env)?.to_string();
-    if request.len() > MAX_COMMAND_BYTES {
-        return Ok(JNI_FALSE);
-    }
-    let Ok(action) = serde_json::from_str::<Action>(&request) else {
-        return Ok(JNI_FALSE);
-    };
-    let accepted = with_controller(|controller| {
-        action
-            .intent(controller)
-            .is_some_and(|intent| controller.dispatch(intent))
-    });
-    Ok(if accepted == Some(true) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    })
-}
-
 fn with_controller<T>(f: impl FnOnce(&mut Controller) -> T) -> Option<T> {
     with_session(|session| f(&mut session.controller))
 }
@@ -399,93 +325,4 @@ fn refresh_schedule<'local>(
         }),
     };
     env.new_string(payload.to_string())
-}
-
-fn view(controller: &Controller) -> Value {
-    let snapshot = controller.snapshot();
-    let locale = model::locale(snapshot.language);
-    let label = |key| text(locale, key);
-    let mut profiles: Vec<_> = snapshot.profiles.iter().map(|profile| json!({
-        "uuid": &profile.profile_uuid,
-        "name": &profile.name,
-        "protocol": &profile.protocol,
-        "selected": snapshot.selected_profile_uuid.as_deref() == Some(&profile.profile_uuid),
-    })).collect();
-    profiles.extend(
-        snapshot
-            .subscriptions
-            .iter()
-            .filter_map(|subscription| {
-                snapshot
-                    .unavailable_profiles
-                    .get(&subscription.subscription_uuid)
-            })
-            .flatten()
-            .map(|profile| {
-                json!({
-                    "name": model::unavailable_profile_name(locale, profile),
-                    "protocol": profile.protocol.as_deref().unwrap_or_default(),
-                    "unavailable_reason": model::unavailable_profile_reason(locale, profile.reason),
-                })
-            }),
-    );
-    let subscriptions: Vec<_> = snapshot
-        .subscriptions
-        .iter()
-        .map(|item| {
-            json!({
-                "uuid": &item.subscription_uuid,
-                "title": &item.title,
-                "count": item.profile_count,
-                "error": item.last_error.map(|error| error_text(ErrorNotice::Client(error), locale)),
-            })
-        })
-        .collect();
-    let state = model::state_key(snapshot.connection, snapshot.active_mode);
-    let (action_label, action) = model::primary_action(snapshot, controller.is_saving_mode());
-    json!({
-        "busy": snapshot.busy,
-        "error": controller.error().map(|error| error_text(error, locale)),
-        "status": label(state),
-        "primary_action": label(action_label),
-        "primary_enabled": action.is_some(),
-        "request_vpn": matches!(action, Some(Intent::Connect(ConnectionMode::Tun))),
-        "mode_available": snapshot.mode_capabilities.supports(snapshot.selected_mode),
-        "language": match snapshot.language { Language::English => "EN", Language::Russian => "RU" },
-        "profiles": profiles,
-        "subscriptions": subscriptions,
-        "labels": labels(snapshot.language),
-    })
-}
-
-fn error_text(
-    error: ErrorNotice,
-    locale: vpn_presentation::localization::Locale,
-) -> std::borrow::Cow<'static, str> {
-    error.text_with_code(locale, error.key())
-}
-
-fn labels(language: Language) -> Value {
-    let locale = model::locale(language);
-    let label = |key| text(locale, key);
-    json!({
-        "title": label(Key::AppName), "profiles": label(Key::Profiles),
-        "subscriptions": label(Key::Subscriptions), "unavailable": label(Key::ModeUnavailable),
-        "add_subscription": label(Key::AddSubscription), "import": label(Key::AddConfiguration),
-        "clipboard": label(Key::AddClipboard), "clipboard_empty": label(Key::ClipboardEmpty),
-        "clipboard_large": label(Key::ClipboardTextTooLarge), "qr": label(Key::AddQr),
-        "qr_file": label(Key::QrOpenFile), "qr_screenshot": label(Key::QrScreenshot),
-        "qr_camera": label(Key::QrCamera), "qr_camera_help": label(Key::QrCameraHelp),
-        "qr_camera_unavailable": label(Key::QrCameraUnavailable),
-        "qr_image_error": label(Key::QrUnreadableImage), "qr_image_large": label(Key::QrImageTooLarge),
-        "qr_screenshot_help": label(Key::QrScreenshotMobileHelp), "import_problem": label(Key::ImportProblem),
-        "import_text": label(Key::ConfigurationText), "configuration_name": label(Key::ConfigurationName),
-        "name": label(Key::SubscriptionName), "url": label(Key::SubscriptionUrl),
-        "empty_profiles": label(Key::NoProfiles), "empty_subscriptions": label(Key::NoSubscriptions),
-        "refresh": label(Key::Refresh), "select": label(Key::ActiveProfile),
-        "selected": label(Key::Selected), "cancel": label(Key::Cancel), "save": label(Key::Save),
-        "connect": label(Key::Connect), "busy": label(Key::Busy),
-        "app_updates": label(Key::SettingsUpdateGroup),
-        "app_updates_failed": label(Key::AboutUpdateFailed),
-    })
 }

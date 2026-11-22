@@ -10,6 +10,7 @@ members = [
     "src/presentation/client-cli",
     "src/platform/android",
     "src/platform/ios",
+    "src/platform/apple/observer-bridge",
     "src/platform/linux",
     "src/platform/macos",
     "src/platform/windows",
@@ -39,6 +40,7 @@ opentelemetry-otlp = { version = "=0.33.1", default-features = false, features =
 eframe = { version = "=0.37.0", default-features = false }
 egui = { version = "=0.37.0", default-features = false, features = ["default_fonts", "experimental"] }
 jni = "=0.22.4"
+nix = { version = "=0.31.4", default-features = false, features = ["socket"] }
 
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"

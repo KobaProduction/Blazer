@@ -31,25 +31,31 @@ pub fn apply_update(arguments: impl Iterator<Item = OsString>) -> std::io::Resul
 }
 
 fn run_window(import: Option<String>, completed_update: Option<OsString>) -> eframe::Result {
+    let client_options = ClientCoreOptions {
+        subscription_refresh: SubscriptionRefreshMode::Automatic,
+        ..ClientCoreOptions::default()
+    };
+    let options = eframe::NativeOptions {
+        persistence_path: Some(client_options.data_dir.join("window.ron")),
+        persist_window: false,
+        window_builder: Some(Box::new(crate::window_state::restore_viewport)),
+        ..native_options()
+    };
     eframe::run_native(
         localization::text(Locale::Russian, Key::AppName),
-        native_options(),
+        options,
         Box::new(move |creation| {
             crate::set_taskbar_icon(creation);
-            let mut window = create_window(
-                creation,
-                ClientCoreOptions {
-                    subscription_refresh: SubscriptionRefreshMode::Automatic,
-                    ..ClientCoreOptions::default()
-                },
-            )?;
+            let mut window = create_window(creation, client_options)?;
             if let Some(input) = import {
                 window.prefill_import(input);
             }
             if let Some(work) = completed_update {
                 updates::package::schedule_cleanup(work);
             }
-            Ok(Box::new(NativeView(window)))
+            Ok(Box::new(
+                NativeView::new(window, true).with_window_placement(creation),
+            ))
         }),
     )
 }

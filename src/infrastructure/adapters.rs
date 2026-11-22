@@ -7,8 +7,10 @@ pub mod client_http;
 pub mod client_normalize;
 pub mod client_probe;
 pub mod client_store;
+mod native_profile;
 mod provider;
 mod provider_store;
+mod xhttp_wire;
 
 pub use provider::{subscription_display, subscription_usage};
 

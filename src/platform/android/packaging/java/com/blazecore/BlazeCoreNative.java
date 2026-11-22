@@ -21,5 +21,18 @@ public final class BlazeCoreNative {
     public static native void stop(long handle);
     public static native boolean isRunning();
 
+    // Bit 0 is the reviewed core ABI's named-selector control capability.
+    public static native long getCapabilities();
+    public static native int selectOutbound(long handle, String group, String member);
+
+    public static boolean selectorControlAvailable() {
+        if (!AVAILABLE) return false;
+        try {
+            return (getCapabilities() & 1L) != 0;
+        } catch (UnsatisfiedLinkError unavailableAbi) {
+            return false;
+        }
+    }
+
     private BlazeCoreNative() {}
 }

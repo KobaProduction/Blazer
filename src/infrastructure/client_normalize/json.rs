@@ -1,6 +1,6 @@
-use std::fmt;
+use std::{cell::Cell, fmt, net::IpAddr};
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use vpn_application::client::{ProfileUnavailableReason, UnavailableProfile};
 use vpn_domain::client::TcpProbeEndpoint;
@@ -8,17 +8,39 @@ use vpn_domain::client::TcpProbeEndpoint;
 use super::subscription::{SubscriptionProfiles, is_tcp_transport, protocol_label};
 use super::{
     AlpnProtocols, ClientError, MAX_PROFILES, ProxyProfile, blazecore, endpoint_host, links,
-    sing_box, xray,
+    sing_box, xray, xray_graph,
 };
 
 pub(super) fn parse_document(text: &str) -> Result<Vec<ProxyProfile>, ClientError> {
-    let value = parse_value(text)?;
+    parse_document_value(parse_value(text)?)
+}
+
+pub(super) fn recognizes_native_yaml(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && *line != "---")
+        .and_then(|line| line.strip_prefix("- ").unwrap_or(line).split_once(':'))
+        .is_some_and(|(key, _)| {
+            matches!(
+                key,
+                "address" | "name" | "protocol" | "client_group" | "transport"
+            )
+        })
+}
+
+pub(super) fn parse_native_yaml(text: &str) -> Result<Vec<ProxyProfile>, ClientError> {
+    parse_document_value(parse_yaml_value(text)?)
+}
+
+fn parse_document_value(value: Value) -> Result<Vec<ProxyProfile>, ClientError> {
     if !value.is_array() && !value.is_object() {
         return Err(ClientError::UnsupportedFormat);
     }
     let items = value
         .as_array()
         .map_or(std::slice::from_ref(&value), Vec::as_slice);
+    let groups = blazecore::expand_client_groups(items)?;
+    let items = groups.as_deref().unwrap_or(items);
     let mut profiles = Vec::new();
     for item in items {
         append_profiles(item, &mut profiles)?;
@@ -48,10 +70,24 @@ fn append_wrapped_outbounds(
     outbounds: &Value,
     profiles: &mut Vec<ProxyProfile>,
 ) -> Result<(), ClientError> {
-    fields(document, &["outbounds", "inbounds", "log"])?;
     let outbounds = outbounds
         .as_array()
         .ok_or(ClientError::InvalidSubscription)?;
+    if let Some(outbound) = standalone_xray_xhttp(document, outbounds) {
+        if profiles.len() == MAX_PROFILES {
+            return Err(ClientError::PayloadTooLarge);
+        }
+        profiles.push(parse_wrapped_xhttp(document, outbound)?);
+        return Ok(());
+    }
+    if xray_graph::recognizes(document) {
+        if profiles.len() == MAX_PROFILES {
+            return Err(ClientError::PayloadTooLarge);
+        }
+        profiles.push(xray_graph::parse(document)?);
+        return Ok(());
+    }
+    fields(document, &["outbounds", "inbounds", "log"])?;
     if outbounds.is_empty() {
         return Err(ClientError::InvalidSubscription);
     }
@@ -94,23 +130,37 @@ fn static_xray_outbound(outbound: &Value, xray: bool) -> Result<bool, ClientErro
 }
 
 fn parse_outbound(value: &Value) -> Result<ProxyProfile, ClientError> {
-    match (value.get("protocol"), value.get("type")) {
-        (Some(protocol), None) if protocol.is_string() => xray::parse_outbound(value),
-        (Some(protocol), None) if protocol.is_object() => blazecore::parse(value),
-        (None, Some(_)) => sing_box::parse_outbound(value),
-        (Some(_), Some(_)) => Err(ClientError::UnsupportedFeature),
-        (_, None) => Err(ClientError::UnsupportedFormat),
-    }
+    let mut profile = if value.get("containers").is_some() {
+        super::amnezia::parse_bundle(value)
+    } else {
+        match (value.get("protocol"), value.get("type")) {
+            (Some(protocol), None) if protocol.is_string() => xray::parse_outbound(value),
+            (Some(protocol), None) if protocol.is_object() => blazecore::parse(value),
+            (None, Some(_)) => sing_box::parse_outbound(value),
+            (Some(_), Some(_)) => Err(ClientError::UnsupportedFeature),
+            (_, None) => Err(ClientError::UnsupportedFormat),
+        }
+    }?;
+    let source =
+        serde_json::to_string_pretty(value).map_err(|_| ClientError::InvalidSubscription)?;
+    profile.source = Some(vpn_domain::client::Secret::new(source));
+    Ok(profile)
 }
 
 pub(super) fn append_subscription_entries(
     text: &str,
     profiles: &mut SubscriptionProfiles,
 ) -> Result<(), ClientError> {
-    let value = parse_value(text)?;
+    let value = if recognizes_native_yaml(text) {
+        parse_yaml_value(text)?
+    } else {
+        parse_value(text)?
+    };
     let items = value
         .as_array()
         .map_or(std::slice::from_ref(&value), Vec::as_slice);
+    let groups = blazecore::expand_client_groups(items)?;
+    let items = groups.as_deref().unwrap_or(items);
     for item in items {
         if ["error", "errors", "message"]
             .iter()
@@ -142,6 +192,19 @@ fn append_subscription_wrapper(
         return append_subscription_outbound(document, None, profiles);
     }
     let name = optional_str(document, "remarks")?.unwrap_or_default();
+    if let Some(outbound) = standalone_xray_xhttp(document, outbounds) {
+        return append_normalized_outbound(
+            outbound,
+            Some(name),
+            parse_wrapped_xhttp(document, outbound),
+            profiles,
+        );
+    }
+    if xray_graph::recognizes(document) {
+        return profiles.append(xray_graph::parse(document), true, |reason| {
+            unavailable_wrapper(outbounds, name, reason)
+        });
+    }
     let xray = outbounds
         .iter()
         .filter(|outbound| is_proxy_outbound(outbound))
@@ -167,20 +230,96 @@ fn append_unavailable_wrapper(
     name: &str,
     profiles: &mut SubscriptionProfiles,
 ) -> Result<(), ClientError> {
+    profiles.append(Err(ClientError::UnsupportedFeature), true, |reason| {
+        unavailable_wrapper(outbounds, name, reason)
+    })
+}
+
+fn unavailable_wrapper(
+    outbounds: &[Value],
+    name: &str,
+    reason: ProfileUnavailableReason,
+) -> UnavailableProfile {
     let protocol = wrapper_protocol(outbounds);
     let mut proxies = outbounds
         .iter()
         .filter(|outbound| is_proxy_outbound(outbound));
     let only_proxy = proxies.next().filter(|_| proxies.next().is_none());
-    let error = if only_proxy.is_some_and(xray::unsupported_xhttp_upload_method) {
-        ClientError::UnsupportedXhttpUploadMethod
-    } else {
-        ClientError::UnsupportedFeature
-    };
-    profiles.append(Err(error), true, |reason| {
-        UnavailableProfile::new(name, protocol, reason)
-            .with_probe_endpoint(only_proxy.and_then(tcp_probe_endpoint))
+    UnavailableProfile::new(name, protocol, reason)
+        .with_probe_endpoint(only_proxy.and_then(tcp_probe_endpoint))
+}
+
+fn standalone_xray_xhttp<'a>(document: &Value, outbounds: &'a [Value]) -> Option<&'a Value> {
+    let (proxy, static_outbounds) = outbounds.split_first()?;
+    // AsIs and no rules leave the first outbound as the only route. A plain global DNS
+    // list is unused by this route; its outbound has no local DNS resolution directive.
+    (is_proxy_outbound(proxy)
+        && proxy.get("protocol").is_some_and(Value::is_string)
+        && xray::uses_xhttp(proxy)
+        && fields(
+            document,
+            &["outbounds", "inbounds", "log", "remarks", "routing", "dns"],
+        )
+        .is_ok()
+        && wrapper_options(document, true).is_ok()
+        && check_empty(document, "inbounds", |value| {
+            value.as_array().is_some_and(|inbounds| {
+                inbounds.iter().all(|inbound| {
+                    matches!(
+                        inbound.get("protocol").and_then(Value::as_str),
+                        Some("socks" | "http")
+                    )
+                })
+            })
+        })
+        .is_ok()
+        && baseline_xray_routing(document)
+        && static_outbounds.iter().all(|outbound| {
+            matches!(static_xray_outbound(outbound, true), Ok(true))
+                && check_empty(outbound, "settings", |settings| {
+                    settings.as_object().is_some_and(Map::is_empty)
+                })
+                .is_ok()
+        }))
+    .then_some(proxy)
+}
+
+fn baseline_xray_routing(document: &Value) -> bool {
+    check_empty(document, "routing", |routing| {
+        fields(routing, &["domainStrategy", "rules"]).is_ok()
+            && check_empty(routing, "domainStrategy", |strategy| {
+                strategy.as_str() == Some("AsIs")
+            })
+            .is_ok()
+            && check_empty(routing, "rules", |rules| {
+                rules.as_array().is_some_and(Vec::is_empty)
+            })
+            .is_ok()
     })
+    .is_ok()
+        && check_empty(document, "dns", |dns| {
+            fields(dns, &["servers"]).is_ok()
+                && check_empty(dns, "servers", |servers| {
+                    servers.as_array().is_some_and(|servers| {
+                        servers.iter().all(|server| {
+                            server
+                                .as_str()
+                                .is_some_and(|ip| ip.parse::<IpAddr>().is_ok())
+                        })
+                    })
+                })
+                .is_ok()
+        })
+        .is_ok()
+}
+
+fn parse_wrapped_xhttp(document: &Value, outbound: &Value) -> Result<ProxyProfile, ClientError> {
+    let mut profile = parse_outbound(outbound)?;
+    apply_wrapper_name(&mut profile, optional_str(document, "remarks")?);
+    let source =
+        serde_json::to_string_pretty(document).map_err(|_| ClientError::InvalidSubscription)?;
+    profile.source = Some(vpn_domain::client::Secret::new(source));
+    Ok(profile)
 }
 
 fn independent_outbounds(
@@ -244,12 +383,27 @@ fn append_subscription_outbound(
         });
     }
     let mut result = parse_outbound(outbound);
-    if let (Ok(profile), Some(name)) = (&mut result, wrapper_name) {
+    if let Ok(profile) = &mut result {
+        apply_wrapper_name(profile, wrapper_name);
+    }
+    append_normalized_outbound(outbound, wrapper_name, result, profiles)
+}
+
+fn apply_wrapper_name(profile: &mut ProxyProfile, name: Option<&str>) {
+    if let Some(name) = name {
         let label = UnavailableProfile::new(name, None, ProfileUnavailableReason::Unsupported).name;
         if !label.is_empty() {
             profile.name = label;
         }
     }
+}
+
+fn append_normalized_outbound(
+    outbound: &Value,
+    wrapper_name: Option<&str>,
+    result: Result<ProxyProfile, ClientError>,
+    profiles: &mut SubscriptionProfiles,
+) -> Result<(), ClientError> {
     profiles.append(result, true, |reason| {
         let name = wrapper_name
             .filter(|name| !name.is_empty())
@@ -318,6 +472,9 @@ fn sing_box_tcp_address(outbound: &Value) -> Option<(&str, u16)> {
 }
 
 fn is_proxy_outbound(value: &Value) -> bool {
+    if value.get("containers").is_some() {
+        return true;
+    }
     if static_xray_outbound(value, true).unwrap_or(true) {
         return false;
     }
@@ -331,6 +488,9 @@ fn is_proxy_outbound(value: &Value) -> bool {
 }
 
 fn outbound_protocol(value: &Value) -> Option<&'static str> {
+    if value.get("containers").is_some() {
+        return Some("amnezia");
+    }
     value
         .get("protocol")
         .and_then(|value| {
@@ -342,8 +502,14 @@ fn outbound_protocol(value: &Value) -> Option<&'static str> {
         .and_then(protocol_label)
 }
 
-pub(super) fn parse_value(input: &str) -> Result<Value, ClientError> {
+pub(crate) fn parse_value(input: &str) -> Result<Value, ClientError> {
     serde_json::from_str::<UniqueValue>(input)
+        .map(|value| value.0)
+        .map_err(|_| ClientError::InvalidSubscription)
+}
+
+fn parse_yaml_value(input: &str) -> Result<Value, ClientError> {
+    serde_yaml::from_str::<UniqueValue>(input)
         .map(|value| value.0)
         .map_err(|_| ClientError::InvalidSubscription)
 }
@@ -441,24 +607,50 @@ struct UniqueValue(Value);
 
 impl<'de> Deserialize<'de> for UniqueValue {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        decoder.deserialize_any(UniqueVisitor).map(Self)
+        // Bound the expanded representation, including data reached through YAML aliases.
+        let remaining = Cell::new(16 * vpn_application::MAX_SUBSCRIPTION_BYTES);
+        UniqueVisitor(&remaining).deserialize(decoder).map(Self)
     }
 }
 
-struct UniqueVisitor;
+#[derive(Clone, Copy)]
+struct UniqueVisitor<'a>(&'a Cell<usize>);
 
-impl<'de> Visitor<'de> for UniqueVisitor {
+impl UniqueVisitor<'_> {
+    fn charge<E: de::Error>(&self, bytes: usize) -> Result<(), E> {
+        let left = self
+            .0
+            .get()
+            .checked_sub(bytes)
+            .ok_or_else(|| E::custom("expanded configuration exceeds size limit"))?;
+        self.0.set(left);
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueVisitor<'_> {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Value, D::Error> {
+        self.charge(size_of::<Value>())?;
+        decoder.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueVisitor<'_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("JSON with unique keys")
+        formatter.write_str("a configuration value with unique keys")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
-        while let Some((key, UniqueValue(value))) = access.next_entry::<String, UniqueValue>()? {
+        while let Some(key) = access.next_key::<String>()? {
+            self.charge(key.len() + size_of::<String>())?;
+            let value = access.next_value_seed(self)?;
             if object.insert(key, value).is_some() {
-                return Err(de::Error::custom("duplicate JSON key"));
+                return Err(de::Error::custom("duplicate configuration key"));
             }
         }
         Ok(Value::Object(object))
@@ -466,7 +658,7 @@ impl<'de> Visitor<'de> for UniqueVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
         let mut values = Vec::new();
-        while let Some(UniqueValue(value)) = access.next_element()? {
+        while let Some(value) = access.next_element_seed(self)? {
             values.push(value);
         }
         Ok(Value::Array(values))
@@ -491,10 +683,12 @@ impl<'de> Visitor<'de> for UniqueVisitor {
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        self.charge(value.len())?;
         Ok(Value::String(value.to_owned()))
     }
 
     fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+        self.charge(value.len())?;
         Ok(Value::String(value))
     }
 

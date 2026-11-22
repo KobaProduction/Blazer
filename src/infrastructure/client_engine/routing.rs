@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use vpn_domain::routing::{DnsPolicy, RouteAction, RouteRule, RouteTarget, RoutingInput};
 
-const PROXY_GROUP: &str = "blazer-outbound";
+pub(super) const PROXY_GROUP: &str = "blazer-outbound";
 
 pub(super) fn proxy_group(proxy: Value) -> Value {
     json!({"client_group": PROXY_GROUP, "client_chains": [{"chain": [proxy]}]})
@@ -18,7 +18,7 @@ pub(super) fn configure_listener(listener: &mut Value, routing: &RoutingInput) {
     }
 }
 
-fn render_rule(rule: &RouteRule) -> Value {
+pub(super) fn render_rule(rule: &RouteRule) -> Value {
     let target = match &rule.target {
         RouteTarget::Domain(name) => json!({"domain": [name]}),
         RouteTarget::DomainSuffix(name) => json!({"domain_suffix": [name]}),
@@ -36,7 +36,7 @@ fn render_rule(rule: &RouteRule) -> Value {
     }
 }
 
-fn dns_server(policy: &DnsPolicy) -> Option<Value> {
+pub(super) fn dns_server(policy: &DnsPolicy) -> Option<Value> {
     // Configure the listener's resolver. A remote proxy may resolve its own targets.
     let server = match policy {
         DnsPolicy::Automatic => return None,

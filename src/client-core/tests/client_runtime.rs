@@ -30,6 +30,54 @@ const ECHO_PAYLOAD: &[u8] = b"blazer\x00echo\xff";
 const ENGINE_INCOMPATIBLE_XHTTP: &str = "vless://a5c41b77-fc31-4ab0-a275-1c67aa9aab31@localhost:7443?type=xhttp&security=tls&flow=xtls-rprx-vision#Engine-incompatible";
 
 #[test]
+fn profile_source_edit_updates_the_selected_profile_and_persists_after_reload() {
+    let directory = TestDirectory::new();
+    let options = directory.options();
+    let mut backend = TestBackend::start(options.clone());
+    let original = "socks5://user:fixture-password@127.0.0.1:18001#Original";
+    let added = backend.run(ClientCommand::ImportText {
+        title: "Original".into(),
+        text: original.into(),
+    });
+    let profile_uuid = added.profiles[0].profile_uuid.clone();
+    assert_eq!(
+        added.profiles[0].source.as_ref().unwrap().expose(),
+        original
+    );
+    assert!(!format!("{added:?}").contains(original));
+    let update = |text| ClientCommand::UpdateProfile {
+        profile_uuid: profile_uuid.clone(),
+        text: Secret::new(text),
+    };
+    let request = backend.send(update("not a valid config"));
+    let invalid = backend.wait(Some(request), "reject invalid profile source");
+    assert!(invalid.last_error.is_some());
+    assert_eq!(
+        invalid.profiles[0].source.as_ref().unwrap().expose(),
+        original
+    );
+    let outbound = r#"{"type":"socks","tag":"Edited","server":"127.0.0.1","server_port":18002}"#;
+    let saved = backend.run(update(outbound));
+    assert_eq!(saved.last_error, None);
+    assert_eq!(saved.profiles.len(), 1);
+    assert_eq!(saved.profiles[0].profile_uuid, profile_uuid);
+    assert_eq!(
+        saved.selected_profile_uuid.as_deref(),
+        Some(profile_uuid.as_str())
+    );
+    assert_eq!(saved.profiles[0].name, "Edited");
+    assert_eq!(saved.profiles[0].server, "127.0.0.1:18002");
+    let source = saved.profiles[0].source.as_ref().unwrap();
+    assert!(source.expose().contains(r#""server_port": 18002"#));
+    backend.handle.shutdown().expect("shutdown before reload");
+    let mut reopened = TestBackend::start(options);
+    let restored = reopened.handle.snapshot();
+    assert_eq!(restored.profiles[0].source.as_ref(), Some(source));
+    assert_eq!(restored.profiles[0].server, "127.0.0.1:18002");
+    reopened.handle.shutdown().expect("shutdown after reload");
+}
+
+#[test]
 fn add_subscription_exposes_the_http_code_and_server_detail() {
     let directory = TestDirectory::new();
     let source = loopback_listener();
@@ -846,6 +894,49 @@ fn automatic_backend(directory: &TestDirectory) -> TestBackend {
 }
 
 #[test]
+fn probe_settings_persist_across_restart_and_reject_invalid_updates_atomically() {
+    use client_core::{ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy};
+    let directory = TestDirectory::new();
+    let mut backend = TestBackend::start(directory.options());
+    let target = loopback_listener();
+    let added = backend.run(ClientCommand::ImportText {
+        title: "Configurable probe".into(),
+        text: format!("socks5://{}#Probe", target.local_addr().unwrap()),
+    });
+    let profile_uuid = added.selected_profile_uuid.unwrap();
+    let measured = backend.run(ClientCommand::ProbeProfile { profile_uuid });
+    assert!(!measured.profile_latencies.is_empty());
+    let settings = ProbeSettings {
+        method: ProbeMethod::Proxy,
+        http_method: ProbeHttpMethod::Head,
+        url: "https://probe.example.test/status?fixture=1".into(),
+        timeout_ms: 1750,
+        attempts: 4,
+        warmup: true,
+        strategy: ProbeStrategy::Median,
+    };
+    let saved = backend.run(ClientCommand::SetProbeSettings {
+        settings: settings.clone(),
+    });
+    assert_eq!(saved.probe_settings, settings);
+    assert!(saved.profile_latencies.is_empty());
+    let invalid = ProbeSettings {
+        url: "https://host:notaport/status".into(),
+        ..settings.clone()
+    };
+    assert_eq!(
+        backend
+            .handle
+            .send(ClientCommand::SetProbeSettings { settings: invalid }),
+        Err(SubmitError::Rejected(ClientError::InvalidUrl))
+    );
+    assert_eq!(backend.handle.snapshot().probe_settings, settings);
+    backend.handle.shutdown().unwrap();
+    let restarted = TestBackend::start(directory.options());
+    assert_eq!(restarted.handle.snapshot().probe_settings, settings);
+}
+
+#[test]
 fn tcp_probe_reports_the_catalog_endpoint_without_starting_blazecore() {
     let directory = TestDirectory::new();
     let target = loopback_listener();
@@ -854,12 +945,19 @@ fn tcp_probe_reports_the_catalog_endpoint_without_starting_blazecore() {
         title: "TCP fixture".into(),
         text: format!("socks5://{}#Probe", target.local_addr().unwrap()),
     });
-    assert!(imported.tcp_probe_available);
-    let profile_uuid = imported.selected_profile_uuid.unwrap();
+    assert!(imported.profile_probe_available);
+    let profile_uuid = imported.selected_profile_uuid.clone().unwrap();
     let probe = || ClientCommand::ProbeProfile {
         profile_uuid: profile_uuid.clone(),
     };
     let reachable = backend.run(probe());
+    assert_eq!(reachable.revision, imported.revision + 1);
+    assert_eq!(reachable.profiles.len(), imported.profiles.len());
+    assert_eq!(reachable.profiles[0].name, imported.profiles[0].name);
+    assert_eq!(
+        reachable.selected_profile_uuid,
+        imported.selected_profile_uuid
+    );
     assert!(matches!(
         reachable.profile_latencies.get(&profile_uuid),
         Some(ProfileLatency::Reachable { .. })
@@ -1001,7 +1099,7 @@ fn tunnel_reports_its_mode_and_clears_it_on_disconnect() {
         connected.selected_profile_uuid
     );
     assert!(connected.local_proxy.is_none() && connected.http_proxy.is_none());
-    assert!(!connected.tcp_probe_available);
+    assert!(!connected.profile_probe_available);
     let probe = backend.send(ClientCommand::ProbeProfile {
         profile_uuid: connected.selected_profile_uuid.unwrap(),
     });
@@ -1015,8 +1113,114 @@ fn tunnel_reports_its_mode_and_clears_it_on_disconnect() {
     assert_eq!(rejected.last_error, Some(ClientError::UnsupportedMode));
     assert!(rejected.profile_latencies.is_empty());
     let disconnected = backend.run(ClientCommand::Disconnect);
-    assert!(disconnected.tcp_probe_available);
+    assert!(disconnected.profile_probe_available);
     assert_disconnected(&disconnected);
+}
+
+#[test]
+fn explicit_tcp_probe_remains_available_during_a_tunnel_without_starting_an_engine() {
+    let directory = TestDirectory::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend =
+        tunnel_backend_with_probe(&directory, RunningConnection::Tun, false, calls.clone());
+    let target = loopback_listener();
+    let imported = backend.run(ClientCommand::ImportText {
+        title: "TCP endpoint".into(),
+        text: format!("socks5://{}#Endpoint", target.local_addr().unwrap()),
+    });
+    let other = imported.profiles.last().unwrap().profile_uuid.clone();
+    backend.run(ClientCommand::SetProbeSettings {
+        settings: client_core::ProbeSettings {
+            method: client_core::ProbeMethod::Tcp,
+            warmup: false,
+            ..Default::default()
+        },
+    });
+    let connected = backend.run(ClientCommand::Connect {
+        mode: ConnectionMode::Tun,
+    });
+    assert!(connected.profile_probe_available);
+    let checked = backend.run(ClientCommand::ProbeProfile {
+        profile_uuid: other.clone(),
+    });
+    assert!(matches!(
+        checked.profile_latencies.get(&other),
+        Some(ProfileLatency::Reachable { .. })
+    ));
+    assert_eq!(checked.connection, ConnectionStatus::Connected);
+    assert!(calls.lock().unwrap().is_empty());
+    drop(accept(&target));
+    assert_disconnected(&backend.run(ClientCommand::Disconnect));
+}
+
+#[test]
+fn active_tunnel_probe_uses_the_current_engine_even_for_a_tcp_profile() {
+    let directory = TestDirectory::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend =
+        tunnel_backend_with_probe(&directory, RunningConnection::Tun, true, calls.clone());
+    let connected = backend.run(ClientCommand::Connect {
+        mode: ConnectionMode::Tun,
+    });
+    assert!(connected.profile_probe_available);
+    let active = connected.active_profile_uuid.clone().unwrap();
+    let measured = backend.run(ClientCommand::ProbeProfile {
+        profile_uuid: active.clone(),
+    });
+    assert_eq!(
+        measured.profile_latencies.get(&active),
+        Some(&ProfileLatency::Reachable { milliseconds: 17 })
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        std::slice::from_ref(&active)
+    );
+    assert_eq!(measured.active_profile_uuid.as_ref(), Some(&active));
+    assert_eq!(measured.active_mode, Some(ConnectionMode::Tun));
+    assert_eq!(measured.connection, ConnectionStatus::Connected);
+    assert!(!measured.cleanup_required);
+    assert_disconnected(&backend.run(ClientCommand::Disconnect));
+}
+
+#[test]
+fn active_tunnel_probe_batch_rejects_other_profiles_without_tcp_connections() {
+    let directory = TestDirectory::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend =
+        tunnel_backend_with_probe(&directory, RunningConnection::Tun, true, calls.clone());
+    let target = loopback_listener();
+    let imported = backend.run(ClientCommand::ImportText {
+        title: "Alternate".into(),
+        text: format!("socks5://{}#Alternate", target.local_addr().unwrap()),
+    });
+    let other = imported.profiles.last().unwrap().profile_uuid.clone();
+    let connected = backend.run(ClientCommand::Connect {
+        mode: ConnectionMode::Tun,
+    });
+    let active = connected.active_profile_uuid.clone().unwrap();
+    assert_ne!(active, other);
+    let request = backend.send(ClientCommand::ProbeProfile {
+        profile_uuid: other.clone(),
+    });
+    let rejected = backend.wait(Some(request), "refuse another profile while TUN is active");
+    assert_eq!(rejected.last_error, Some(ClientError::DisconnectFirst));
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(rejected.profile_latencies.is_empty());
+    let measured = backend.run(ClientCommand::ProbeProfiles {
+        subscription_uuid: None,
+    });
+    assert_eq!(
+        measured.profile_latencies.get(&active),
+        Some(&ProfileLatency::Reachable { milliseconds: 17 })
+    );
+    assert_eq!(
+        measured.profile_latencies.get(&other),
+        Some(&ProfileLatency::Failed(ClientError::DisconnectFirst))
+    );
+    assert_eq!(*calls.lock().unwrap(), [active]);
+    assert_eq!(measured.connection, ConnectionStatus::Connected);
+    assert_listener_unused(&target);
+    assert_disconnected(&backend.run(ClientCommand::Disconnect));
 }
 
 #[test]
@@ -1351,8 +1555,8 @@ impl ClientEnginePort for RoutingEngineFixture {
         }
     }
 
-    fn supports_local_proxy_routing(&self) -> bool {
-        true
+    fn supports_routing(&self, mode: ConnectionMode) -> bool {
+        mode == ConnectionMode::LocalProxy
     }
 
     fn validate_profile(&self, _: &ProxyProfile) -> Result<(), ClientError> {
@@ -1410,12 +1614,23 @@ impl ClientEnginePort for RoutingEngineFixture {
 }
 
 fn tunnel_backend(directory: &TestDirectory, reported: RunningConnection) -> TestBackend {
+    tunnel_backend_with_probe(directory, reported, false, Arc::new(Mutex::new(Vec::new())))
+}
+
+fn tunnel_backend_with_probe(
+    directory: &TestDirectory,
+    reported: RunningConnection,
+    active_probe: bool,
+    probe_calls: Arc<Mutex<Vec<String>>>,
+) -> TestBackend {
     let handle = ClientHandle::spawn_with_platform(
         directory.path.clone(),
         Box::new(UserSecretProtection),
         Box::new(TunnelFixture {
             reported,
             running: false,
+            active_probe,
+            probe_calls,
         }),
         SubscriptionRefreshMode::Manual,
     )
@@ -1435,6 +1650,8 @@ fn tunnel_backend(directory: &TestDirectory, reported: RunningConnection) -> Tes
 struct TunnelFixture {
     reported: RunningConnection,
     running: bool,
+    active_probe: bool,
+    probe_calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl ClientEnginePort for TunnelFixture {
@@ -1447,6 +1664,33 @@ impl ClientEnginePort for TunnelFixture {
 
     fn validate_profile(&self, _profile: &ProxyProfile) -> Result<(), ClientError> {
         Ok(())
+    }
+
+    fn supports_active_tunnel_probe(&self) -> bool {
+        self.active_probe
+    }
+
+    fn probe_tunnel(
+        &self,
+        profile: &ProxyProfile,
+        active: Option<&ProxyProfile>,
+        reuse_active_proxy: bool,
+        _settings: &client_core::ProbeSettings,
+        cancel: &Cancellation,
+    ) -> Result<Duration, ClientError> {
+        cancel.check()?;
+        assert!(self.running && self.active_probe);
+        assert_eq!(self.reported, RunningConnection::Tun);
+        assert_eq!(
+            active.map(|item| &item.profile_uuid),
+            Some(&profile.profile_uuid)
+        );
+        assert!(!reuse_active_proxy);
+        self.probe_calls
+            .lock()
+            .unwrap()
+            .push(profile.profile_uuid.clone());
+        Ok(Duration::from_millis(17))
     }
 
     fn start(
@@ -1591,6 +1835,56 @@ fn subscription_with_only_unavailable_profiles_is_saved_and_recovers_after_refre
     assert!(refreshed.unavailable_profiles.is_empty());
     assert_eq!(refreshed.profiles[0].name, "Compatible");
     assert!(refreshed.selected_profile_uuid.is_some());
+}
+
+#[test]
+fn subscription_url_replacement_preserves_the_saved_address_on_failure() {
+    let directory = TestDirectory::new();
+    let options = directory.options();
+    let server = loopback_listener();
+    let authority = server.local_addr().unwrap();
+    let original = format!("http://{authority}{SUBSCRIPTION_PATH}");
+    let replacement_path = "/subscription?key=replacement-token";
+    let replacement = format!("http://{authority}{replacement_path}");
+    let profiles = "socks5://127.0.0.1:12345#Fixture";
+    let mut backend = TestBackend::start(options.clone());
+    let request = backend.send(ClientCommand::AddSubscription {
+        title: "Initial title".into(),
+        url: original.clone(),
+    });
+    serve_subscription(&server, "200 OK", profiles);
+    let added = backend.wait(Some(request), "add subscription");
+    let uuid = added.subscriptions[0].subscription_uuid.clone();
+    assert_eq!(added.subscriptions[0].url.expose(), original);
+    assert!(!format!("{added:?}").contains(&original));
+
+    let update = || ClientCommand::UpdateSubscription {
+        subscription_uuid: uuid.clone(),
+        title: "Edited title".into(),
+        url: replacement.clone(),
+    };
+    let request = backend.send(update());
+    serve_provider_response(&server, replacement_path, "503 Unavailable", &[], "");
+    let failed = backend.wait(Some(request), "failed URL replacement");
+    assert_subscription_http(failed.last_error, 503, "Service Unavailable");
+    assert_eq!(failed.subscriptions[0].url.expose(), original);
+    assert_eq!(failed.subscriptions[0].title, "Initial title");
+
+    let request = backend.send(update());
+    serve_provider_response(&server, replacement_path, "200 OK", &[], profiles);
+    let saved = backend.wait(Some(request), "save replacement URL");
+    assert_eq!(saved.last_error, None);
+    assert_eq!(saved.subscriptions[0].title, "Edited title");
+    assert_eq!(saved.subscriptions[0].url.expose(), replacement);
+    assert!(!format!("{saved:?}").contains(&replacement));
+    backend.handle.shutdown().expect("shutdown before reload");
+
+    let mut reopened = TestBackend::start(options);
+    assert_eq!(
+        reopened.handle.snapshot().subscriptions[0].url.expose(),
+        replacement
+    );
+    reopened.handle.shutdown().expect("shutdown after reload");
 }
 
 #[test]
@@ -2347,6 +2641,54 @@ fn exercise_provider_backup(
     assert!(provider.pending.is_empty());
     assert_eq!(refreshed.profiles[0].name, "Backup");
     assert!(refreshed.profiles[0].server.is_empty());
+}
+
+#[test]
+fn provider_uses_fallback_advertised_in_the_subscription_body() {
+    let directory = TestDirectory::new();
+    let server = loopback_listener();
+    let backend = TestBackend::start(directory.options());
+    let alternate = format!(
+        "http://{}/backup?key=body-fixture",
+        server.local_addr().unwrap()
+    );
+    let added = provider_add(
+        &backend,
+        &server,
+        &[],
+        &format!("#fallback-url {alternate}\n#hide-settings: 1\nsocks5://127.0.0.1:19001#Primary"),
+    );
+    assert_eq!(added.last_error, None);
+    let provider = &added.provider_subscriptions[0];
+    assert!(provider.has_committed_fallback);
+    assert!(provider.raw_config_hidden);
+    assert!(provider.pending.is_empty());
+    assert!(added.profiles[0].source.is_none());
+    let request = backend.send(ClientCommand::UpdateProfile {
+        profile_uuid: added.profiles[0].profile_uuid.clone(),
+        text: Secret::new("socks5://127.0.0.1:19005#Unapproved"),
+    });
+    let blocked = backend.wait(Some(request), "reject hidden profile edit");
+    assert_eq!(blocked.last_error, Some(ClientError::UnsupportedFeature));
+    assert_eq!(blocked.profiles[0].name, "Primary");
+
+    let request = backend.send(ClientCommand::RefreshSubscription {
+        subscription_uuid: added.subscriptions[0].subscription_uuid.clone(),
+    });
+    serve_provider_response(&server, SUBSCRIPTION_PATH, "503 Unavailable", &[], "");
+    serve_provider_response(
+        &server,
+        "/backup?key=body-fixture",
+        "200 OK",
+        &[],
+        "socks5://127.0.0.1:19002#Backup",
+    );
+    let updated = backend.wait(Some(request), "use fallback from subscription body");
+    assert_eq!(updated.last_error, None);
+    assert_eq!(updated.profiles[0].name, "Backup");
+    assert!(updated.provider_subscriptions[0].last_update_used_fallback);
+    assert!(updated.provider_subscriptions[0].raw_config_hidden);
+    assert_eq!(updated.subscriptions[0].url, added.subscriptions[0].url);
 }
 
 #[test]

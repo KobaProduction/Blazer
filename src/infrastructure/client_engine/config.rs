@@ -4,18 +4,49 @@ use vpn_domain::client::{ClientError, ProxyProfile, ProxyProtocol, ProxySecurity
 use vpn_domain::client::{WebSocketEarlyData, XhttpMetadata, XhttpPacketOptions, XhttpPlacement};
 use vpn_domain::routing::RoutingProfile;
 
-use super::{routing, vless_encryption};
+use super::{graph, routing, vless_encryption};
 
 pub(super) fn render(
     profile: &ProxyProfile,
     port: u16,
     profile_routing: Option<&RoutingProfile>,
 ) -> Result<Vec<u8>, ClientError> {
-    let chain = client_chain(profile)?;
-    let mut listener = json!({
+    let listener = json!({
         "address":format!("127.0.0.1:{port}"),
         "protocol":{"type":"mixed"},
     });
+    let document = configure_profile_ingress(listener, profile, profile_routing)?;
+    serde_json::to_vec_pretty(&document).map_err(|_| ClientError::EngineInvalid)
+}
+
+pub(super) fn configure_profile_ingress(
+    mut listener: Value,
+    profile: &ProxyProfile,
+    profile_routing: Option<&RoutingProfile>,
+) -> Result<Vec<Value>, ClientError> {
+    if let ProxyProtocol::Graph(provider) = &profile.protocol {
+        validate(profile)?;
+        return graph::configure(listener, provider, profile_routing);
+    }
+    let chain = client_chain(profile)?;
+    if let Some(dns) = profile_dns(profile, &chain) {
+        listener["dns"] = dns;
+    }
+    configure_ingress(listener, chain, profile_routing)
+}
+
+pub(super) fn entry_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
+    match &profile.protocol {
+        ProxyProtocol::Graph(provider) => graph::entry_chain(provider),
+        _ => client_chain(profile),
+    }
+}
+
+pub(super) fn configure_ingress(
+    mut listener: Value,
+    chain: Value,
+    profile_routing: Option<&RoutingProfile>,
+) -> Result<Vec<Value>, ClientError> {
     let document = if let Some(profile_routing) = profile_routing {
         profile_routing.input.validate()?;
         routing::configure_listener(&mut listener, &profile_routing.input);
@@ -24,7 +55,7 @@ pub(super) fn render(
         listener["rules"] = json!([forward_rule(&chain)]);
         vec![listener]
     };
-    serde_json::to_vec_pretty(&document).map_err(|_| ClientError::EngineInvalid)
+    Ok(document)
 }
 
 #[cfg(target_os = "android")]
@@ -33,26 +64,44 @@ pub fn render_android_tunnel(
     device_fd: i32,
     readiness_port: u16,
 ) -> Result<String, ClientError> {
-    let chain = client_chain(profile)?;
-    let document = json!([{
+    let document = render_android_tunnel_records(profile, device_fd, readiness_port)?;
+    serde_json::to_string(&document).map_err(|_| ClientError::EngineInvalid)
+}
+
+#[cfg(any(target_os = "android", test))]
+pub fn render_android_tunnel_records(
+    profile: &ProxyProfile,
+    device_fd: i32,
+    readiness_port: u16,
+) -> Result<Vec<Value>, ClientError> {
+    let chain = entry_chain(profile)?;
+    let listener = json!({
         "device_fd":device_fd,
         "mtu":1500,
         "dns_hijack":true,
         "dns":{"servers":[{"url":"tcp://1.1.1.1", "client_chain":&chain}]},
-        "rules":[forward_rule(&chain)]
-    }, {
+    });
+    let mut document = configure_profile_ingress(listener, profile, None)?;
+    document.push(json!({
         "address":format!("127.0.0.1:{readiness_port}"),
         "protocol":{"type":"mixed"},
         "rules":"block-all"
-    }]);
-    serde_json::to_string(&document).map_err(|_| ClientError::EngineInvalid)
+    }));
+    Ok(document)
 }
 
 fn forward_rule(chain: &Value) -> Value {
     json!({"masks":["0.0.0.0/0","::/0"], "action":"allow", "client_chain":chain})
 }
 
-fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
+pub(super) fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
+    if matches!(profile.protocol, ProxyProtocol::Graph(_)) {
+        return Err(ClientError::UnsupportedFeature);
+    }
+    if let ProxyProtocol::Native(proxy) = &profile.protocol {
+        validate_endpoint(profile)?;
+        return native_chain(profile, proxy);
+    }
     validate(profile)?;
     let mut protocol = wrap_transport(profile);
     let address = format_host(&profile.host, profile.port);
@@ -104,6 +153,27 @@ fn client_chain(profile: &ProxyProfile) -> Result<Value, ClientError> {
     Ok(json!({"address":address, "protocol":protocol}))
 }
 
+pub(super) fn profile_dns(profile: &ProxyProfile, chain: &Value) -> Option<Value> {
+    match &profile.protocol {
+        ProxyProtocol::Native(proxy) => crate::native_profile::dns(proxy, chain),
+        _ => None,
+    }
+}
+
+fn native_chain(
+    profile: &ProxyProfile,
+    proxy: &vpn_domain::client::NativeProxy,
+) -> Result<Value, ClientError> {
+    if profile.security != ProxySecurity::None {
+        return Err(ClientError::InvalidInput);
+    }
+    crate::native_profile::to_engine(
+        proxy,
+        &profile.transport,
+        format_host(&profile.host, profile.port),
+    )
+}
+
 fn quic_chain(
     profile: &ProxyProfile,
     address: String,
@@ -133,7 +203,7 @@ fn quic_chain(
 fn wrap_transport(profile: &ProxyProfile) -> Value {
     let protocol = protocol(&profile.protocol);
     match &profile.transport {
-        ProxyTransport::Tcp | ProxyTransport::Quic { .. } => protocol,
+        ProxyTransport::Tcp | ProxyTransport::Udp | ProxyTransport::Quic { .. } => protocol,
         ProxyTransport::WebSocket {
             path,
             host,
@@ -195,17 +265,16 @@ fn write_xhttp_metadata(wrapper: &mut Value, metadata: &XhttpMetadata) {
 }
 
 fn write_xhttp_packet(wrapper: &mut Value, packet: &XhttpPacketOptions) {
+    for (field, value) in crate::xhttp_wire::render(&packet.wire) {
+        wrapper[&field] = value;
+    }
     for (field, range) in [
         ("sc_max_each_post_bytes", packet.max_post_bytes),
         ("sc_min_posts_interval_ms", packet.min_post_interval_ms),
     ] {
         if let Some(range) = range {
             let (min, max) = range.bounds();
-            wrapper[field] = if min == max {
-                json!(min)
-            } else {
-                json!(format!("{min}-{max}"))
-            };
+            wrapper[field] = crate::xhttp_wire::render_range(min, max);
         }
     }
 }
@@ -236,6 +305,20 @@ fn outer_vision(protocol: &ProxyProtocol) -> bool {
 }
 
 pub(crate) fn validate(profile: &ProxyProfile) -> Result<(), ClientError> {
+    if let ProxyProtocol::Graph(provider) = &profile.protocol {
+        if profile.security != ProxySecurity::None || profile.transport != ProxyTransport::Tcp {
+            return Err(ClientError::UnsupportedFeature);
+        }
+        return graph::validate(provider);
+    }
+    validate_endpoint(profile)?;
+    if let ProxyProtocol::Native(proxy) = &profile.protocol {
+        return native_chain(profile, proxy).map(|_| ());
+    }
+    validate_translated_profile(profile)
+}
+
+fn validate_endpoint(profile: &ProxyProfile) -> Result<(), ClientError> {
     if profile.host.is_empty()
         || profile.host.len() > 253
         || profile.port == 0
@@ -243,6 +326,10 @@ pub(crate) fn validate(profile: &ProxyProfile) -> Result<(), ClientError> {
     {
         return Err(ClientError::InvalidInput);
     }
+    Ok(())
+}
+
+fn validate_translated_profile(profile: &ProxyProfile) -> Result<(), ClientError> {
     validate_protocol(&profile.protocol)?;
     if matches!(profile.protocol, ProxyProtocol::Hysteria2 { .. })
         || matches!(profile.transport, ProxyTransport::Quic { .. })
@@ -272,8 +359,15 @@ pub(crate) fn validate(profile: &ProxyProfile) -> Result<(), ClientError> {
     {
         return Err(ClientError::UnsupportedFeature);
     }
-    if let ProxyTransport::Xhttp { metadata, .. } = &profile.transport {
+    if let ProxyTransport::Xhttp {
+        metadata,
+        mode,
+        packet,
+        ..
+    } = &profile.transport
+    {
         metadata.validate()?;
+        packet.validate_mode(*mode)?;
         validate_xhttp(profile)?;
     }
     Ok(())
@@ -372,6 +466,9 @@ fn validate_xhttp(profile: &ProxyProfile) -> Result<(), ClientError> {
 
 fn validate_protocol(protocol: &ProxyProtocol) -> Result<(), ClientError> {
     match protocol {
+        ProxyProtocol::Native(_) | ProxyProtocol::Graph(_) => {
+            return Err(ClientError::InvalidInput);
+        }
         ProxyProtocol::Socks5 { username, password }
         | ProxyProtocol::Http { username, password } => {
             if username.is_some() != password.is_some()
@@ -459,6 +556,9 @@ fn validate_user_uuid(value: &str) -> Result<(), ClientError> {
 
 fn protocol(protocol: &ProxyProtocol) -> Value {
     match protocol {
+        ProxyProtocol::Native(_) | ProxyProtocol::Graph(_) => {
+            unreachable!("structured profiles use their own renderer")
+        }
         ProxyProtocol::Socks5 { username, password } => auth("socks", username, password),
         ProxyProtocol::Http { username, password } => auth("http", username, password),
         ProxyProtocol::Vless {

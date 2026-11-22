@@ -6,11 +6,12 @@ use super::ViewFrame;
 use super::controls::{feedback, paint_spinner, roomy_input};
 use super::flags::server_name;
 use super::layout::{ViewportLayout, modal_content_width};
-use super::screens::toggle;
-use crate::view::view_model::{ConfigurationDraft, ConfigurationKind};
+use super::screens::{toggle, toggle_width};
+use crate::view::view_model::{ConfigurationDraft, ConfigurationKind, ProfileEditor};
 use vpn_presentation::import::{self, ImportKind};
 use vpn_presentation::localization::{Key, Locale};
 use vpn_presentation::model::{ErrorNotice, Intent, Removal, profile_details_hidden};
+use vpn_presentation::session::{ProfileSummary, Secret};
 
 const DIALOG_WIDTH: f32 = 728.0;
 const DIALOG_PADDING: i8 = 28;
@@ -112,6 +113,15 @@ impl ViewFrame<'_> {
     }
 
     fn read_import_source(&self, ui: &mut egui::Ui, draft: &mut ConfigurationDraft) -> bool {
+        if draft.kind == ConfigurationKind::Configuration {
+            if draft.source.busy()
+                && let Some(input) = draft.source.poll(ui.ctx(), false)
+            {
+                draft.input = input;
+                draft.feedback = None;
+            }
+            return false;
+        }
         if draft.kind.import_kind().is_some() {
             return false;
         }
@@ -205,6 +215,28 @@ impl ViewFrame<'_> {
         }
     }
 
+    fn configuration_file_picker(&self, ui: &mut egui::Ui, draft: &mut ConfigurationDraft) {
+        let Some(pick) = &self.view.host.pick_configuration else {
+            return;
+        };
+        let reading = draft.source.busy();
+        let button = egui::Button::new(self.tr(Key::ConfigurationOpenFile))
+            .frame(false)
+            .min_size(egui::vec2(110.0, 34.0));
+        let response = ui.add_enabled(!reading && draft.pending.is_none(), button);
+        if reading {
+            response.on_disabled_hover_text(self.tr(Key::ImportReading));
+            ui.spinner();
+        } else if response.clicked() {
+            draft.source.pick_file(
+                ui.ctx(),
+                self.tr(Key::ConfigurationOpenFile),
+                Key::ImportUnreadableConfiguration,
+                pick.clone(),
+            );
+        }
+    }
+
     fn clipboard_fields(&self, ui: &mut egui::Ui, draft: &mut ConfigurationDraft) {
         if draft.source.busy() {
             ui.horizontal_wrapped(|ui| {
@@ -234,12 +266,26 @@ impl ViewFrame<'_> {
             draft.source.open_file(ui.ctx(), path);
         }
         ui.horizontal_wrapped(|ui| {
+            if let Some(scan) = &self.view.host.scan_qr_camera
+                && ui.button(self.tr(Key::QrCamera)).clicked()
+            {
+                let opened = scan(
+                    self.tr(Key::QrCamera),
+                    self.tr(Key::QrCameraHelp),
+                    self.tr(Key::Cancel),
+                    self.tr(Key::QrCameraUnavailable),
+                );
+                draft.source.error = (!opened).then_some(Key::QrCameraUnavailable);
+            }
             if let Some(pick) = &self.view.host.pick_qr_image
                 && ui.button(self.tr(Key::QrOpenFile)).clicked()
             {
-                draft
-                    .source
-                    .pick_file(ui.ctx(), self.tr(Key::QrOpenFile), pick.clone());
+                draft.source.pick_file(
+                    ui.ctx(),
+                    self.tr(Key::QrOpenFile),
+                    Key::QrUnreadableImage,
+                    pick.clone(),
+                );
             }
             if let Some(capture) = &self.view.host.capture_qr_image
                 && ui.button(self.tr(Key::QrScreenshot)).clicked()
@@ -291,13 +337,17 @@ impl ViewFrame<'_> {
             let mut indicator = value;
             ui.separator();
             ui.horizontal(|ui| {
-                let text_width = (ui.available_width() - 66.0).max(1.0);
+                let control = toggle_width(ui, self.view.locale, indicator);
+                let text_width =
+                    (ui.available_width() - control - ui.spacing().item_spacing.x).max(1.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(text_width, 43.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.strong(self.tr(label));
-                        ui.weak(self.tr(help));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(self.tr(label)).strong()).wrap(),
+                        );
+                        ui.add(egui::Label::new(egui::RichText::new(self.tr(help)).weak()).wrap());
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -319,10 +369,15 @@ impl ViewFrame<'_> {
         );
     }
 
-    fn configuration_footer(&self, ui: &mut egui::Ui, draft: &ConfigurationDraft) -> FormAction {
+    fn configuration_footer(
+        &self,
+        ui: &mut egui::Ui,
+        draft: &mut ConfigurationDraft,
+    ) -> FormAction {
         let key = Key::Add;
         let complete = !import::payload(&draft.input).is_empty();
-        let can_submit = !self.snapshot.busy && draft.pending.is_none() && complete;
+        let can_submit =
+            !self.snapshot.busy && draft.pending.is_none() && !draft.source.busy() && complete;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), FOOTER_HEIGHT),
             egui::Layout::right_to_left(egui::Align::Center),
@@ -337,6 +392,9 @@ impl ViewFrame<'_> {
                 } else {
                     response
                 };
+                if draft.kind == ConfigurationKind::Configuration {
+                    self.configuration_file_picker(ui, draft);
+                }
                 if response.clicked() {
                     FormAction::Submit
                 } else {
@@ -359,122 +417,192 @@ impl ViewFrame<'_> {
         else {
             return;
         };
-        let hidden = profile_details_hidden(self.snapshot, profile);
-        let modal = egui::Modal::new(egui::Id::unique("server-json-editor"))
+        let pending = draft.pending.is_some();
+        let modal = egui::Modal::new(egui::Id::unique("profile-editor"))
             .frame(dialog_frame(ui, 16))
             .show(ui.ctx(), |ui| {
-                let viewport = ui.ctx().content_rect();
-                ui.set_width(modal_content_width(ui, DIALOG_WIDTH, 56.0));
-                ui.horizontal(|ui| {
-                    let title = self.tr(Key::EditConfiguration);
-                    let title_width = (ui.available_width() - 32.0).max(1.0);
-                    ui.add_sized(
-                        [title_width, FIELD_HEIGHT],
-                        egui::Label::new(egui::RichText::new(title).size(22.0).strong()).truncate(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("×").on_hover_text(self.tr(Key::Close)).clicked() {
-                            ui.close();
-                        }
-                    });
-                });
-                ui.add(egui::Label::new(server_name(&profile.name)).truncate());
-                ui.add_space(6.0);
-                if hidden {
-                    ui.label(self.tr(Key::ProfileHidden));
-                } else {
-                    ui.weak(self.tr(Key::ProfileJsonDraft));
-                    ui.add_space(6.0);
-                    egui::ScrollArea::both()
-                        .max_height((viewport.height() - 240.0).clamp(80.0, 410.0))
-                        .show(ui, |ui| {
-                            let edit = egui::TextEdit::multiline(&mut draft.json)
-                                .id_salt("core-json")
-                                .code_editor()
-                                .desired_rows(13)
-                                .desired_width(ui.available_width());
-                            if ui.add(edit).changed() {
-                                draft.invalid = false;
-                            }
-                        });
-                    if draft.invalid {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            self.tr(Key::ProfileJsonInvalid),
-                        );
-                    }
-                }
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    self.profile_ping_button(ui, Some(profile), false);
-                    let can_remove = !self.snapshot.busy
-                        && self.snapshot.active_profile_uuid.as_ref() != Some(&draft.uuid);
-                    if ui
-                        .add_enabled(can_remove, egui::Button::new(self.tr(Key::Remove)))
-                        .clicked()
-                    {
-                        self.view.removal = Some(Removal::Profile(draft.uuid.clone()));
-                        ui.close();
-                    }
-                    if !hidden {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.button(self.tr(Key::Save)).clicked()
-                        })
-                        .inner
-                    } else {
-                        false
-                    }
-                })
-                .inner
+                self.profile_editor_contents(ui, profile, &mut draft)
             });
-        if modal.should_close() {
+        if !pending && modal.should_close() {
+            self.view.dismissed_error = draft.feedback;
             return;
         }
         if modal.inner {
-            match serde_json::from_str::<serde_json::Value>(&draft.json) {
-                Ok(value) if value.is_object() || value.is_array() => {
-                    self.view.profile_drafts.insert(draft.uuid, draft.json);
-                    return;
-                }
-                _ => draft.invalid = true,
-            }
+            self.emit(Intent::UpdateProfile {
+                profile_uuid: draft.uuid.clone(),
+                text: Secret::new(import::payload(&draft.text)),
+            });
         }
         self.view.profile_editor = Some(draft);
+    }
+
+    fn profile_editor_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ProfileSummary,
+        draft: &mut ProfileEditor,
+    ) -> bool {
+        ui.set_width(modal_content_width(ui, DIALOG_WIDTH, 56.0));
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 32.0).max(0.0);
+            ui.add_sized(
+                [width, FIELD_HEIGHT],
+                egui::Label::new(egui::RichText::new(self.tr(Key::EditConfiguration)).size(22.0))
+                    .truncate(),
+            );
+            if ui
+                .add_enabled(draft.pending.is_none(), egui::Button::new("×"))
+                .on_hover_text(self.tr(Key::Close))
+                .clicked()
+            {
+                ui.close();
+            }
+        });
+        ui.add(egui::Label::new(server_name(&profile.name)).truncate());
+        ui.add_space(6.0);
+        let hidden = profile_details_hidden(self.snapshot, profile);
+        if hidden {
+            draft.text.clear();
+            ui.label(self.tr(Key::ProfileHidden));
+        } else {
+            self.profile_source_field(ui, profile, draft);
+        }
+        ui.add_space(8.0);
+        self.profile_editor_actions(ui, profile, draft, hidden)
+    }
+
+    fn profile_source_field(
+        &self,
+        ui: &mut egui::Ui,
+        profile: &ProfileSummary,
+        draft: &mut ProfileEditor,
+    ) {
+        let label = if profile.protocol == "AmneziaWG" && profile.source.is_some() {
+            Key::AmneziaProfileParameters
+        } else if profile.source.is_some() {
+            Key::ProfileSource
+        } else {
+            Key::ProfileSourceMissing
+        };
+        ui.weak(self.tr(label));
+        let height = (ui.ctx().content_rect().height() - 240.0).clamp(80.0, 410.0);
+        egui::ScrollArea::both().max_height(height).show(ui, |ui| {
+            let edit = egui::TextEdit::multiline(&mut draft.text)
+                .id_salt(("profile-source", &draft.uuid))
+                .code_editor()
+                .desired_rows(12)
+                .desired_width(ui.available_width())
+                .char_limit(import::MAX_TEXT_BYTES);
+            if ui.add_enabled(draft.pending.is_none(), edit).changed() {
+                draft.feedback = None;
+            }
+        });
+        if let Some((_, error)) = draft.feedback {
+            feedback(
+                ui,
+                &error.text_with_code(self.view.locale, error.key()),
+                None,
+            );
+        }
+    }
+
+    fn profile_editor_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ProfileSummary,
+        draft: &ProfileEditor,
+        hidden: bool,
+    ) -> bool {
+        let active = self.snapshot.active_profile_uuid.as_ref() == Some(&draft.uuid);
+        let enabled = !active && !self.snapshot.busy && draft.pending.is_none();
+        ui.horizontal_wrapped(|ui| {
+            if draft.pending.is_some() {
+                ui.spinner();
+            } else {
+                self.profile_ping_button(ui, Some(profile), false);
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new(self.tr(Key::Remove)))
+                .clicked()
+            {
+                self.view.removal = Some(Removal::Profile(draft.uuid.clone()));
+                ui.close();
+            }
+            if hidden {
+                return false;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = import::payload(&draft.text);
+                let changed = !text.is_empty()
+                    && profile
+                        .source
+                        .as_ref()
+                        .is_none_or(|source| source.expose() != text);
+                let button =
+                    ui.add_enabled(enabled && changed, egui::Button::new(self.tr(Key::Save)));
+                if active {
+                    button
+                        .on_disabled_hover_text(self.tr(Key::DisconnectFirst))
+                        .clicked()
+                } else {
+                    button.clicked()
+                }
+            })
+            .inner
+        })
+        .inner
     }
 
     pub(super) fn remove_confirmation(&mut self, ui: &mut egui::Ui) {
         let Some(removal) = self.view.removal.clone() else {
             return;
         };
-        if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.view.removal = None;
-            return;
-        }
         let key = match removal {
             Removal::Subscription(_) => Key::RemoveSubscriptionConfirm,
             Removal::Profile(_) => Key::ProfileRemoved,
         };
-        let mut confirm = false;
-        let mut cancel = false;
-        let width = modal_content_width(ui, 380.0, 32.0);
-        egui::Window::new(self.tr(Key::Remove))
-            .id(egui::Id::unique("remove-confirmation"))
-            .collapsible(false)
-            .resizable(false)
-            .max_width(width)
-            .show(ui.ctx(), |ui| {
-                ui.add(egui::Label::new(self.tr(key)).wrap());
-                ui.horizontal_wrapped(|ui| {
-                    confirm = ui.button(self.tr(Key::ConfirmRemove)).clicked();
-                    cancel = ui.button(self.tr(Key::Cancel)).clicked();
-                });
-            });
-        if confirm {
+        let dialog = egui::Modal::new(egui::Id::unique("remove-confirmation"))
+            .frame(dialog_frame(ui, 20))
+            .show(ui.ctx(), |ui| self.remove_confirmation_contents(ui, key));
+        if dialog.inner == FormAction::Submit {
             self.emit(Intent::ConfirmRemoval(removal));
         }
-        if cancel {
+        if dialog.inner == FormAction::Close || dialog.should_close() {
             self.view.removal = None;
         }
+    }
+
+    fn remove_confirmation_contents(&self, ui: &mut egui::Ui, question: Key) -> FormAction {
+        ui.set_width(modal_content_width(ui, 360.0, 40.0));
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Label::new(self.tr(question)).wrap());
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let size = egui::vec2(104.0, 34.0);
+                if ui
+                    .add(
+                        egui::Button::new(self.tr(Key::Cancel))
+                            .frame_when_inactive(false)
+                            .min_size(size),
+                    )
+                    .clicked()
+                {
+                    return FormAction::Close;
+                }
+                if ui
+                    .add_enabled(
+                        !self.snapshot.busy,
+                        egui::Button::new(self.tr(Key::ConfirmRemove)).min_size(size),
+                    )
+                    .clicked()
+                {
+                    return FormAction::Submit;
+                }
+                FormAction::None
+            })
+            .inner
+        })
+        .inner
     }
 }
 
@@ -554,6 +682,127 @@ mod tests {
             Some(Intent::SaveSubscription { subscription_uuid: None, title, .. })
                 if title == "My subscription"
         ));
+    }
+
+    #[test]
+    fn configuration_footer_keeps_file_open_beside_add_at_desktop_and_narrow_widths() {
+        for width in [360.0, 1100.0] {
+            let context = egui::Context::default();
+            context.global_style_mut(|style| style.animation_time = 0.0);
+            let mut state = ViewState::default();
+            state.locale = Locale::English;
+            state.host.pick_configuration = Some(std::sync::Arc::new(|_| Ok(None)));
+            state.open_configuration(ConfigurationKind::Configuration);
+            let snapshot = ClientSnapshot {
+                busy: false,
+                ..ClientSnapshot::default()
+            };
+            let mut view = ViewFrame::new(&mut state, &snapshot, false, None);
+            let mut shapes = Vec::new();
+            for _ in 0..6 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 640.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| view.configuration_dialog(ui),
+                );
+                output.textures_delta.clear();
+                shapes = output.shapes;
+            }
+            let labels = shapes.iter().map(|item| &item.shape);
+            let open = labels
+                .clone()
+                .find_map(|shape| label_rect(shape, "Open file"))
+                .unwrap();
+            let add = labels
+                .clone()
+                .find_map(|shape| label_rect(shape, "Add"))
+                .unwrap();
+            let field = labels
+                .clone()
+                .find_map(|shape| label_rect(shape, "Configuration text or share links"))
+                .unwrap();
+            assert!((open.center().y - add.center().y).abs() < 1.0);
+            assert!(open.right() < add.left());
+            assert!(open.top() > field.bottom());
+            assert!(open.left() >= 0.0 && add.right() <= width);
+        }
+    }
+
+    #[test]
+    fn removal_dialog_blocks_background_clicks_and_stays_centered() {
+        let context = egui::Context::default();
+        context.global_style_mut(|style| style.animation_time = 0.0);
+        let mut state = ViewState::default();
+        state.locale = Locale::English;
+        state.removal = Some(Removal::Profile("fixture".into()));
+        let snapshot = ClientSnapshot {
+            busy: false,
+            ..ClientSnapshot::default()
+        };
+        let mut view = ViewFrame::new(&mut state, &snapshot, false, None);
+        let mut clicked_background = false;
+        let background = egui::pos2(20.0, 20.0);
+        let mut draw = |events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let rect = egui::Rect::from_center_size(background, egui::vec2(32.0, 28.0));
+                    clicked_background |= ui.put(rect, egui::Button::new("X")).clicked();
+                    view.remove_confirmation(ui);
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        for _ in 0..6 {
+            draw(Vec::new());
+        }
+        let shapes = draw(Vec::new());
+        assert!(
+            shapes
+                .iter()
+                .any(|item| label_rect(&item.shape, "Yes, remove").is_some())
+        );
+        let question = shapes
+            .iter()
+            .find_map(|item| label_rect(&item.shape, "Remove this configuration?"))
+            .unwrap();
+        assert!((question.center().x - 360.0).abs() < 10.0);
+        for pressed in [true, false] {
+            draw(vec![
+                egui::Event::PointerMoved(background),
+                egui::Event::PointerButton {
+                    pos: background,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(!clicked_background);
+        assert!(view.intent.is_none());
+    }
+
+    fn label_rect(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| label_rect(shape, label)),
+            _ => None,
+        }
     }
 
     fn paste_import(payload: &str) -> Intent {

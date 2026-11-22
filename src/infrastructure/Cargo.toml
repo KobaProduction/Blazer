@@ -15,8 +15,10 @@ vpn-application.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "=0.9.34"
 url.workspace = true
 base64.workspace = true
+flate2 = "=1.1.11"
 percent-encoding.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
@@ -24,27 +26,31 @@ sha2.workspace = true
 tokio.workspace = true
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { workspace = true, features = ["native-tls"] }
+reqwest = { workspace = true, features = ["native-tls", "socks"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
-reqwest = { workspace = true, features = ["rustls-no-provider"] }
+reqwest = { workspace = true, features = ["rustls-no-provider", "socks"] }
 rustix = { version = "1.1.6", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
 
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+getrandom = "=0.4.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+
 [target.'cfg(windows)'.dependencies]
-clap = { version = "=4.6.7", default-features = false }
-futures-util = { version = "=0.3.34", default-features = false }
-net-route = "=0.4.6"
-tun = { version = "=0.8.14", features = ["async"] }
-tun2proxy = { version = "=0.8.7", default-features = false }
 wait-timeout = "=0.2.1"
 win-custody = "=0.1.1"
 windows-dpapi = "=0.2.0"
-
-[target.'cfg(windows)'.dev-dependencies]
-etherparse = "=0.20.3"
+windows-service = "=0.8.1"
+winping = { package = "winping-rs", version = "=0.11.0" }
+windows-registry = "=0.6.1"
+sysproxy = "=0.3.0"
 
 [lints]
 workspace = true

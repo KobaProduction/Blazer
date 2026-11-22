@@ -10,7 +10,7 @@ use vpn_presentation::localization::{self, Key, Locale};
 use vpn_presentation::session::{
     ClientCommand, ClientError, ClientEvent, ClientEventKind, ClientSession, ClientSnapshot,
     ConnectionMode, ConnectionStatus, ProfileLatency, ProfileSummary, ProviderSubscriptionSummary,
-    RequestId, SubmitError, SubscriptionSummary,
+    RequestId, Secret, SubmitError, SubscriptionSummary,
 };
 
 use super::{
@@ -37,7 +37,7 @@ pub fn run_demo() -> eframe::Result {
             };
             let mut window = sample_window(&creation.egui_ctx, snapshot);
             window.enable_demo();
-            Ok(Box::new(NativeView(window)))
+            Ok(Box::new(NativeView::new(window, false)))
         }),
     )
 }
@@ -69,12 +69,7 @@ impl ClientSession for DemoSession {
             return Err(SubmitError::Busy);
         }
         let request = RequestId(snapshot.revision + 1);
-        if matches!(
-            command,
-            ClientCommand::RefreshSubscription { .. }
-                | ClientCommand::ProbeProfile { .. }
-                | ClientCommand::ProbeProfiles { .. }
-        ) {
+        if matches!(command, ClientCommand::RefreshSubscription { .. }) {
             let state = Arc::clone(&self.snapshot);
             let dirty = Arc::clone(&self.dirty);
             let context = self.context.clone();
@@ -115,6 +110,7 @@ fn complete(snapshot: &mut ClientSnapshot, request: RequestId, command: ClientCo
         ClientCommand::RemoveProfile { .. } => Some(ClientEventKind::ProfileRemoved),
         ClientCommand::RemoveSubscription { .. } => Some(ClientEventKind::SubscriptionRemoved),
         ClientCommand::ImportText { .. } => Some(ClientEventKind::ProfilesImported),
+        ClientCommand::UpdateProfile { .. } => Some(ClientEventKind::ProfileUpdated),
         ClientCommand::AddSubscription { .. }
         | ClientCommand::UpdateSubscription { .. }
         | ClientCommand::RefreshSubscription { .. } => Some(ClientEventKind::SubscriptionUpdated),
@@ -123,6 +119,7 @@ fn complete(snapshot: &mut ClientSnapshot, request: RequestId, command: ClientCo
         }
         ClientCommand::SetLanguage { .. }
         | ClientCommand::SetLocalProxyPort { .. }
+        | ClientCommand::SetProbeSettings { .. }
         | ClientCommand::SetSubscriptionHwid { .. }
         | ClientCommand::SetSubscriptionUserAgent { .. }
         | ClientCommand::SetConnectionMode { .. } => Some(ClientEventKind::SettingsSaved),
@@ -151,6 +148,11 @@ fn apply(
     match command {
         ClientCommand::SetLanguage { language } => snapshot.language = language,
         ClientCommand::SetLocalProxyPort { port } => snapshot.local_proxy_port = port,
+        ClientCommand::SetProbeSettings { settings } => {
+            settings.validate()?;
+            snapshot.probe_settings = settings;
+            snapshot.profile_latencies.clear();
+        }
         ClientCommand::SetSubscriptionHwid { enabled } => snapshot.send_subscription_hwid = enabled,
         ClientCommand::SetSubscriptionUserAgent { value } => {
             snapshot.subscription_user_agent = value
@@ -186,9 +188,28 @@ fn apply(
         }
         ClientCommand::ImportText { title, text } => {
             let protocol = import_protocol(&text)?;
-            insert_profile(snapshot, request, title, protocol, None);
+            insert_profile(
+                snapshot,
+                request,
+                title,
+                protocol,
+                None,
+                Some(Secret::new(text)),
+            );
         }
-        ClientCommand::AddSubscription { title, .. } => add_subscription(snapshot, request, title),
+        ClientCommand::UpdateProfile { profile_uuid, text } => {
+            let protocol = import_protocol(text.expose())?;
+            let profile = snapshot
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.profile_uuid == profile_uuid)
+                .ok_or(ClientError::ProfileNotFound)?;
+            profile.protocol = protocol;
+            profile.source = Some(text);
+        }
+        ClientCommand::AddSubscription { title, url } => {
+            add_subscription(snapshot, request, title, url);
+        }
         ClientCommand::RefreshSubscription { subscription_uuid } => {
             refresh_subscription(snapshot, subscription_uuid)?;
         }
@@ -215,22 +236,12 @@ fn apply(
         ClientCommand::RenameSubscription {
             subscription_uuid,
             title,
-        }
-        | ClientCommand::UpdateSubscription {
+        } => edit_subscription(snapshot, &subscription_uuid, title, None)?,
+        ClientCommand::UpdateSubscription {
             subscription_uuid,
             title,
-            ..
-        } => {
-            let locale = vpn_presentation::model::locale(snapshot.language);
-            let (title, auto_title) = demo_subscription_title(locale, title);
-            let subscription = snapshot
-                .subscriptions
-                .iter_mut()
-                .find(|row| row.subscription_uuid == subscription_uuid)
-                .ok_or(ClientError::SubscriptionNotFound)?;
-            subscription.title = title;
-            subscription.auto_title = auto_title;
-        }
+            url,
+        } => edit_subscription(snapshot, &subscription_uuid, title, Some(url))?,
         _ => return Err(ClientError::UnsupportedMode),
     }
     Ok(())
@@ -361,6 +372,7 @@ fn insert_profile(
     name: String,
     protocol: String,
     subscription_uuid: Option<String>,
+    source: Option<Secret>,
 ) {
     let profile_uuid = format!("demo-profile-{}", request.0);
     snapshot.profiles.push(ProfileSummary {
@@ -368,11 +380,12 @@ fn insert_profile(
         name,
         protocol,
         server: "203.0.113.4:443".to_owned(),
+        source,
         subscription_uuid,
     });
 }
 
-fn add_subscription(snapshot: &mut ClientSnapshot, request: RequestId, title: String) {
+fn add_subscription(snapshot: &mut ClientSnapshot, request: RequestId, title: String, url: String) {
     let subscription_uuid = format!("demo-subscription-{}", request.0);
     let locale = vpn_presentation::model::locale(snapshot.language);
     let (title, auto_title) = demo_subscription_title(locale, title);
@@ -380,6 +393,7 @@ fn add_subscription(snapshot: &mut ClientSnapshot, request: RequestId, title: St
         subscription_uuid: subscription_uuid.clone(),
         title: title.clone(),
         auto_title,
+        url: Secret::new(url),
         profile_count: 1,
         last_error: None,
     });
@@ -389,7 +403,29 @@ fn add_subscription(snapshot: &mut ClientSnapshot, request: RequestId, title: St
         title,
         "SOCKS5".to_owned(),
         Some(subscription_uuid),
+        Some(Secret::new("socks5://203.0.113.4:443")),
     );
+}
+
+fn edit_subscription(
+    snapshot: &mut ClientSnapshot,
+    uuid: &str,
+    title: String,
+    url: Option<String>,
+) -> Result<(), ClientError> {
+    let locale = vpn_presentation::model::locale(snapshot.language);
+    let (title, auto_title) = demo_subscription_title(locale, title);
+    let subscription = snapshot
+        .subscriptions
+        .iter_mut()
+        .find(|row| row.subscription_uuid == uuid)
+        .ok_or(ClientError::SubscriptionNotFound)?;
+    subscription.title = title;
+    subscription.auto_title = auto_title;
+    if let Some(url) = url {
+        subscription.url = Secret::new(url);
+    }
+    Ok(())
 }
 
 fn demo_subscription_title(locale: Locale, title: String) -> (String, bool) {
@@ -406,7 +442,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refresh_and_subscription_probe_publish_busy_then_update_only_the_group() {
+    fn refresh_is_busy_and_subscription_probe_updates_only_the_group() {
         let mut snapshot = sample_catalog();
         snapshot.profile_latencies.insert(
             "preview-4".to_owned(),
@@ -445,7 +481,7 @@ mod tests {
                 subscription_uuid: Some(uuid),
             })
             .unwrap();
-        assert!(session.snapshot().busy);
+        assert!(!session.snapshot().busy);
         let probed = wait_for_request(&session, probe);
         assert_eq!(
             probed.profile_latencies.get("preview-1"),

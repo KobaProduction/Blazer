@@ -17,17 +17,24 @@ use vpn_presentation::session::{
     ConnectionMode, ConnectionStatus, ModeCapabilities, ProfileLatency, ProfileSummary,
     ProviderChangeKind, ProviderChangePreview, ProviderDisplay, ProviderNotice,
     ProviderNoticeButton, ProviderNoticeColor, ProviderSubscriptionSummary, RequestId, RouteAction,
-    RouteRule, RouteTarget, RoutingAssignment, RoutingInput, RoutingProfile, SubmitError,
+    RouteRule, RouteTarget, RoutingAssignment, RoutingInput, RoutingProfile, Secret, SubmitError,
     SubscriptionSummary,
 };
 
 use super::native_options;
 
 pub fn capture(path: PathBuf, screen: &OsStr) -> Result<(), Box<dyn std::error::Error>> {
-    let compact = matches!(
-        screen.to_str(),
-        Some("home-compact" | "settings-compact" | "add-compact")
-    );
+    let compact_screen = screen
+        .to_str()
+        .and_then(|name| name.strip_suffix("-compact"));
+    let compact = compact_screen.is_some();
+    let screen = match compact_screen {
+        Some("home") => OsStr::new("home-sample"),
+        Some(name) => OsStr::new(name),
+        None => screen,
+    };
+    let probe_pending = screen == "home-probe-pending";
+    let probe_idle = screen == "home-probe-idle";
     let expanded = screen == "home-expanded";
     let cidr_edit = screen == "excluded-routes-edit";
     let refresh = match screen.to_str() {
@@ -47,12 +54,13 @@ pub fn capture(path: PathBuf, screen: &OsStr) -> Result<(), Box<dyn std::error::
         Some(
             "home-sample"
             | "home-expanded"
-            | "home-compact"
+            | "home-probe-idle"
+            | "home-probe-pending"
+            | "home-probe-result"
             | "home-mobile"
             | "home-tablet"
             | "edit-subscription"
             | "add"
-            | "add-compact"
             | "add-config"
             | "add-json"
             | "add-qr"
@@ -75,7 +83,7 @@ pub fn capture(path: PathBuf, screen: &OsStr) -> Result<(), Box<dyn std::error::
     };
     let size = match screen.to_str() {
         Some("home-mobile") => Some([390.0, 760.0]),
-        Some("home-tablet") => Some([768.0, 720.0]),
+        Some("home-tablet" | "settings-tablet") => Some([768.0, 720.0]),
         _ if compact => Some([700.0, 520.0]),
         _ => None,
     };
@@ -96,6 +104,9 @@ pub fn capture(path: PathBuf, screen: &OsStr) -> Result<(), Box<dyn std::error::
                 busy: false,
                 ..Default::default()
             });
+            if probe_pending || probe_idle {
+                snapshot.profile_latencies.remove("preview-1");
+            }
             let refresh = refresh.map(|(busy, error)| {
                 let request = RequestId(1);
                 snapshot.busy = busy;
@@ -117,6 +128,9 @@ pub fn capture(path: PathBuf, screen: &OsStr) -> Result<(), Box<dyn std::error::
             window.preview_layout(expanded || compact, if compact { 200 } else { 100 });
             if let Some((uuid, request)) = refresh {
                 window.preview_subscription_refresh(&uuid, request);
+            }
+            if probe_pending {
+                window.preview_profile_probe("preview-1", RequestId(1));
             }
             if cidr_edit {
                 window.preview_cidr();
@@ -164,7 +178,9 @@ fn capture_screen(screen: &OsStr) -> Result<Screen, io::Error> {
             "home"
             | "home-sample"
             | "home-expanded"
-            | "home-compact"
+            | "home-probe-idle"
+            | "home-probe-pending"
+            | "home-probe-result"
             | "home-mobile"
             | "home-tablet"
             | "subscriptions"
@@ -172,7 +188,6 @@ fn capture_screen(screen: &OsStr) -> Result<Screen, io::Error> {
             | "home-connecting"
             | "profiles"
             | "add"
-            | "add-compact"
             | "add-config"
             | "add-json"
             | "add-qr"
@@ -193,7 +208,7 @@ fn capture_screen(screen: &OsStr) -> Result<Screen, io::Error> {
         Some("subscription-routing") => Screen::Settings(SettingsPage::SubscriptionRouting),
         Some("logs" | "logs-sample") => Screen::Settings(SettingsPage::Logs),
         Some("statistics") => Screen::Statistics,
-        Some("settings" | "settings-compact") => Screen::Settings(SettingsPage::Index),
+        Some("settings" | "settings-tablet") => Screen::Settings(SettingsPage::Index),
         Some("general" | "interface") => Screen::Settings(SettingsPage::Index),
         Some("advanced" | "vpn" | "network") => Screen::Settings(SettingsPage::Advanced),
         Some("inbounds") => Screen::Settings(SettingsPage::Inbounds),
@@ -205,6 +220,7 @@ fn capture_screen(screen: &OsStr) -> Result<Screen, io::Error> {
         Some("subscription-settings") => Screen::Settings(SettingsPage::Subscriptions),
         Some("subscription-sample") => Screen::Settings(SettingsPage::Subscription),
         Some("ping") => Screen::Settings(SettingsPage::Ping),
+        Some("telemetry") => Screen::Settings(SettingsPage::Telemetry),
         Some("about") => Screen::Settings(SettingsPage::About),
         _ => {
             return Err(io::Error::new(
@@ -218,7 +234,7 @@ fn capture_screen(screen: &OsStr) -> Result<Screen, io::Error> {
 
 fn capture_form(screen: &OsStr) -> Option<ConfigurationPreview> {
     let kind = match screen.to_str()? {
-        "add" | "add-compact" | "import-picker" => ConfigurationKind::Subscription,
+        "add" | "import-picker" => ConfigurationKind::Subscription,
         "add-config" | "add-json" => ConfigurationKind::Configuration,
         "add-qr" => ConfigurationKind::Qr,
         "edit-subscription" => return Some(ConfigurationPreview::EditSubscription),
@@ -253,6 +269,9 @@ pub(super) fn sample_catalog() -> ClientSnapshot {
                 name: name.to_owned(),
                 protocol: protocol.to_owned(),
                 server: "203.0.113.1:443".to_owned(),
+                source: (uuid == "preview-1").then(|| Secret::new(
+                    "vless://b3d0b458-169c-411a-8b11-df426441a001@203.0.113.1:443?security=tls#Sample"
+                )),
                 subscription_uuid: (uuid != "preview-4" && uuid != "preview-5")
                     .then(|| source.to_owned()),
             })
@@ -261,6 +280,7 @@ pub(super) fn sample_catalog() -> ClientSnapshot {
             subscription_uuid: source.to_owned(),
             title: "Пример подписки".to_owned(),
             auto_title: false,
+            url: Secret::new("https://provider.example/subscription"),
             profile_count: 3,
             last_error: None,
         }],
@@ -312,7 +332,7 @@ pub(super) fn sample_catalog() -> ClientSnapshot {
             ),
         ]
         .into(),
-        tcp_probe_available: true,
+        profile_probe_available: true,
         mode_capabilities: ModeCapabilities {
             local_proxy: true,
             local_http_proxy: true,
@@ -459,6 +479,10 @@ impl eframe::App for CaptureApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.window.close();
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 

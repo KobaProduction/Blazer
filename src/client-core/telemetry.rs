@@ -202,6 +202,7 @@ fn attributes(event: ClientEventKind) -> (&'static str, &'static str) {
         }
         ClientEventKind::SubscriptionRemoved => ("client.subscription", "removed"),
         ClientEventKind::ProfilesImported => ("client.profile", "imported"),
+        ClientEventKind::ProfileUpdated => ("client.profile", "updated"),
         ClientEventKind::ProfileSelected => ("client.profile", "selected"),
         ClientEventKind::ProfileRemoved => ("client.profile", "removed"),
         ClientEventKind::ConnectionStarting => ("client.connection", "starting"),

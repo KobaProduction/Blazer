@@ -22,6 +22,11 @@ use zeroize::Zeroizing;
 
 use crate::provider_store::StoredProviderState;
 
+mod probe;
+use probe::ProbeSettingsDto;
+mod graph;
+use graph::GraphDto;
+
 const HEADER: &[u8] = b"VPNC01\0";
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENCRYPTED_BYTES: usize = MAX_CATALOG_BYTES + 65536;
@@ -29,6 +34,8 @@ const SUBSCRIPTION_DEVICE_ID_FILE: &str = "subscription-device-id";
 
 #[cfg(target_os = "android")]
 mod android_lock;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub mod sealing;
 #[cfg(target_os = "android")]
 use android_lock::CatalogLock;
 
@@ -210,6 +217,12 @@ impl StateStorePort for SealedCatalogStore {
     }
 
     fn save(&self, catalog: &Catalog) -> Result<(), ClientError> {
+        catalog.settings.probe.validate()?;
+        for item in &catalog.profiles {
+            if let ProxyProtocol::Graph(graph) = &item.profile.protocol {
+                graph.validate()?;
+            }
+        }
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&StoredCatalog::from_catalog(catalog))
                 .map_err(|_| ClientError::StorageWrite)?,
@@ -263,6 +276,8 @@ struct StoredCatalog {
     subscription_user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry: Option<TelemetrySettingsDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe: Option<ProbeSettingsDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     routing: Option<RoutingCatalogDto>,
 }
@@ -414,6 +429,8 @@ struct StoredProfile {
     profile_uuid: String,
     subscription_uuid: Option<String>,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     host: String,
     port: u16,
     protocol: ProtocolDto,
@@ -424,6 +441,14 @@ struct StoredProfile {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ProtocolDto {
+    Graph {
+        graph: Box<GraphDto>,
+    },
+    Native {
+        settings: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dns_servers: Vec<std::net::IpAddr>,
+    },
     Socks5 {
         username: Option<String>,
         password: Option<String>,
@@ -460,6 +485,7 @@ enum ProtocolDto {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum TransportDto {
     Tcp,
+    Udp,
     WebSocket {
         path: String,
         host: Option<String>,
@@ -487,6 +513,8 @@ struct XhttpPacketDto {
     max_post_bytes: Option<(u32, u32)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_post_interval_ms: Option<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    wire: serde_json::Map<String, serde_json::Value>,
 }
 
 impl XhttpPacketDto {
@@ -494,6 +522,7 @@ impl XhttpPacketDto {
         (options != &XhttpPacketOptions::default()).then(|| Self {
             max_post_bytes: options.max_post_bytes.map(XhttpPacketRange::bounds),
             min_post_interval_ms: options.min_post_interval_ms.map(XhttpPacketRange::bounds),
+            wire: crate::xhttp_wire::render(&options.wire),
         })
     }
 
@@ -503,6 +532,7 @@ impl XhttpPacketDto {
         Ok(XhttpPacketOptions {
             max_post_bytes: self.max_post_bytes.map(range).transpose()?,
             min_post_interval_ms: self.min_post_interval_ms.map(range).transpose()?,
+            wire: crate::xhttp_wire::restore(&self.wire)?,
         })
     }
 }
@@ -618,6 +648,7 @@ impl StoredCatalog {
                 .as_ref()
                 .map(|value| value.expose().to_owned()),
             telemetry: TelemetrySettingsDto::from_settings(&catalog.settings.telemetry),
+            probe: ProbeSettingsDto::from_settings(&catalog.settings.probe),
             routing: RoutingCatalogDto::from_catalog(&catalog.routing),
         }
     }
@@ -658,6 +689,11 @@ impl StoredCatalog {
                 telemetry: self
                     .telemetry
                     .map(TelemetrySettingsDto::into_settings)
+                    .transpose()?
+                    .unwrap_or_default(),
+                probe: self
+                    .probe
+                    .map(ProbeSettingsDto::into_settings)
                     .transpose()?
                     .unwrap_or_default(),
                 connection_mode: match self.connection_mode {
@@ -957,11 +993,16 @@ impl StoredProfile {
             profile_uuid: profile.profile_uuid.clone(),
             subscription_uuid: value.subscription_uuid.clone(),
             name: profile.name.clone(),
+            source: profile
+                .source
+                .as_ref()
+                .map(|source| source.expose().to_owned()),
             host: profile.host.clone(),
             port: profile.port,
             protocol: ProtocolDto::from_protocol(&profile.protocol),
             transport: match &profile.transport {
                 ProxyTransport::Tcp => TransportDto::Tcp,
+                ProxyTransport::Udp => TransportDto::Udp,
                 ProxyTransport::WebSocket {
                     path,
                     host,
@@ -1020,16 +1061,18 @@ impl StoredProfile {
     }
 
     fn into_profile(self) -> Result<CatalogProfile, ClientError> {
-        Ok(CatalogProfile {
+        let mut restored = CatalogProfile {
             subscription_uuid: self.subscription_uuid,
             profile: ProxyProfile {
                 profile_uuid: self.profile_uuid,
                 name: self.name,
+                source: self.source.map(Secret::new),
                 host: self.host,
                 port: self.port,
-                protocol: self.protocol.into_protocol(),
+                protocol: self.protocol.into_protocol()?,
                 transport: match self.transport {
                     TransportDto::Tcp => ProxyTransport::Tcp,
+                    TransportDto::Udp => ProxyTransport::Udp,
                     TransportDto::WebSocket {
                         path,
                         host,
@@ -1091,7 +1134,10 @@ impl StoredProfile {
                     },
                 },
             },
-        })
+        };
+        crate::native_profile::set_wireguard_editor_source(&mut restored.profile)
+            .map_err(|_| ClientError::StorageCorrupt)?;
+        Ok(restored)
     }
 }
 
@@ -1107,6 +1153,13 @@ impl ProtocolDto {
         let optional =
             |value: &Option<Secret>| value.as_ref().map(|value| value.expose().to_owned());
         match value {
+            ProxyProtocol::Graph(graph) => Self::Graph {
+                graph: Box::new(GraphDto::from_graph(graph)),
+            },
+            ProxyProtocol::Native(proxy) => Self::Native {
+                settings: proxy.settings.expose().to_owned(),
+                dns_servers: proxy.dns_servers.clone(),
+            },
             ProxyProtocol::Socks5 { username, password } => Self::Socks5 {
                 username: optional(username),
                 password: optional(password),
@@ -1147,8 +1200,13 @@ impl ProtocolDto {
         }
     }
 
-    fn into_protocol(self) -> ProxyProtocol {
-        match self {
+    fn into_protocol(self) -> Result<ProxyProtocol, ClientError> {
+        Ok(match self {
+            Self::Graph { graph } => ProxyProtocol::Graph(Box::new(graph.into_graph()?)),
+            Self::Native {
+                settings,
+                dns_servers,
+            } => ProxyProtocol::Native(crate::native_profile::restore(&settings, dns_servers)?),
             Self::Socks5 { username, password } => ProxyProtocol::Socks5 {
                 username: username.map(Secret::new),
                 password: password.map(Secret::new),
@@ -1186,13 +1244,56 @@ impl ProtocolDto {
                 cipher,
                 password: Secret::new(password),
             },
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+
+    #[test]
+    fn native_wireguard_secure_catalog_roundtrip_preserves_protocol_dns_and_source() {
+        use vpn_application::client::ClientNormalizerPort;
+        let input = b"[Interface]\nPrivateKey = KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\nAddress = 10.77.0.2/32\nDNS = 10.77.0.1\n[Peer]\nPublicKey = F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:51820";
+        let profile = crate::client_normalize::SubscriptionNormalizer
+            .normalize(input)
+            .unwrap()
+            .remove(0);
+        let row = CatalogProfile {
+            subscription_uuid: None,
+            profile,
+        };
+        let serialized =
+            Zeroizing::new(serde_json::to_vec(&StoredProfile::from_profile(&row)).unwrap());
+        let restored = serde_json::from_slice::<StoredProfile>(&serialized)
+            .unwrap()
+            .into_profile()
+            .unwrap();
+        assert_eq!(restored.profile, row.profile);
+    }
+
+    #[test]
+    fn saved_amnezia_profile_reopens_with_optional_signatures_normalized() {
+        use vpn_application::client::ClientNormalizerPort;
+        let input = b"[Interface]\nPrivateKey = KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\nAddress = 10.77.0.2/32\nI1 = <r 5>\n[Peer]\nPublicKey = F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:51820";
+        let profile = crate::client_normalize::SubscriptionNormalizer
+            .normalize(input)
+            .unwrap()
+            .remove(0);
+        let row = CatalogProfile {
+            subscription_uuid: None,
+            profile,
+        };
+        let mut stored = StoredProfile::from_profile(&row);
+        let ProtocolDto::Native { settings, .. } = &mut stored.protocol else {
+            panic!("expected native AmneziaWG");
+        };
+        let mut old: serde_json::Value = serde_json::from_str(settings).unwrap();
+        old["protocol"]["amnezia"]["i2"] = serde_json::Value::from("");
+        *settings = old.to_string();
+        assert_eq!(stored.into_profile().unwrap().profile, row.profile);
+    }
 
     #[test]
     fn catalog_written_before_provider_fields_loads_without_scheduling_or_fallback() {
@@ -1395,7 +1496,7 @@ mod compatibility_tests {
         let bytes =
             Zeroizing::new(serde_json::to_vec(&ProtocolDto::from_protocol(&protocol)).unwrap());
         let restored = serde_json::from_slice::<ProtocolDto>(&bytes).unwrap();
-        assert_eq!(restored.into_protocol(), protocol);
+        assert_eq!(restored.into_protocol(), Ok(protocol));
     }
 
     #[test]

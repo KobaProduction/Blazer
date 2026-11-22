@@ -17,7 +17,6 @@ chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 egui.workspace = true
 epaint_default_fonts = { version = "=0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
-serde_json.workspace = true
 skrifa = { version = "=0.44.0", default-features = false, features = ["std"] }
 vpn-image-import.workspace = true
 vpn-presentation.workspace = true

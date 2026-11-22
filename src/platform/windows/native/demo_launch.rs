@@ -25,6 +25,7 @@ const USAGE: &str = "usage: blazer --demo [--screenshot <file.png> [screen]]";
 
 fn native_options() -> eframe::NativeOptions {
     let mut options = blazer::native_options();
+    options.viewport = options.viewport.with_app_id("blazer-demo");
     options.persist_window = false;
     options
 }

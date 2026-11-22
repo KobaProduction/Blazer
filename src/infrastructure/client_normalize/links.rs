@@ -13,12 +13,21 @@ use super::{
 };
 
 pub(super) fn parse_share_link(text: &str) -> Result<ProxyProfile, ClientError> {
+    let mut profile = parse_link(text)?;
+    profile.source = Some(vpn_domain::client::Secret::new(text));
+    Ok(profile)
+}
+
+fn parse_link(text: &str) -> Result<ProxyProfile, ClientError> {
     if has_unescaped_space_or_control(text) {
         return Err(ClientError::InvalidSubscription);
     }
     let (scheme, body) = text
         .split_once("://")
         .ok_or(ClientError::InvalidSubscription)?;
+    if scheme.eq_ignore_ascii_case("vpn") {
+        return super::amnezia::parse_link(body);
+    }
     if scheme.eq_ignore_ascii_case("vmess") && !body.contains('@') {
         return parse_v2rayn(body);
     }

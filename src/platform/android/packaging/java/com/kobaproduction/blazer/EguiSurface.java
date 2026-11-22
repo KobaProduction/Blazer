@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 final class EguiSurface extends GLSurfaceView {
-    private final EguiActivity activity;
+    private final MainActivity activity;
     private final long handle;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Object scheduleLock = new Object();
@@ -26,7 +26,7 @@ final class EguiSurface extends GLSurfaceView {
     private volatile boolean closed;
     private boolean recheckIme;
 
-    EguiSurface(EguiActivity activity, long handle) {
+    EguiSurface(MainActivity activity, long handle) {
         super(activity);
         this.activity = activity;
         this.handle = handle;
@@ -83,7 +83,7 @@ final class EguiSurface extends GLSurfaceView {
         requestRender();
     }
 
-    boolean postToActivity(Consumer<EguiActivity> action) {
+    boolean postToActivity(Consumer<MainActivity> action) {
         if (!drawing || closed) return false;
         return main.post(() -> {
             if (drawing && !closed && !activity.isFinishing()) action.accept(activity);

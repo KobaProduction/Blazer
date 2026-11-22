@@ -23,7 +23,7 @@ static NEXT_SURFACE: AtomicI64 = AtomicI64::new(1);
 
 const _: NativeMethod = native_method! {
     java_type = "com.kobaproduction.blazer.EguiNative",
-    static extern fn create() -> jlong,
+    static extern fn create(updates_available: jboolean) -> jlong,
 };
 const _: NativeMethod = native_method! {
     java_type = "com.kobaproduction.blazer.EguiNative",
@@ -75,6 +75,7 @@ struct Surface {
     dirty: Arc<AtomicBool>,
     input: Mutex<InputQueue>,
     renderer: Mutex<Option<Renderer>>,
+    updates_available: bool,
 }
 
 struct JavaUi {
@@ -127,6 +128,43 @@ impl JavaUi {
             })
             .unwrap_or(false)
     }
+
+    fn scan_qr_camera(&self, title: &str, hint: &str, cancel: &str, error: &str) -> bool {
+        self.vm
+            .attach_current_thread(|env| {
+                let title = env.new_string(title)?;
+                let hint = env.new_string(hint)?;
+                let cancel = env.new_string(cancel)?;
+                let error = env.new_string(error)?;
+                env.call_static_method(
+                    &*self.class,
+                    jni_str!("scanQrCamera"),
+                    jni_sig!("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z"),
+                    &[
+                        JValue::Long(self.handle),
+                        JValue::Object(title.as_ref()),
+                        JValue::Object(hint.as_ref()),
+                        JValue::Object(cancel.as_ref()),
+                        JValue::Object(error.as_ref()),
+                    ],
+                )?
+                .z()
+            })
+            .unwrap_or(false)
+    }
+
+    fn open_updates(&self, error: &str) {
+        let _ = self.vm.attach_current_thread(|env| {
+            let error = env.new_string(error)?;
+            env.call_static_method(
+                &*self.class,
+                jni_str!("openUpdates"),
+                jni_sig!("(JLjava/lang/String;)V"),
+                &[JValue::Long(self.handle), JValue::Object(error.as_ref())],
+            )?;
+            Ok::<_, jni::errors::Error>(())
+        });
+    }
 }
 
 impl Surface {
@@ -136,6 +174,8 @@ impl Surface {
         context.set_request_repaint_callback(move |request| repaint.repaint(request.delay));
         let tunnel = self.java.clone();
         let qr = self.java.clone();
+        let camera = self.java.clone();
+        let updates = self.java.clone();
         let host = UiHost {
             request_tunnel_start: Some(Arc::new(move || tunnel.request_tunnel_start())),
             pick_qr_image: Some(Arc::new(move |title| {
@@ -145,6 +185,12 @@ impl Surface {
                     Err(Key::QrUnreadableImage)
                 }
             })),
+            scan_qr_camera: Some(Arc::new(move |title, hint, cancel, error| {
+                camera.scan_qr_camera(title, hint, cancel, error)
+            })),
+            open_updates: self
+                .updates_available
+                .then(|| Arc::new(move |error: &str| updates.open_updates(error)) as _),
             ..UiHost::default()
         };
         let controller = Controller::new(self.client.clone(), self.dirty.clone());
@@ -218,7 +264,11 @@ impl Renderer {
     }
 }
 
-fn create(env: &mut Env<'_>, class: JClass<'_>) -> jni::errors::Result<jlong> {
+fn create(
+    env: &mut Env<'_>,
+    class: JClass<'_>,
+    updates_available: jboolean,
+) -> jni::errors::Result<jlong> {
     let Some(client) = bridge::attach_client() else {
         return Ok(0);
     };
@@ -237,6 +287,7 @@ fn create(env: &mut Env<'_>, class: JClass<'_>) -> jni::errors::Result<jlong> {
         dirty: Arc::new(AtomicBool::new(true)),
         input: Mutex::new(InputQueue::default()),
         renderer: Mutex::new(None),
+        updates_available,
     }));
     Ok(handle)
 }

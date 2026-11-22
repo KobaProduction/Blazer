@@ -19,8 +19,7 @@ final class NativeSession {
     private static WeakReference<Activity> observer = new WeakReference<>(null);
 
     private static native boolean open(String dataDir, boolean blazeCorePackaged);
-    static native String snapshot();
-    static native boolean dispatch(String request);
+    static native void disconnect();
     static native String decodeQrImage(byte[] image);
     static native String decodeQrFrame(byte[] frame, int width, int height);
     static native long requestTunnelStart();
@@ -61,7 +60,6 @@ final class NativeSession {
         POSTED.set(false);
         ClientVpnService.onNativeUpdate();
         SubscriptionRefreshJob.onNativeUpdate();
-        if (observer.get() instanceof MainActivity activity) activity.refresh();
     }
 
     /** Called on the client worker, never on the Activity rendering thread. */
@@ -75,6 +73,10 @@ final class NativeSession {
     static boolean tunnelRunning() { return ClientVpnService.tunnelRunning(); }
     static boolean tunnelRouted() { return ClientVpnService.tunnelRouted(); }
     static boolean stopTunnel() { return ClientVpnService.stopTunnel(); }
+    static boolean selectorControlAvailable() { return BlazeCoreNative.selectorControlAvailable(); }
+    static long tunnelHandle() { return ClientVpnService.tunnelHandle(); }
+    static boolean selectorControlReady(long expectedHandle) { return ClientVpnService.selectorControlReady(expectedHandle); }
+    static boolean selectOutbound(long expectedHandle, String group, String member) { return ClientVpnService.selectOutbound(expectedHandle, group, member); }
 
     private NativeSession() {}
 }

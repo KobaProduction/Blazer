@@ -11,8 +11,7 @@ use crate::provider::{
     FetchOutcome, check_security, fetch_update, record_success, resolve_pending, stage_provider,
 };
 use vpn_domain::client::{
-    ProxyTransport, Secret, TcpProbeEndpoint, preserve_profile_uuids,
-    validate_subscription_user_agent,
+    Secret, TcpProbeEndpoint, preserve_profile_uuids, validate_subscription_user_agent,
 };
 use vpn_domain::provider::{ProviderChangeKind, ProviderState};
 
@@ -305,7 +304,7 @@ impl ClientApplication {
                     } else {
                         &profile.name
                     };
-                    let endpoint = if matches!(profile.transport, ProxyTransport::Quic { .. }) {
+                    let endpoint = if !profile.transport.has_tcp_endpoint() {
                         None
                     } else {
                         TcpProbeEndpoint::new(&profile.host, profile.port)

@@ -134,13 +134,13 @@ Blazer читает известные HTTP-заголовки и начальн
 | `fallback-url`, `new-url`, `new-domain`, `hide-settings` | Резервный источник, миграция с проверкой origin и скрытие сведений профиля |
 | `profile-title`, `name` | Определяют название при добавлении и обновлении подписки с автоматическим именем. При отсутствии этих полей клиент проверяет параметр `name` в URL, затем использует имя хоста. Пустое поле имени включает этот режим. Имя, заданное вручную, сохраняется |
 | `providerid`, `subscription-auto-update-enable`, `change-user-agent`, `manual-block-user-agent`, `dont-use-filter` | Проводные значения распознаются. Глобальные настройки и фильтры сохраняют существующее поведение |
-| `notification-subs-expire`, `subscription-ping-onopen-enabled`, `ping-type`, `check-url-via-proxy`, `proxy-ping-mode`, `proxy-ping-timeout` | Будущие отдельные сценарии системного уведомления, автопинга и измерения через BlazeCore. Текущий прямой TCP-пинг использует ядро клиента |
+| `notification-subs-expire`, `subscription-ping-onopen-enabled`, `ping-type`, `check-url-via-proxy`, `proxy-ping-mode`, `proxy-ping-timeout` | Проводные параметры распознаются. Системное уведомление и автопинг требуют отдельных сценариев. Методы, URL, GET/HEAD, таймаут, прогрев и стратегия измерения настраиваются пользователем через ядро клиента; метаданные подписки не заменяют эти настройки автоматически |
 | `color-profile`, `subscription-autoconnect*`, `app-auto-start`, `subscription-*-hwid-*`, `no-limit-*` | Документированные параметры Happ без применения к настройкам и полномочиям приложения Blazer |
 | `routing*`, `*-auth-*`, `custom-tunnel-config`, `tun-*`, `proxy-enable`, `xray-tun-*`, `inbound-http-enable`, `exclude-routes*`, `include-all-networks-enable`, `exclude-*-enable`, `per-app-proxy-*`, `block-bind-to-tunnel-enable`, `hide-vpn-icon` | Платформенные настройки Happ. Реальные операции туннеля и маршрутизации Blazer используют собственные типизированные команды |
 | `fragmentation-*`, `noises-*`, `mux-*`, `sniffing-enable`, `server-address-resolve-*`, `dns-from-json-enable`, `user-agent-geo-files` | Параметры сетевого ядра Happ. Совместимость определяется возможностями BlazeCore |
 | `encrypt-tag`, `happ://crypt4/`, `happ://crypt5/` | Отдельные защищённые форматы отложены |
 
-Сводный и подписочный журнал Blazer получают результат обновления, сбой и
+Журнал приложения Blazer получает результат обновления, сбой и
 использование fallback без адресов подписок. Ошибка запроса остаётся привязана
 к карточке подписки. Уведомления внутри окна включаются через «Настройки →
 Подписки» на время текущего сеанса. Предупреждение об истечении пересчитывается

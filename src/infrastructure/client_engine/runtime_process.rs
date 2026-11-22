@@ -88,8 +88,61 @@ mod platform {
         }
 
         pub(in crate::client_engine) fn stop(&mut self) -> Result<(), ClientError> {
-            super::super::stop_child(&mut self.0)
+            stop(&mut self.0)
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn stop(child: &mut Child) -> Result<(), ClientError> {
+        super::super::stop_child(child)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop(child: &mut Child) -> Result<(), ClientError> {
+        use rustix::process::{Pid, Signal, kill_process};
+        use std::time::{Duration, Instant};
+
+        let failure = ClientError::EngineStopped;
+        if child.try_wait().map_err(|_| failure)?.is_some() {
+            return Ok(());
+        }
+        // SIGTERM lets BlazeCore revert its owned nftables, routing and DNS state.
+        kill_process(Pid::from_child(child), Signal::TERM).map_err(|_| failure)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if super::super::wait_for_exit(child, Duration::from_millis(20))
+                .map_err(|_| failure)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        Err(failure)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn linux_shutdown_runs_the_child_cleanup_handler() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Command;
+
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap 'echo cleaned; exit 0' TERM; echo ready; while :; do sleep 0.1; done",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        stop(&mut child).unwrap();
+        assert!(child.try_wait().unwrap().unwrap().success());
+        let mut cleanup = String::new();
+        output.read_line(&mut cleanup).unwrap();
+        assert_eq!(cleanup.trim(), "cleaned");
     }
 }
 

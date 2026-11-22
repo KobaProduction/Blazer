@@ -84,6 +84,7 @@ fn run_action(
         Action::Profiles => render::profiles(&initial),
         Action::Subscriptions => render::subscriptions(&initial),
         Action::Settings => render::settings(&initial),
+        Action::PingSettings => render::ping_settings(&initial),
         Action::Diagnostics => render::diagnostics(&initial),
         Action::Routing(uuid) => render::routing(&initial, uuid.as_deref())?,
         Action::Serve(mode) => return serve_connection(client, updates, wakeup, mode),

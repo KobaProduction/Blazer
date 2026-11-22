@@ -125,7 +125,7 @@ impl ImportKind {
         match (self, error) {
             (Self::Subscription, Key::ParseFailed) => Key::ImportInvalidSubscription,
             (Self::Subscription, Key::InvalidInput) => Key::ImportInvalidUrl,
-            (Self::Configuration, Key::ParseFailed) if payload(input).starts_with(['{', '[']) => {
+            (Self::Configuration, Key::ParseFailed) if starts_json(payload(input)) => {
                 Key::ImportInvalidJson
             }
             (Self::Configuration, Key::ParseFailed) => Key::ImportInvalidConfiguration,
@@ -133,6 +133,13 @@ impl ImportKind {
             _ => error,
         }
     }
+}
+
+fn starts_json(input: &str) -> bool {
+    input.starts_with('{')
+        || input
+            .strip_prefix('[')
+            .is_some_and(|rest| rest.trim_start().starts_with(['{', '[', '"', ']']))
 }
 
 #[cfg(test)]

@@ -6,7 +6,187 @@ use vpn_domain::client::{
 const ID: &str = "a5c41b77-fc31-4ab0-a275-1c67aa9aab31";
 
 fn normalize(input: impl AsRef<[u8]>) -> Result<Vec<ProxyProfile>, ClientError> {
-    SubscriptionNormalizer.normalize(input.as_ref())
+    let mut profiles = SubscriptionNormalizer.normalize(input.as_ref())?;
+    // The dialect comparisons below assert equivalent connection settings.
+    for profile in &mut profiles {
+        profile.source = None;
+    }
+    Ok(profiles)
+}
+
+#[test]
+fn wireguard_conf_preserves_amneziawg_3_1_fields_and_rejects_scripts() {
+    let client_key = STANDARD.encode([42; 32]);
+    let server_key = STANDARD.encode([41; 32]);
+    let input = format!(
+        "# Note\n[Interface]\nPrivateKey = {client_key}\nAddress = 10.8.0.2/32, fd00::2/128\nDNS = 10.8.0.1\nMTU = 1420\n\
+         Jc = 8\nJmin = 75\nJmax = 123\nS1 = 40\nS2 = 97\nS3 = 20\nS4 = 16\n\
+         H1 = 1000000-1000999\nH2 = 2000000-2000999\nH3 = 3000000-3000999\nH4 = 4000000-4000999\n\
+         I1 = <b 0x160301><r 32>\nI2 = <r 28>\nHeaderProtectionKey = {client_key}\n\
+         ContentPaddingAddition = 0-64\nRekeyAfterTime = 121-155\nRekeyTimeout = 5\nRejectAfterTime = 185-201\n\
+         KeepaliveTimeout = 12-26\nMaxHandshakeAttempts = 18\nRandomTrailers = on\nDisableCookies = off\n\
+         [Peer]\nPublicKey = {server_key}\nEndpoint = [2001:db8::1]:51820\n\
+         AllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 20-30\n"
+    );
+    let profile = normalize(&input).unwrap().remove(0);
+    let ProxyProtocol::Native(native) = &profile.protocol else {
+        panic!("expected native AmneziaWG");
+    };
+    let protocol: serde_json::Value = serde_json::from_str(native.settings.expose()).unwrap();
+    let awg = &protocol["protocol"]["amnezia"];
+    assert_eq!(profile.protocol.name(), "AmneziaWG");
+    assert_eq!(profile.host, "2001:db8::1");
+    assert_eq!(profile.transport, ProxyTransport::Udp);
+    assert_eq!(native.dns_servers[0].to_string(), "10.8.0.1");
+    assert_eq!(awg["header_protection_key"], "2a".repeat(32));
+    assert_eq!(awg["content_padding_addition"], "0-64");
+    assert_eq!(awg["rekey_after_time"], "121-155");
+    assert_eq!(awg["persistent_keepalive_interval"], "20-30");
+    assert_eq!(awg["random_trailers"], true);
+    assert_eq!(awg["disable_cookies"], false);
+    assert_eq!(
+        normalize(input.replace("MTU = 1420", "PreUp = echo reject")),
+        Err(ClientError::UnsupportedFeature)
+    );
+    assert_eq!(
+        normalize(input.replace("MTU = 1420", "MTU = 1800")),
+        Err(ClientError::InvalidSubscription)
+    );
+}
+
+#[test]
+fn native_yaml_imports_client_group_and_rejects_listener_policies() {
+    let yaml = r#"
+- client_group: vpn
+  client_chains:
+    - address: "127.0.0.1:443"
+      protocol:
+        type: hysteria2
+        password: secret
+        hopping: {ports: "443, 8000-8003", interval_secs: 15}
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: ["0.0.0.0/0", "::/0"]
+      action: allow
+      client_chain: vpn
+"#;
+    let profile = normalize(yaml).unwrap().remove(0);
+    assert_eq!(profile.protocol.name(), "Hysteria2");
+    assert!(!profile.transport.has_tcp_endpoint());
+    assert_eq!(
+        normalize(yaml.replace("action: allow", "action: block")),
+        Err(ClientError::UnsupportedFeature)
+    );
+}
+
+#[test]
+fn amnezia_vpn_imports_qt_compressed_bundle_and_decoded_wireguard() {
+    use std::io::Write as _;
+
+    let private = STANDARD.encode([42; 32]);
+    let public = STANDARD.encode([41; 32]);
+    let config = format!(
+        "[Interface]\nPrivateKey = {private}\nAddress = 10.8.0.2/32\n[Peer]\nPublicKey = {public}\nEndpoint = 198.51.100.2:51820\nAllowedIPs = 0.0.0.0/0"
+    );
+    let settings = serde_json::json!({
+        "config": config.replace("[Peer]", "DNS = $PRIMARY_DNS, 192.0.2.53, $SECONDARY_DNS\nI2 =\nI3 = \nI4 =\nI5 =\n[Peer]"),
+        "Jc":"2", "Jmin":"12", "Jmax":"20",
+        "HeaderProtectionKey":private, "S1":12, "S2":"12", "S3":12, "S4":12,
+        "RandomTrailers":"on", "I1":"<r 5>", "I2":"", "I3":"  ", "I4":"", "I5":""
+    });
+    let bundle = serde_json::json!({
+        "description":"Amnezia fixture", "defaultContainer":"amnezia-awg2",
+        "dns1":"10.8.0.1", "dns2":"2001:db8::53",
+        "containers":[
+            {"container":"amnezia-openvpn"},
+            {"container":"amnezia-awg2","awg":{"last_config":settings.to_string()}}
+        ]
+    })
+    .to_string();
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        (bundle.len() as u32).to_be_bytes().to_vec(),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(bundle.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let link = |value: &[u8]| format!("vpn://{}", URL_SAFE_NO_PAD.encode(value));
+    check_amnezia_editor_roundtrip(&link(&compressed));
+    for input in [link(&compressed), link(bundle.as_bytes()), bundle] {
+        let profile = normalize(input).unwrap().remove(0);
+        assert_eq!(profile.name, "Amnezia fixture");
+        let ProxyProtocol::Native(proxy) = profile.protocol else {
+            panic!("expected native AmneziaWG");
+        };
+        assert_eq!(proxy.kind.name(), "AmneziaWG");
+        let settings: serde_json::Value = serde_json::from_str(proxy.settings.expose()).unwrap();
+        assert_eq!(settings["protocol"]["amnezia"]["random_trailers"], true);
+        let servers = proxy
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(servers, ["10.8.0.1", "192.0.2.53", "2001:db8::53"]);
+    }
+    assert_eq!(
+        normalize(link(config.as_bytes())).unwrap()[0]
+            .protocol
+            .name(),
+        "WireGuard"
+    );
+    assert_eq!(
+        normalize(link(&compressed[..compressed.len() - 2])),
+        Err(ClientError::InvalidSubscription)
+    );
+    assert_eq!(
+        normalize(link(&u32::MAX.to_be_bytes())),
+        Err(ClientError::PayloadTooLarge)
+    );
+}
+
+fn check_amnezia_editor_roundtrip(input: &str) {
+    let imported = SubscriptionNormalizer
+        .normalize(input.as_bytes())
+        .unwrap()
+        .remove(0);
+    let mut editor: serde_json::Value =
+        serde_json::from_str(imported.source.as_ref().unwrap().expose()).unwrap();
+    assert_eq!(editor["protocol"]["type"], "amneziawg");
+    assert_eq!(editor["protocol"]["amnezia"]["i1"], "<r 5>");
+    for unused in ["i2", "i3", "i4", "i5"] {
+        assert!(editor["protocol"]["amnezia"].get(unused).is_none());
+    }
+    assert_eq!(editor["protocol"]["amnezia"]["random_trailers"], true);
+    editor["protocol"]["amnezia"]["random_trailers"] = serde_json::json!(false);
+    editor["dns_servers"] = serde_json::json!(["192.0.2.53"]);
+    let edited = normalize(editor.to_string()).unwrap().remove(0);
+    let ProxyProtocol::Native(edited) = edited.protocol else {
+        panic!("the edited profile keeps AmneziaWG");
+    };
+    assert_eq!(edited.dns_servers[0].to_string(), "192.0.2.53");
+    let updated: serde_json::Value = serde_json::from_str(edited.settings.expose()).unwrap();
+    assert_eq!(updated["protocol"]["type"], "wireguard");
+    assert_eq!(updated["protocol"]["amnezia"]["random_trailers"], false);
+}
+
+#[test]
+fn amnezia_vpn_imports_structured_wireguard_without_native_conf() {
+    let private = STANDARD.encode([42; 32]);
+    let public = STANDARD.encode([41; 32]);
+    let document = serde_json::json!({
+        "hostName":"2001:db8::1","defaultContainer":"amnezia-wireguard",
+        "containers":[{"container":"amnezia-wireguard","wireguard":{
+            "port":"51820","last_config":{
+                "client_ip":"10.8.0.2","client_priv_key":private,"server_pub_key":public,
+                "allowed_ips":["0.0.0.0/0"]
+            }
+        }}]
+    });
+    let source = format!("vpn://{}", URL_SAFE.encode(document.to_string()));
+    let profile = normalize(source).unwrap().remove(0);
+    assert_eq!(profile.host, "2001:db8::1");
+    assert_eq!(profile.port, 51820);
+    assert_eq!(profile.protocol.name(), "WireGuard");
 }
 
 #[test]
@@ -112,6 +292,340 @@ fn fetched_wrappers_isolate_independent_outbounds_and_keep_single_profile_remark
         ProfileUnavailableReason::Invalid
     );
     assert_eq!(result.unavailable_profiles[1].protocol, None);
+}
+
+fn balanced_xray_configuration() -> serde_json::Value {
+    // Synthetic endpoints using Project X's BalancerObject/ObservatoryObject:
+    // https://xtls.github.io/config/routing.html#balancerobject
+    // https://xtls.github.io/config/observatory.html#observatoryobject
+    serde_json::json!({
+        "remarks": "Balanced route",
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "local", "listen": "127.0.0.1", "port": 1080,
+            "protocol": "socks", "settings": {"auth": "noauth", "udp": true}
+        }],
+        "outbounds": [
+            {"tag": "proxy-a", "protocol": "socks", "settings": {
+                "servers": [{"address": "192.0.2.10", "port": 1081}]
+            }},
+            {"tag": "proxy-b", "protocol": "socks", "settings": {
+                "servers": [{"address": "192.0.2.20", "port": 1082}]
+            }}
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [{"type": "field", "inboundTag": ["local"], "balancerTag": "smart"}],
+            "balancers": [{
+                "tag": "smart", "selector": ["proxy-"], "fallbackTag": "proxy-a",
+                "strategy": {"type": "leastPing"}
+            }]
+        },
+        "observatory": {
+            "subjectSelector": ["proxy-"],
+            "probeUrl": "https://connectivitycheck.gstatic.com/generate_204",
+            "probeInterval": "10s", "enableConcurrency": true
+        }
+    })
+}
+
+#[test]
+fn xray_least_ping_policy_is_not_flattened_and_preserves_the_complete_source() {
+    let document = balanced_xray_configuration();
+    let mut independent = document.clone();
+    independent.as_object_mut().unwrap().remove("routing");
+    independent.as_object_mut().unwrap().remove("observatory");
+    independent.as_object_mut().unwrap().remove("remarks");
+    let supported = normalize(independent.to_string()).unwrap();
+    assert_eq!(supported.len(), 2);
+    assert_eq!(supported[0].name, "proxy-a");
+    assert_eq!(supported[1].name, "proxy-b");
+    let body = serde_json::to_vec(&document).unwrap();
+    for source in [body.clone(), STANDARD.encode(&body).into_bytes()] {
+        let imported = SubscriptionNormalizer
+            .normalize_subscription(&source)
+            .unwrap();
+        let manual = SubscriptionNormalizer.normalize(&source).unwrap();
+        assert!(imported.unavailable_profiles.is_empty());
+        assert_eq!(imported.profiles.len(), 1);
+        assert_eq!(manual.len(), 1);
+        assert_least_ping_profile(&imported.profiles[0], &document);
+        assert_least_ping_profile(&manual[0], &document);
+    }
+}
+
+fn assert_least_ping_profile(profile: &ProxyProfile, document: &serde_json::Value) {
+    use vpn_domain::client::GraphStrategy;
+    let ProxyProtocol::Graph(graph) = &profile.protocol else {
+        panic!("the policy must remain one composite graph");
+    };
+    assert_eq!(profile.name, "Balanced route");
+    assert_eq!(graph.groups[0].members, ["proxy-a", "proxy-b"]);
+    assert_eq!(
+        graph.groups[0].strategy,
+        GraphStrategy::LeastPing {
+            fallback: Some("proxy-a".into())
+        }
+    );
+    let observer = graph.observatory.as_ref().unwrap();
+    assert_eq!(observer.members, ["proxy-a", "proxy-b"]);
+    assert_eq!(
+        observer.probe_url.expose(),
+        "https://connectivitycheck.gstatic.com/generate_204"
+    );
+    assert_eq!(observer.interval, std::time::Duration::from_secs(10));
+    assert!(observer.enable_concurrency);
+    let source: serde_json::Value =
+        serde_json::from_str(profile.source.as_ref().unwrap().expose()).unwrap();
+    assert_eq!(&source, document);
+}
+
+#[test]
+fn xray_least_ping_policy_keeps_independent_subscription_entries() {
+    let document = serde_json::json!([
+        balanced_xray_configuration(),
+        "socks5://192.0.2.30:1083#Independent%20server"
+    ]);
+    let imported = SubscriptionNormalizer
+        .normalize_subscription(document.to_string().as_bytes())
+        .unwrap();
+    let [policy, independent] = imported.profiles.as_slice() else {
+        panic!("the graph and the separate share link must both remain selectable");
+    };
+    assert!(matches!(policy.protocol, ProxyProtocol::Graph(_)));
+    assert_eq!(policy.name, "Balanced route");
+    assert_eq!(independent.name, "Independent server");
+    assert_eq!(independent.host, "192.0.2.30");
+    assert_eq!(independent.port, 1083);
+    assert!(imported.unavailable_profiles.is_empty());
+}
+
+fn graph_from_document(document: &serde_json::Value) -> Box<vpn_domain::client::ProxyGraph> {
+    let profile = SubscriptionNormalizer
+        .normalize(document.to_string().as_bytes())
+        .unwrap()
+        .remove(0);
+    let ProxyProtocol::Graph(graph) = profile.protocol else {
+        panic!("expected a graph");
+    };
+    graph
+}
+
+#[test]
+fn xray_least_ping_observatory_keeps_its_own_subjects_defaults_and_precise_interval() {
+    let mut source = balanced_xray_configuration();
+    source["observatory"] = serde_json::json!({"subjectSelector":["proxy-b"]});
+    let graph = graph_from_document(&source);
+    let observer = graph.observatory.unwrap();
+    assert_eq!(observer.members, ["proxy-b"]);
+    assert_eq!(
+        observer.probe_url.expose(),
+        "https://www.google.com/generate_204"
+    );
+    assert_eq!(observer.interval, std::time::Duration::from_secs(10));
+    assert!(!observer.enable_concurrency);
+    for (value, expected) in [
+        ("200ms", 200_000_000),
+        (".5s", 500_000_000),
+        ("1m30.5s", 90_500_000_000),
+        ("1\u{b5}s", 1_000),
+        ("0s", 10_000_000_000),
+    ] {
+        source["observatory"]["probeInterval"] = serde_json::json!(value);
+        assert_eq!(
+            graph_from_document(&source).observatory.unwrap().interval,
+            std::time::Duration::from_nanos(expected)
+        );
+    }
+    source["observatory"]["probeURL"] = serde_json::json!("https://probe.example/check");
+    assert_eq!(
+        graph_from_document(&source)
+            .observatory
+            .unwrap()
+            .probe_url
+            .expose(),
+        "https://probe.example/check"
+    );
+}
+
+#[test]
+fn xray_least_ping_rejects_conflicting_urls_missing_fallback_and_unrepresented_observer_policy() {
+    let original = balanced_xray_configuration();
+    let mut conflict = original.clone();
+    conflict["observatory"]["probeURL"] = serde_json::json!("https://other.example/check");
+    let mut missing_fallback = original.clone();
+    missing_fallback["routing"]["balancers"][0]["fallbackTag"] = serde_json::json!("missing");
+    let mut invalid_interval = original.clone();
+    invalid_interval["observatory"]["probeInterval"] = serde_json::json!("-1s");
+    for source in [conflict, missing_fallback, invalid_interval] {
+        assert_eq!(
+            normalize(source.to_string()),
+            Err(ClientError::InvalidSubscription)
+        );
+    }
+    let mut absent = original.clone();
+    absent.as_object_mut().unwrap().remove("observatory");
+    let mut unsupported = original.clone();
+    unsupported["observatory"]["unmappedField"] = serde_json::json!(true);
+    let mut long_interval = original.clone();
+    long_interval["observatory"]["probeInterval"] = serde_json::json!("25h");
+    for source in [absent, unsupported, long_interval] {
+        assert_eq!(
+            normalize(source.to_string()),
+            Err(ClientError::UnsupportedFeature)
+        );
+    }
+}
+
+fn round_robin_xray_configuration() -> serde_json::Value {
+    let mut document = balanced_xray_configuration();
+    document.as_object_mut().unwrap().remove("observatory");
+    let balancer = &mut document["routing"]["balancers"][0];
+    balancer.as_object_mut().unwrap().remove("fallbackTag");
+    balancer["strategy"]["type"] = serde_json::json!("roundRobin");
+    document
+}
+
+#[test]
+fn xray_round_robin_graph_preserves_members_rules_default_and_complete_editor_source() {
+    let mut document = round_robin_xray_configuration();
+    document["outbounds"].as_array_mut().unwrap().extend([
+        serde_json::json!({"tag":"direct", "protocol":"freedom", "settings":{}}),
+        serde_json::json!({"tag":"blocked", "protocol":"blackhole", "settings":{}}),
+    ]);
+    document["routing"]["balancers"][0]["selector"] = serde_json::json!(["proxy-", "proxy-a"]);
+    document["routing"]["rules"] = serde_json::json!([
+        {"type":"field", "domain":["full:ads.example"], "outboundTag":"blocked"},
+        {"type":"field", "ip":["192.0.2.25/24", "2001:db8::12"], "outboundTag":"direct"},
+        {"type":"field", "domain":["full:exact.example", "domain:example.net"],
+            "network":"tcp,udp", "inboundTag":["local"], "balancerTag":"smart"}
+    ]);
+    let body = serde_json::to_vec(&document).unwrap();
+    for input in [body.clone(), STANDARD.encode(&body).into_bytes()] {
+        let manual = SubscriptionNormalizer.normalize(&input).unwrap();
+        let fetched = SubscriptionNormalizer
+            .normalize_subscription(&input)
+            .unwrap();
+        assert!(fetched.unavailable_profiles.is_empty());
+        assert_eq!(manual.len(), 1);
+        assert_eq!(fetched.profiles.len(), 1);
+        for profile in manual.iter().chain(&fetched.profiles) {
+            assert_composite_xray_profile(profile, &document);
+        }
+    }
+}
+
+fn assert_composite_xray_profile(profile: &ProxyProfile, document: &serde_json::Value) {
+    assert_eq!(profile.name, "Balanced route");
+    assert_eq!((profile.host.as_str(), profile.port), ("192.0.2.10", 1081));
+    let source: serde_json::Value =
+        serde_json::from_str(profile.source.as_ref().unwrap().expose()).unwrap();
+    assert_eq!(&source, document);
+    let ProxyProtocol::Graph(graph) = &profile.protocol else {
+        panic!("the entire Xray document must become one composite profile");
+    };
+    assert_round_robin_graph(graph);
+}
+
+fn assert_round_robin_graph(graph: &vpn_domain::client::ProxyGraph) {
+    use vpn_domain::client::{
+        GraphMatch, GraphNetwork, GraphOutboundKind, GraphStrategy, GraphTarget,
+    };
+
+    assert_eq!(
+        graph
+            .outbounds
+            .iter()
+            .map(|outbound| outbound.tag.as_str())
+            .collect::<Vec<_>>(),
+        ["proxy-a", "proxy-b", "direct", "blocked"]
+    );
+    assert!(matches!(graph.outbounds[2].kind, GraphOutboundKind::Direct));
+    assert!(matches!(graph.outbounds[3].kind, GraphOutboundKind::Block));
+    assert_eq!(
+        graph.default_target,
+        GraphTarget::Outbound("proxy-a".into())
+    );
+    assert_eq!(graph.groups[0].members, ["proxy-a", "proxy-b"]);
+    assert_eq!(graph.groups[0].strategy, GraphStrategy::RoundRobin);
+    assert_eq!(
+        graph.rules[0].target,
+        GraphTarget::Outbound("blocked".into())
+    );
+    assert_eq!(
+        graph.rules[1].condition,
+        GraphMatch::Cidr(vec!["192.0.2.0/24".into(), "2001:db8::12/128".into()])
+    );
+    assert_eq!(
+        graph.rules[2].condition,
+        GraphMatch::All(vec![
+            GraphMatch::Any(vec![
+                GraphMatch::Domain(vec!["exact.example".into()]),
+                GraphMatch::DomainSuffix(vec!["example.net".into()])
+            ]),
+            GraphMatch::Network(vec![GraphNetwork::Tcp, GraphNetwork::Udp]),
+        ])
+    );
+    assert_eq!(graph.rules[2].target, GraphTarget::Group("smart".into()));
+}
+
+#[test]
+fn xray_round_robin_graph_rejects_missing_references_and_unmapped_policy_semantics() {
+    let source = round_robin_xray_configuration();
+    let mut missing_group = source.clone();
+    missing_group["routing"]["rules"][0]["balancerTag"] = serde_json::json!("missing");
+    let mut missing_outbound = source.clone();
+    missing_outbound["routing"]["rules"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("balancerTag");
+    missing_outbound["routing"]["rules"][0]["outboundTag"] = serde_json::json!("missing");
+    let mut empty_selector = source.clone();
+    empty_selector["routing"]["balancers"][0]["selector"] = serde_json::json!(["missing-"]);
+    for document in [missing_group, missing_outbound, empty_selector] {
+        assert_eq!(
+            normalize(document.to_string()),
+            Err(ClientError::InvalidSubscription)
+        );
+    }
+
+    let mut unknown_strategy = source.clone();
+    unknown_strategy["routing"]["balancers"][0]["strategy"]["type"] = serde_json::json!("random");
+    let mut default_random = source.clone();
+    default_random["routing"]["balancers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("strategy");
+    let mut fallback = source.clone();
+    fallback["routing"]["balancers"][0]["fallbackTag"] = serde_json::json!("proxy-a");
+    let mut conflicting_inbounds = source.clone();
+    let mut inbound = conflicting_inbounds["inbounds"][0].clone();
+    inbound["tag"] = serde_json::json!("second");
+    conflicting_inbounds["inbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(inbound);
+    let mut custom_dns = source.clone();
+    custom_dns["dns"] = serde_json::json!({"servers":["1.1.1.1"]});
+    let mut geo_rule = source.clone();
+    geo_rule["routing"]["rules"][0]["domain"] = serde_json::json!(["geosite:private"]);
+    let mut authenticated_inbound = source.clone();
+    authenticated_inbound["inbounds"][0]["settings"] =
+        serde_json::json!({"auth":"password", "accounts":[{"user":"fixture", "pass":"fixture"}]});
+    for document in [
+        unknown_strategy,
+        default_random,
+        fallback,
+        conflicting_inbounds,
+        custom_dns,
+        geo_rule,
+        authenticated_inbound,
+    ] {
+        assert_eq!(
+            normalize(document.to_string()),
+            Err(ClientError::UnsupportedFeature)
+        );
+    }
 }
 
 #[test]
@@ -389,6 +903,7 @@ fn xhttp_session_and_sequence_metadata_import_across_formats() {
         packet: XhttpPacketOptions {
             max_post_bytes: Some(XhttpPacketRange::new(128_000, 256_000).unwrap()),
             min_post_interval_ms: Some(XhttpPacketRange::new(5, 15).unwrap()),
+            ..Default::default()
         },
     };
     for input in [
@@ -439,19 +954,19 @@ fn xhttp_rejects_ambiguous_and_invalid_metadata() {
 }
 
 #[test]
-fn fetched_xray_wrapper_reports_xhttp_upload_method_and_keeps_tcp_probe() {
+fn fetched_xray_wrapper_imports_get_packet_up_and_keeps_unsupported_policies_separate() {
     use vpn_application::client::ProfileUnavailableReason;
 
     let link =
-        format!("vless://{ID}@localhost:7443?type=xhttp&mode=packet-up&uplinkHTTPMethod=GET");
+        format!("vless://{ID}@localhost:7443?type=xhttp&mode=stream-up&uplinkHTTPMethod=GET");
     assert_eq!(
         normalize(link),
         Err(ClientError::UnsupportedXhttpUploadMethod)
     );
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "remarks":"Fixture",
-        "dns":{"servers":["example.test"]},
-        "routing":{"rules":[]},
+        "dns":{"servers":["192.0.2.53"]},
+        "routing":{"domainStrategy":"AsIs","rules":[]},
         "outbounds":[{
             "protocol":"vless","tag":"proxy",
             "settings":{"address":"localhost","port":7443,"id":ID},
@@ -461,20 +976,47 @@ fn fetched_xray_wrapper_reports_xhttp_upload_method_and_keeps_tcp_probe() {
                 "xhttpSettings":{"mode":"packet-up","extra":{
                     "seqPlacement":"header","scMaxEachPostBytes":"128000-256000",
                     "scMinPostsIntervalMs":"5-15","uplinkHTTPMethod":"GET",
-                    "sessionIDLength":"8-10"
+                    "sessionIDLength":"18-24","sessionIDTable":"base36",
+                    "xPaddingBytes":"100-1000","xPaddingMethod":"tokenish",
+                    "xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader",
+                    "xPaddingHeader":"Referer","xPaddingKey":"padding",
+                    "xmux":{"maxConnections":"3-3","hMaxRequestTimes":"50-100"}
                 }}
             }
         },{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}]
     });
-    let result = SubscriptionNormalizer
-        .normalize_subscription(document.to_string().as_bytes())
-        .unwrap();
+    let normalize_wrapper = |document: &serde_json::Value| {
+        SubscriptionNormalizer
+            .normalize_subscription(document.to_string().as_bytes())
+            .unwrap()
+    };
+    let imported = normalize_wrapper(&document);
+    assert!(imported.unavailable_profiles.is_empty());
+    let profile = &imported.profiles[0];
+    assert_eq!(profile.name, "Fixture");
+    assert_eq!(
+        profile.security.fingerprint().unwrap().name(),
+        "firefox-148"
+    );
+    let ProxyTransport::Xhttp { packet, .. } = &profile.transport else {
+        panic!("expected XHTTP transport");
+    };
+    let rendered = crate::xhttp_wire::render(&packet.wire);
+    assert_eq!(rendered["uplink_http_method"], "GET");
+    assert_eq!(rendered["session_id_length"], "18-24");
+    assert_eq!(rendered["x_padding_bytes"], "100-1000");
+    assert_eq!(rendered["xmux"]["max_connections"], 3);
+    assert_eq!(crate::xhttp_wire::restore(&rendered).unwrap(), packet.wire);
+    assert_eq!(
+        normalize(profile.source.as_ref().unwrap().expose()).unwrap()[0].transport,
+        profile.transport
+    );
+
+    document["routing"]["rules"] = serde_json::json!([{"outboundTag":"blocked","domain":["test"]}]);
+    let result = normalize_wrapper(&document);
     assert!(result.profiles.is_empty());
     let row = &result.unavailable_profiles[0];
-    assert_eq!(
-        row.reason,
-        ProfileUnavailableReason::UnsupportedXhttpUploadMethod
-    );
+    assert_eq!(row.reason, ProfileUnavailableReason::Unsupported);
     assert_eq!(
         row.probe_endpoint().map(|endpoint| endpoint.address()),
         Some(("localhost", 7443))
@@ -569,7 +1111,7 @@ fn wrapped_json_subscription_preserves_order_and_checks_total_profile_count() {
     let routed = serde_json::json!([source[0].clone(), {"outbounds":[leaf("Route")],"routing":{"rules":[{}]}}]);
     assert_eq!(
         normalize(routed.to_string()),
-        Err(ClientError::UnsupportedFeature)
+        Err(ClientError::InvalidSubscription)
     );
 }
 

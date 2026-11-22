@@ -218,7 +218,7 @@ fn parse_transport(stream: &Value, network: &str) -> Result<ProxyTransport, Clie
     }
 }
 
-pub(super) fn unsupported_xhttp_upload_method(outbound: &Value) -> bool {
+pub(super) fn uses_xhttp(outbound: &Value) -> bool {
     let Some(stream) = outbound.get("streamSettings") else {
         return false;
     };
@@ -226,13 +226,7 @@ pub(super) fn unsupported_xhttp_upload_method(outbound: &Value) -> bool {
         .ok()
         .flatten()
         .and_then(Value::as_str);
-    if !matches!(network, Some("xhttp" | "splithttp")) {
-        return false;
-    }
-    only_one(stream.get("xhttpSettings"), stream.get("splithttpSettings"))
-        .ok()
-        .flatten()
-        .is_some_and(xhttp::unsupported_upload_method)
+    matches!(network, Some("xhttp" | "splithttp"))
 }
 
 fn parse_xhttp(value: Option<&Value>) -> Result<ProxyTransport, ClientError> {

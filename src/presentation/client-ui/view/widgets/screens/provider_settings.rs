@@ -41,6 +41,7 @@ impl ViewFrame<'_> {
             draft.pending = None;
             if snapshot.last_error.is_none() {
                 draft.title = None;
+                draft.url = None;
             }
         }
         let enabled = !snapshot.busy && draft.pending.is_none();
@@ -128,6 +129,8 @@ fn subscription_editor(
         source.title.as_str()
     };
     let title = draft.title.get_or_insert_with(|| original_title.to_owned());
+    let saved_url = source.url.expose();
+    let mut input = draft.url.take().unwrap_or_else(|| saved_url.to_owned());
     let mut intent = None;
     group(ui, None, |ui| {
         ui.weak(tr(Key::SubscriptionName));
@@ -139,26 +142,16 @@ fn subscription_editor(
         );
         ui.weak(tr(Key::SubscriptionAutomaticName));
         ui.add_space(8.0);
-        ui.weak(tr(Key::SubscriptionAddress));
-        let response = ui
-            .add_enabled_ui(enabled && address_blocked.is_none(), |ui| {
-                masked_url_input(
-                    ui,
-                    &mut draft.url,
-                    "subscription-primary-url",
-                    tr(Key::SubscriptionUrlHint),
-                );
-            })
-            .response;
-        if let Some(reason) = address_blocked {
-            response.on_disabled_hover_text(tr(reason));
-        }
-        ui.weak(tr(Key::EditUrlHelp));
+        subscription_url_field(ui, locale, &mut input, &mut draft.url_visible, enabled);
         ui.add_space(6.0);
-        let url = import::payload(&draft.url);
+        let url = import::payload(&input);
+        let url_changed = url != saved_url;
         let title = title.trim();
-        let changed = title != original_title || !url.is_empty();
-        let writable = enabled && (url.is_empty() || address_blocked.is_none());
+        let changed = title != original_title || url_changed;
+        let writable = enabled && !url.is_empty() && (!url_changed || address_blocked.is_none());
+        if url_changed && address_blocked == Some(Key::SubscriptionDisconnectFirst) {
+            ui.weak(tr(Key::SubscriptionDisconnectFirst));
+        }
         if ui
             .add_enabled(changed && writable, egui::Button::new(tr(Key::Save)))
             .clicked()
@@ -166,18 +159,62 @@ fn subscription_editor(
             intent = Some(Intent::SaveSubscription {
                 subscription_uuid: Some(source.subscription_uuid.clone()),
                 title: title.to_owned(),
-                url: url.to_owned(),
+                url: if url_changed {
+                    url.to_owned()
+                } else {
+                    String::new()
+                },
             });
-            draft.url.clear();
         }
     });
+    draft.url = (import::payload(&input) != saved_url).then_some(input);
     intent
 }
 
-fn masked_url_input(ui: &mut egui::Ui, url: &mut String, id_salt: &str, hint: &str) {
+fn subscription_url_field(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    input: &mut String,
+    visible: &mut bool,
+    editable: bool,
+) {
+    let tr = |key| localization::text(locale, key);
+    ui.weak(tr(Key::SubscriptionAddress));
+    ui.add_enabled_ui(editable, |ui| {
+        url_input(
+            ui,
+            input,
+            "subscription-primary-url",
+            tr(Key::SubscriptionUrlHint),
+            !*visible,
+        );
+    });
+    ui.horizontal_wrapped(|ui| {
+        let key = if *visible {
+            Key::HideSubscriptionUrl
+        } else {
+            Key::ShowSubscriptionUrl
+        };
+        if ui.button(tr(key)).clicked() {
+            *visible = !*visible;
+        }
+        let url = import::payload(input);
+        if ui
+            .add_enabled(
+                !url.is_empty(),
+                egui::Button::new(tr(Key::CopySubscriptionUrl)),
+            )
+            .clicked()
+        {
+            ui.ctx().copy_text(url.to_owned());
+        }
+    });
+}
+
+fn url_input(ui: &mut egui::Ui, url: &mut String, id_salt: &str, hint: &str, masked: bool) {
     let mut field = roomy_input(url, ui.available_width())
         .id_salt(id_salt)
-        .password(true)
+        .password(masked)
         .hint_text(hint)
         .show(ui);
     field.state.clear_undoer();
@@ -202,11 +239,12 @@ fn fallback_form(
         };
         ui.weak(tr(status));
         ui.add_enabled_ui(enabled, |ui| {
-            masked_url_input(
+            url_input(
                 ui,
                 &mut draft.fallback_url,
                 "subscription-fallback-url",
                 tr(Key::SubscriptionUrlHint),
+                true,
             );
         });
         ui.horizontal_wrapped(|ui| {

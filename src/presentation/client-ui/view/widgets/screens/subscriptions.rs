@@ -11,7 +11,7 @@ use vpn_presentation::session::{
 use super::ViewFrame;
 use crate::view::settings_state::{PingDisplay, ServerSort};
 use crate::view::theme;
-use crate::view::view_model::{CatalogOperation, ConfigurationKind};
+use crate::view::view_model::{ConfigurationKind, ProbeScope};
 use crate::view::widgets::controls::{SELECTOR_HEIGHT, more_button, paint_spinner, roomy_input};
 use crate::view::widgets::icons::{Icon, paint_failure_badge};
 use vpn_presentation::localization::{Key, Locale};
@@ -38,12 +38,11 @@ const TOOL_SPINNER_SIZE: f32 = 15.0;
 
 impl<'a> ViewFrame<'a> {
     pub(super) fn home_catalog(&mut self, ui: &mut egui::Ui) {
-        self.catalog_header(ui);
-        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-        egui::ScrollArea::vertical()
-            .id_salt("server-catalog")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.catalog_contents(ui));
+        let layout = self.layout;
+        layout.scroll_frame().show(ui, |ui| {
+            layout.scroll_header(ui, |ui| self.catalog_header(ui));
+            layout.vertical_scroll(ui, "server-catalog", |ui| self.catalog_contents(ui));
+        });
     }
 
     pub(super) fn catalog_header(&mut self, ui: &mut egui::Ui) {
@@ -241,7 +240,7 @@ impl<'a> ViewFrame<'a> {
         };
         match self.snapshot.profile_latencies.get(profile_uuid) {
             Some(ProfileLatency::Reachable { milliseconds }) => (0, *milliseconds),
-            Some(ProfileLatency::TimedOut | ProfileLatency::Unreachable) => (1, 0),
+            Some(_) => (1, 0),
             None => (2, 0),
         }
     }
@@ -489,16 +488,8 @@ impl<'a> ViewFrame<'a> {
         }
         self.ping_menu_item(ui, Key::PingTest, Some(uuid));
         self.subscription_pin_action(ui, uuid);
-        if self
-            .subscription_operation(
-                ui,
-                Key::CopySubscriptionUrl,
-                (!self.view.preview).then_some(Key::Unsupported),
-            )
-            .clicked()
-        {
-            ui.ctx()
-                .copy_text("https://provider.example/subscription".to_owned());
+        if ui.button(self.tr(Key::CopySubscriptionUrl)).clicked() {
+            ui.ctx().copy_text(subscription.url.expose().to_owned());
             ui.close();
         }
         if self
@@ -531,7 +522,7 @@ impl<'a> ViewFrame<'a> {
     }
 
     pub(super) fn subscription_change_blocked(&self, subscription_uuid: &str) -> Option<Key> {
-        if self.snapshot.busy || self.view.catalog_operation.is_some() {
+        if self.snapshot.busy || self.view.subscription_refresh.is_some() {
             return Some(Key::Working);
         }
         self.snapshot
@@ -544,7 +535,7 @@ impl<'a> ViewFrame<'a> {
                     .find(|profile| &profile.profile_uuid == active)
             })
             .filter(|active| active.subscription_uuid.as_deref() == Some(subscription_uuid))
-            .map(|_| Key::ModeFinishFirst)
+            .map(|_| Key::SubscriptionDisconnectFirst)
     }
 
     fn subscription_operation(
@@ -778,14 +769,14 @@ impl<'a> ViewFrame<'a> {
     }
 
     pub(in crate::view::widgets) fn refreshing_subscription(&self) -> Option<&str> {
-        match &self.view.catalog_operation {
-            Some((CatalogOperation::Refresh(uuid), _)) => Some(uuid),
-            _ => None,
-        }
+        self.view
+            .subscription_refresh
+            .as_ref()
+            .map(|(uuid, _)| uuid.as_str())
     }
 
     fn ping_blocked(&self, subscription_uuid: Option<&str>) -> Option<Key> {
-        if let Some(reason) = self.tcp_probe_blocked() {
+        if let Some(reason) = self.probe_blocked() {
             return Some(reason);
         }
         let has_profiles = self.snapshot.profiles.iter().any(|profile| {
@@ -816,8 +807,8 @@ impl<'a> ViewFrame<'a> {
         let blocked = self.ping_blocked(subscription_uuid);
         let button = catalog_icon_button(ui, self.tr(key), blocked.is_none());
         let center = button.rect.center();
-        let probing = matches!(&self.view.catalog_operation,
-            Some((CatalogOperation::ProbeGroup(current), _)) if current.as_deref() == subscription_uuid);
+        let probing = matches!(&self.view.probe,
+            Some((ProbeScope::Group(current), _)) if current.as_deref() == subscription_uuid);
         if probing {
             paint_spinner(ui, center, TOOL_SPINNER_SIZE);
         } else {
@@ -1012,6 +1003,7 @@ mod tests {
                     subscription_uuid: uuid.clone(),
                     title: title.into(),
                     auto_title: false,
+                    url: vpn_presentation::session::Secret::new("https://provider.example/sub"),
                     profile_count: 0,
                     last_error: None,
                 }],
@@ -1053,6 +1045,7 @@ mod tests {
             subscription_uuid: "subscription".into(),
             title: "Test subscription".into(),
             auto_title: false,
+            url: vpn_presentation::session::Secret::new("https://provider.example/sub"),
             profile_count: 0,
             last_error: None,
         };
@@ -1097,10 +1090,7 @@ mod tests {
 
             let idle = render(&mut state, &snapshot);
             let request = RequestId(1);
-            state.catalog_operation = Some((
-                CatalogOperation::Refresh(subscription.subscription_uuid.clone()),
-                request,
-            ));
+            state.subscription_refresh = Some((subscription.subscription_uuid.clone(), request));
             snapshot.busy = true;
             assert_eq!(render(&mut state, &snapshot), idle);
             snapshot.busy = false;
@@ -1111,6 +1101,20 @@ mod tests {
             );
             assert_eq!(render(&mut state, &snapshot), idle);
         }
+    }
+
+    #[test]
+    fn probe_keeps_subscription_controls_available() {
+        let mut state = ViewState::default();
+        state.probe = Some((ProbeScope::Profile("profile".into()), RequestId(1)));
+        let snapshot = ClientSnapshot {
+            busy: false,
+            profile_probe_available: true,
+            ..Default::default()
+        };
+        let view = ViewFrame::new(&mut state, &snapshot, false, None);
+        assert_eq!(view.subscription_change_blocked("subscription"), None);
+        assert_eq!(view.probe_blocked(), Some(Key::Working));
     }
 
     #[test]
@@ -1152,6 +1156,57 @@ mod tests {
             };
             assert_eq!(render(false), render(true));
         }
+    }
+
+    #[test]
+    fn subscription_menu_copies_the_saved_url_in_the_regular_client() {
+        let url = "https://provider.example/sub?key=fixture";
+        let subscription = SubscriptionSummary {
+            subscription_uuid: "subscription".into(),
+            title: "Test subscription".into(),
+            auto_title: false,
+            url: vpn_presentation::session::Secret::new(url),
+            profile_count: 0,
+            last_error: None,
+        };
+        let context = egui::Context::default();
+        let snapshot = ClientSnapshot::default();
+        let mut state = ViewState::default();
+        let mut view = ViewFrame::new(&mut state, &snapshot, false, None);
+        let label = view.tr(Key::CopySubscriptionUrl);
+        let mut render = |events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.subscription_menu(ui, &subscription),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let first = render(Vec::new());
+        let pos = first
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("copy subscription URL button");
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(vec![egui::Event::PointerMoved(pos), click(true)]);
+        let output = render(vec![click(false)]);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == url)
+        }));
     }
 
     #[test]

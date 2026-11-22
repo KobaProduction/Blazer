@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use secret_service::{EncryptionType, SecretService};
 use sha2::{Digest, Sha256};
-use vpn_infrastructure::client_store::CatalogProtection;
+use vpn_infrastructure::client_store::{
+    CatalogProtection,
+    sealing::{KEY_BYTES, SealedCatalogCipher},
+};
 use vpn_presentation::session::ClientError;
 use zeroize::Zeroizing;
-
-use crate::catalog_cipher::{KEY_BYTES, SealedCatalogCipher};
 
 type CatalogKey = Zeroizing<[u8; KEY_BYTES]>;
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(4);

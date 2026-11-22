@@ -5,7 +5,6 @@ param(
     [string]$OutputDirectory,
     [string]$BlazeCorePath,
     [string]$BlazeCoreLicensePath,
-    [string]$WintunLicensePath,
     [switch]$ReleaseArchive,
     [switch]$PreviewArchive
 )
@@ -13,7 +12,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'release-version.ps1')
-$wintunLicenseSha256 = '183ADAC21E7D96C508C8FD34D394B7B6708BC81564AD1BAD61AB66143A008CD2'
 if (($ReleaseArchive -or $PreviewArchive) -and $Configuration -ne 'Release') { throw 'Release archives require -Configuration Release.' }
 if ($ReleaseArchive -and $PreviewArchive) { throw 'Select one archive channel.' }
 
@@ -124,29 +122,28 @@ function Get-ApprovedSha256 {
     $digest.Groups[1].Value
 }
 
-function Resolve-WintunLicense {
-    if ($WintunLicensePath) {
-        $candidates = @([IO.Path]::GetFullPath($WintunLicensePath, $workingDirectory))
-    } else {
-        $cargoHome = if ($env:CARGO_HOME) {
-            [IO.Path]::GetFullPath($env:CARGO_HOME, $repo)
-        } else {
-            Join-Path $env:USERPROFILE '.cargo'
-        }
-        $registrySource = Join-Path $cargoHome 'registry/src'
-        $candidates = @(if (Test-Path -LiteralPath $registrySource -PathType Container) {
-            Get-ChildItem -LiteralPath $registrySource -Directory | ForEach-Object {
-                Join-Path $_.FullName 'wintun-bindings-0.7.40/wintun/LICENSE.txt'
-            }
-        })
+function Update-BlazerShellIcon {
+    param([string]$Executable)
+
+    if (-not ('BlazerPackageShell' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class BlazerPackageShell {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern void SHChangeNotify(int eventId, uint flags, string path, IntPtr unused);
+
+    public static void NotifyExecutableUpdated(string path) {
+        const int SHCNE_UPDATEITEM = 0x2000;
+        const uint SHCNF_PATHW = 0x0005;
+        const uint SHCNF_FLUSH = 0x1000;
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, path, IntPtr.Zero);
     }
-    foreach ($candidate in $candidates) {
-        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
-            (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash -eq $wintunLicenseSha256) {
-            return $candidate
-        }
+}
+'@
     }
-    throw 'Approved Wintun 0.14.1 prebuilt-binaries license is missing or has changed. Supply the official LICENSE.txt with -WintunLicensePath.'
+    [BlazerPackageShell]::NotifyExecutableUpdated($Executable)
 }
 
 function Build-Package {
@@ -165,29 +162,23 @@ function Build-Package {
         $env:BLAZER_PREVIEW_BUILD = $previousPreview
     }
 
-    $driver = Join-Path $buildDirectory 'wintun.dll'
-    if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
-        throw "The client build did not provide a Wintun DLL at '$driver'."
-    }
-    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $driver).Hash -ne $driverSha256) {
-        throw "Wintun SHA-256 does not match APPROVED_WINTUN_SHA256: '$driver'."
-    }
-    $driverLicense = Resolve-WintunLicense
-
     $directory = Join-Path $output 'client'
     $files = @(
         @{ Name = 'LICENSE'; Source = Join-Path $repo 'LICENSE' }
         @{ Name = 'LICENSE-NOTO-EMOJI'; Source = Join-Path $repo 'src/presentation/client-ui/assets/LICENSE-NOTO-EMOJI.txt' }
         @{ Name = 'LICENSE-BLAZECORE'; Source = $BlazeCoreLicensePath }
         @{ Name = 'blazecore.exe'; Source = $BlazeCorePath; ExpectedSha256 = $engineSha256 }
-        @{ Name = 'wintun.dll'; Source = $driver; ExpectedSha256 = $driverSha256 }
-        @{ Name = 'LICENSE-WINTUN'; Source = $driverLicense; ExpectedSha256 = $wintunLicenseSha256 }
     )
     $files += @(Get-EngineNoticeFiles $BlazeCoreLicensePath)
     $executable = Join-Path $directory 'blazer.exe'
     Assert-PackageDirectory $directory
     Assert-PackageFileReplaceable $executable
-    $app = @{ Name = 'blazer.exe'; Source = Join-Path $buildDirectory 'blazer.exe' }
+    $appSource = Join-Path $buildDirectory 'blazer.exe'
+    $app = @{
+        Name = 'blazer.exe'
+        Source = $appSource
+        ExpectedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $appSource).Hash
+    }
     # For an existing package, replace the executable first so a late launch blocks publication.
     # A fresh package becomes launchable only after its companion files are installed.
     $files = if ([IO.File]::Exists($executable)) { @($app) + $files } else { $files + @($app) }
@@ -205,6 +196,9 @@ function Build-Package {
             $files += @{ Name = 'blazer-package.json'; Source = $marker }
         }
         Publish-Package 'client' $directory $files
+        if ($Configuration -eq 'Debug') {
+            Update-BlazerShellIcon $executable
+        }
         Write-Output $executable
         if ($ReleaseArchive -or $PreviewArchive) { Write-ReleaseArchive $directory $files }
     } finally {
@@ -261,7 +255,6 @@ function Resolve-EnginePackage {
     $neighbor = Split-Path -Parent $repo
     $engineSource = Join-Path $repo 'src/infrastructure/client_engine'
     $engineSha256 = Get-ApprovedSha256 (Join-Path $engineSource 'mod.rs') 'APPROVED_ENGINE_SHA256'
-    $driverSha256 = Get-ApprovedSha256 (Join-Path $engineSource 'windows_tunnel.rs') 'APPROVED_WINTUN_SHA256'
     if (-not $BlazeCorePath) {
         $candidates = @(
             (Join-Path $neighbor "BlazeCore/downstream/artifacts/$target/release/blazecore.exe")
@@ -301,14 +294,13 @@ function Resolve-EnginePackage {
     if (-not (Test-Path -LiteralPath $BlazeCoreLicensePath -PathType Leaf)) {
         throw "BlazeCore LICENSE is missing at '$BlazeCoreLicensePath'. Supply it with -BlazeCoreLicensePath."
     }
-    @{ Engine = $BlazeCorePath; License = $BlazeCoreLicensePath; EngineHash = $engineSha256; DriverHash = $driverSha256 }
+    @{ Engine = $BlazeCorePath; License = $BlazeCoreLicensePath; EngineHash = $engineSha256 }
 }
 
 $enginePackage = Resolve-EnginePackage
 $BlazeCorePath = $enginePackage.Engine
 $BlazeCoreLicensePath = $enginePackage.License
 $engineSha256 = $enginePackage.EngineHash
-$driverSha256 = $enginePackage.DriverHash
 
 $mutex = [Threading.Mutex]::new($false, 'Local\Blazer.WindowsPackage')
 $locked = $false

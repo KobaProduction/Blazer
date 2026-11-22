@@ -23,7 +23,7 @@ const PREVIEW_GEOSITE: &str =
 
 impl<'a> ViewFrame<'a> {
     fn routing_writable(&self) -> bool {
-        self.snapshot.routing.local_proxy_available
+        (self.snapshot.routing.local_proxy_available || self.snapshot.routing.tun_available)
             && !self.snapshot.busy
             && !self.view.preview
             && !self.view.routing_reconnect.awaiting_edit()
@@ -117,13 +117,21 @@ impl<'a> ViewFrame<'a> {
 
     fn routing_status(&mut self, ui: &mut egui::Ui) {
         let routing = &self.snapshot.routing;
-        let active = self.snapshot.active_mode == Some(ConnectionMode::LocalProxy);
+        let active = match self.snapshot.active_mode {
+            Some(ConnectionMode::LocalProxy) => routing.local_proxy_available,
+            Some(ConnectionMode::Tun) => routing.tun_available,
+            _ => false,
+        };
         let saved = if active {
             routing.saved_for_active.as_ref()
         } else {
             routing.saved.as_ref()
         };
-        ui.weak(self.tr(Key::RoutingLocalProxyOnly));
+        if routing.tun_available {
+            ui.weak(self.tr(Key::RoutingLocalProxyAndTun));
+        } else if routing.local_proxy_available {
+            ui.weak(self.tr(Key::RoutingLocalProxyOnly));
+        }
         group(ui, None, |ui| {
             setting_row(ui, self.tr(Key::RoutingSavedProfile), |ui| {
                 ui.add(egui::Label::new(self.routing_revision_label(saved)).truncate());

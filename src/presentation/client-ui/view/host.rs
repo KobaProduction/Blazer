@@ -3,8 +3,10 @@ use std::sync::Arc;
 use vpn_presentation::localization::Key;
 
 pub type ImportResult = Result<Option<String>, Key>;
-pub type PickQrImage = Arc<dyn Fn(&str) -> ImportResult + Send + Sync>;
+pub type PickImportFile = Arc<dyn Fn(&str) -> ImportResult + Send + Sync>;
 pub type CaptureQrImage = Arc<dyn Fn() -> ImportResult + Send + Sync>;
+pub type ScanQrCamera = Arc<dyn Fn(&str, &str, &str, &str) -> bool + Send + Sync>;
+pub type OpenUpdates = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub enum AppUpdateStatus {
@@ -34,9 +36,11 @@ pub struct AppUpdates {
 #[derive(Default)]
 pub struct UiHost {
     pub device_info: Option<String>,
-    pub reports_wintun: bool,
-    pub pick_qr_image: Option<PickQrImage>,
+    pub pick_configuration: Option<PickImportFile>,
+    pub pick_qr_image: Option<PickImportFile>,
     pub capture_qr_image: Option<CaptureQrImage>,
+    pub scan_qr_camera: Option<ScanQrCamera>,
     pub request_tunnel_start: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub app_updates: Option<AppUpdates>,
+    pub open_updates: Option<OpenUpdates>,
 }

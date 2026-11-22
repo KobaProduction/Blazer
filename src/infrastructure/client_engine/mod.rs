@@ -14,22 +14,45 @@ use vpn_domain::routing::RoutingProfile;
 use wait_timeout::ChildExt;
 use zeroize::Zeroizing;
 
+#[cfg(any(target_os = "android", test))]
+mod android_profile;
+#[cfg(any(target_os = "ios", target_os = "macos", test))]
+mod apple_tunnel;
 mod config;
+mod graph;
+mod least_ping;
+#[cfg(target_os = "linux")]
+mod linux_tunnel;
+#[cfg(any(target_os = "linux", windows))]
+mod managed_tunnel;
 mod private;
+#[cfg(not(target_os = "android"))]
+mod profile_probe;
 mod routing;
 mod runtime_process;
+#[cfg(windows)]
+mod system_proxy;
 mod vless_encryption;
 #[cfg(windows)]
 mod windows_tunnel;
+
+pub use least_ping::{
+    Monitor as ObservatoryMonitor, Prepared as PreparedObservatory, SelectorControl,
+    SelectorControlFuture,
+};
 #[cfg(windows)]
-pub use windows_tunnel::{WindowsEngine, bundled_wintun_version, tun2proxy_version};
+pub use system_proxy::{recover_system_proxy, run_system_proxy_guard};
 
 use self::runtime_process::RuntimeProcess;
 
 #[cfg(target_os = "android")]
-pub use config::render_android_tunnel;
+pub use android_profile::validate_android_profile;
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub use apple_tunnel::render_apple_tunnel;
+#[cfg(target_os = "android")]
+pub use config::{render_android_tunnel, render_android_tunnel_records};
 
-pub(crate) fn validate_profile(profile: &ProxyProfile) -> Result<(), ClientError> {
+pub fn validate_profile(profile: &ProxyProfile) -> Result<(), ClientError> {
     config::validate(profile)
 }
 
@@ -37,9 +60,9 @@ pub(crate) fn validate_profile(profile: &ProxyProfile) -> Result<(), ClientError
 mod import_tests;
 
 pub const APPROVED_ENGINE_SHA256: &str =
-    "C437B5B9D665B8117A2E70934317A6CDA0F0BDCD7BEF07469188AC25592862CB";
-pub const APPROVED_ENGINE_VERSION: &str = "0.3.7+gcce97a2c4c1c.dirty";
-pub const APPROVED_ENGINE_REVISION: &str = "cce97a2c4c1c3bd0a07807f37a7caf3876c79110";
+    "CCA53DEC21570B841D2CBC9F414410CA5CB84F1209865296B31DCB89837E5DCF";
+pub const APPROVED_ENGINE_VERSION: &str = "0.3.7+gb90121c0406c";
+pub const APPROVED_ENGINE_REVISION: &str = "b90121c0406c406bb8eeee90e8405bdb9a508c59";
 
 #[derive(Clone)]
 pub struct TrustedEngineSpec {
@@ -53,8 +76,14 @@ pub struct BlazeCoreProcess {
     data_directory: PathBuf,
     child: Option<RuntimeProcess>,
     private_directory: Option<private::PrivateDirectory>,
-    local_address: Option<SocketAddr>,
+    connection: Option<RunningConnection>,
     port_override: u16,
+    #[cfg(not(target_os = "android"))]
+    pending_observer: Option<least_ping::Prepared>,
+    #[cfg(not(target_os = "android"))]
+    observer: Option<least_ping::Monitor>,
+    #[cfg(windows)]
+    system_proxy: Option<system_proxy::SystemProxyGuard>,
 }
 
 impl BlazeCoreProcess {
@@ -64,16 +93,42 @@ impl BlazeCoreProcess {
             data_directory,
             child: None,
             private_directory: None,
-            local_address: None,
+            connection: None,
             port_override,
+            #[cfg(not(target_os = "android"))]
+            pending_observer: None,
+            #[cfg(not(target_os = "android"))]
+            observer: None,
+            #[cfg(windows)]
+            system_proxy: None,
         }
+    }
+
+    fn prepare_profile(
+        &mut self,
+        profile: &ProxyProfile,
+        document: &[u8],
+        cancel: &Cancellation,
+    ) -> Result<private::PrivateDirectory, ClientError> {
+        #[cfg(not(target_os = "android"))]
+        if let Some(prepared) = least_ping::Prepared::for_profile(profile)? {
+            let mut records: Vec<serde_json::Value> =
+                serde_json::from_slice(document).map_err(|_| ClientError::EngineInvalid)?;
+            prepared.decorate(&mut records)?;
+            let document = Zeroizing::new(
+                serde_json::to_vec(&records).map_err(|_| ClientError::EngineInvalid)?,
+            );
+            let directory = self.prepare(&document, cancel)?;
+            self.pending_observer = Some(prepared);
+            return Ok(directory);
+        }
+        let _ = profile;
+        self.prepare(document, cancel)
     }
 
     fn prepare(
         &self,
-        profile: &ProxyProfile,
-        port: u16,
-        routing: Option<&RoutingProfile>,
+        document: &[u8],
         cancel: &Cancellation,
     ) -> Result<private::PrivateDirectory, ClientError> {
         if !self.spec.source_path.is_absolute() {
@@ -104,20 +159,72 @@ impl BlazeCoreProcess {
             &self.spec.expected_version,
             cancel,
         )?;
-        let document = Zeroizing::new(config::render(profile, port, routing)?);
         let path = directory.0.join("profile.yaml");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|_| ClientError::StorageWrite)?;
-        file.write_all(&document)
+        file.write_all(document)
             .and_then(|()| file.sync_all())
             .map_err(|_| ClientError::StorageWrite)?;
         let mut check = engine_command(&executable, &directory.0);
         check.arg("check").arg(&path);
         run_bounded(check, cancel, ClientError::EngineInvalid)?;
         Ok(directory)
+    }
+
+    fn start_config(
+        &mut self,
+        directory: private::PrivateDirectory,
+        connection: RunningConnection,
+        cancel: &Cancellation,
+    ) -> Result<(), ClientError> {
+        #[cfg(target_os = "android")]
+        cancel.check()?;
+        #[cfg(not(target_os = "android"))]
+        if let Err(error) = cancel.check() {
+            self.pending_observer = None;
+            return Err(error);
+        }
+        let profile_path = directory.0.join("profile.yaml");
+        #[cfg(not(target_os = "android"))]
+        let mut observer = self.pending_observer.take();
+        #[cfg(not(target_os = "android"))]
+        if let Some(prepared) = observer.as_mut() {
+            prepared.release_ports();
+        }
+        let (child, stdout) = RuntimeProcess::spawn(&directory.0, &profile_path)
+            .map_err(|_| ClientError::EngineStart)?;
+        self.child = Some(child);
+        self.private_directory = Some(directory);
+        let result = watch_readiness(stdout).and_then(|marker| {
+            wait_until_ready(
+                self.child.as_mut().ok_or(ClientError::EngineStart)?,
+                connection,
+                cancel,
+                marker,
+            )
+        });
+        // The pinned engine has finished loading the config and reload is disabled.
+        let result = result
+            .and_then(|()| fs::remove_file(profile_path).map_err(|_| ClientError::StorageWrite));
+        if let Err(error) = result {
+            self.stop()?;
+            return Err(error);
+        }
+        self.connection = Some(connection);
+        #[cfg(not(target_os = "android"))]
+        if let Some(prepared) = observer {
+            match prepared.start(cancel) {
+                Ok(monitor) => self.observer = Some(monitor),
+                Err(error) => {
+                    self.stop()?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -126,8 +233,8 @@ impl ClientEnginePort for BlazeCoreProcess {
         vpn_application::session::ModeCapabilities {
             local_proxy: true,
             local_http_proxy: true,
-            system_proxy: false,
-            tun: false,
+            system_proxy: cfg!(windows),
+            tun: cfg!(any(target_os = "linux", windows)),
         }
     }
 
@@ -135,8 +242,29 @@ impl ClientEnginePort for BlazeCoreProcess {
         validate_profile(profile)
     }
 
-    fn supports_local_proxy_routing(&self) -> bool {
+    #[cfg(not(target_os = "android"))]
+    fn supports_tunnel_probe(&self) -> bool {
         true
+    }
+
+    fn supports_active_tunnel_probe(&self) -> bool {
+        cfg!(windows)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn probe_tunnel(
+        &self,
+        profile: &ProxyProfile,
+        active: Option<&ProxyProfile>,
+        reuse_active_proxy: bool,
+        settings: &vpn_domain::client::ProbeSettings,
+        cancel: &Cancellation,
+    ) -> Result<Duration, ClientError> {
+        self.probe_tunnel_with_settings(profile, active, reuse_active_proxy, settings, cancel)
+    }
+
+    fn supports_routing(&self, mode: ConnectionMode) -> bool {
+        self.capabilities().supports(mode)
     }
 
     fn start(
@@ -157,11 +285,21 @@ impl ClientEnginePort for BlazeCoreProcess {
         routing: Option<&RoutingProfile>,
         cancel: &Cancellation,
     ) -> Result<(), ClientError> {
-        if mode != ConnectionMode::LocalProxy {
-            return Err(ClientError::UnsupportedMode);
-        }
         if self.child.is_some() {
             return Err(ClientError::DisconnectFirst);
+        }
+        #[cfg(windows)]
+        if mode == ConnectionMode::Tun {
+            return windows_tunnel::start(self, profile, routing, cancel);
+        }
+        #[cfg(target_os = "linux")]
+        if mode == ConnectionMode::Tun {
+            return linux_tunnel::start(self, profile, routing, cancel);
+        }
+        if mode != ConnectionMode::LocalProxy
+            && !(cfg!(windows) && mode == ConnectionMode::SystemProxy)
+        {
+            return Err(ClientError::UnsupportedMode);
         }
         let configured_port = if self.port_override != 0 {
             self.port_override
@@ -173,55 +311,74 @@ impl ClientEnginePort for BlazeCoreProcess {
         let address = reservation
             .local_addr()
             .map_err(|_| ClientError::EngineStart)?;
-        let directory = self.prepare(profile, address.port(), routing, cancel)?;
-        cancel.check()?;
-        let profile_path = directory.0.join("profile.yaml");
+        let document = Zeroizing::new(config::render(profile, address.port(), routing)?);
+        let directory = self.prepare_profile(profile, &document, cancel)?;
         drop(reservation);
-        let (child, stdout) = RuntimeProcess::spawn(&directory.0, &profile_path)
-            .map_err(|_| ClientError::EngineStart)?;
-        self.child = Some(child);
-        self.private_directory = Some(directory);
-        let result = watch_readiness(stdout).and_then(|marker| {
-            wait_for_socks(
-                self.child.as_mut().ok_or(ClientError::EngineStart)?,
-                address,
-                cancel,
-                marker,
-            )
-        });
-        // Blazer starts the runtime with reload disabled. Readiness confirms the config is loaded.
-        let result = result
-            .and_then(|()| fs::remove_file(profile_path).map_err(|_| ClientError::StorageWrite));
-        if let Err(error) = result {
-            self.stop()?;
-            return Err(error);
+        self.start_config(directory, RunningConnection::LocalProxy(address), cancel)?;
+        #[cfg(windows)]
+        if mode == ConnectionMode::SystemProxy {
+            match system_proxy::SystemProxyGuard::start(address, cancel) {
+                Ok(guard) => {
+                    self.system_proxy = Some(guard);
+                    self.connection = Some(RunningConnection::SystemProxy(address));
+                }
+                Err(error) => {
+                    self.stop()?;
+                    return Err(error);
+                }
+            }
         }
-        self.local_address = Some(address);
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), ClientError> {
+        #[cfg(not(target_os = "android"))]
+        {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.stop()?;
+            }
+            self.observer = None;
+            self.pending_observer = None;
+        }
+        #[cfg(windows)]
+        if let Some(guard) = self.system_proxy.as_mut() {
+            guard.stop()?;
+            self.system_proxy = None;
+        }
         if let Some(child) = self.child.as_mut() {
             child.stop()?;
         }
         self.child = None;
-        self.local_address = None;
+        self.connection = None;
         self.private_directory = None;
         Ok(())
     }
 
     fn poll(&mut self) -> Result<EngineRuntime, ClientError> {
+        #[cfg(not(target_os = "android"))]
+        if let Some(observer) = self.observer.as_ref()
+            && observer.is_finished()
+        {
+            let error = observer.failure();
+            self.stop()?;
+            return Err(error);
+        }
+        #[cfg(windows)]
+        if let Some(guard) = self.system_proxy.as_mut()
+            && !guard.is_running()?
+        {
+            self.stop()?;
+            return Err(ClientError::SystemProxyRestoreFailed);
+        }
         let Some(child) = self.child.as_mut() else {
             return Ok(EngineRuntime::Stopped);
         };
         if !child.is_running().map_err(|_| ClientError::EngineStopped)? {
-            self.child = None;
-            self.local_address = None;
-            self.private_directory = None;
+            self.stop()?;
             return Ok(EngineRuntime::Stopped);
         }
-        self.local_address
-            .map(|address| EngineRuntime::Running(RunningConnection::LocalProxy(address)))
+        self.connection
+            .map(EngineRuntime::Running)
             .ok_or(ClientError::EngineReadiness)
     }
 }
@@ -385,41 +542,55 @@ fn watch_readiness(stdout: impl Read + Send + 'static) -> Result<Receiver<()>, C
     Ok(receiver)
 }
 
-fn wait_for_socks(
+fn wait_until_ready(
     child: &mut RuntimeProcess,
-    address: SocketAddr,
+    connection: RunningConnection,
     cancel: &Cancellation,
     marker: Receiver<()>,
 ) -> Result<(), ClientError> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut owned_listener_ready = false;
+    let timeout = match connection {
+        RunningConnection::Tun => Duration::from_secs(20),
+        _ => Duration::from_secs(8),
+    };
+    let deadline = Instant::now() + timeout;
+    let mut servers_ready = false;
     loop {
-        cancel.check()?;
-        if !child.is_running().map_err(|_| ClientError::EngineStart)? {
-            return Err(ClientError::EngineStart);
-        }
+        check_starting_process(child, cancel)?;
         let wait = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(25));
         if wait.is_zero() {
             return Err(ClientError::EngineReadiness);
         }
-        if !owned_listener_ready {
+        if !servers_ready {
             match marker.recv_timeout(wait) {
-                Ok(()) => owned_listener_ready = true,
+                Ok(()) => servers_ready = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ClientError::EngineStart),
             }
         }
-        if owned_listener_ready && socks_ready(address) {
-            cancel.check()?;
-            if !child.is_running().map_err(|_| ClientError::EngineStart)? {
-                return Err(ClientError::EngineStart);
+        let ready = match connection {
+            RunningConnection::LocalProxy(address) | RunningConnection::SystemProxy(address) => {
+                socks_ready(address)
             }
-            return Ok(());
+            RunningConnection::Tun => true,
+        };
+        if ready {
+            return check_starting_process(child, cancel);
         }
         std::thread::sleep(wait);
     }
+}
+
+fn check_starting_process(
+    child: &mut RuntimeProcess,
+    cancel: &Cancellation,
+) -> Result<(), ClientError> {
+    cancel.check()?;
+    if !child.is_running().map_err(|_| ClientError::EngineStart)? {
+        return Err(ClientError::EngineStart);
+    }
+    Ok(())
 }
 
 fn socks_ready(address: SocketAddr) -> bool {

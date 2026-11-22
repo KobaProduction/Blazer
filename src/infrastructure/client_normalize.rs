@@ -11,14 +11,19 @@ use vpn_domain::client::{
     TlsFingerprint, WebSocketEarlyData,
 };
 
+mod amnezia;
 mod blazecore;
 mod hysteria2;
 mod json;
 mod links;
 mod sing_box;
 mod subscription;
+mod wireguard;
 mod xhttp;
 mod xray;
+mod xray_graph;
+
+pub(crate) use json::parse_value as parse_json_value;
 
 #[cfg(test)]
 mod tests;
@@ -27,15 +32,25 @@ pub struct SubscriptionNormalizer;
 
 impl ClientNormalizerPort for SubscriptionNormalizer {
     fn normalize(&self, input: &[u8]) -> Result<Vec<ProxyProfile>, ClientError> {
-        parse_input(input, parse_document)
+        let mut profiles = parse_input(input, parse_document)?;
+        prepare_editor_sources(&mut profiles)?;
+        Ok(profiles)
     }
 
     fn normalize_subscription(
         &self,
         input: &[u8],
     ) -> Result<vpn_application::client::NormalizedSubscription, ClientError> {
-        subscription::parse(input)
+        let mut result = subscription::parse(input)?;
+        prepare_editor_sources(&mut result.profiles)?;
+        Ok(result)
     }
+}
+
+fn prepare_editor_sources(profiles: &mut [ProxyProfile]) -> Result<(), ClientError> {
+    profiles
+        .iter_mut()
+        .try_for_each(crate::native_profile::set_wireguard_editor_source)
 }
 
 fn parse_input<T>(
@@ -43,7 +58,11 @@ fn parse_input<T>(
     parse_document: impl FnOnce(&str) -> Result<T, ClientError>,
 ) -> Result<T, ClientError> {
     let text = document_text(input)?;
-    if text.starts_with(['{', '[']) || text.contains("://") {
+    if text.starts_with(['{', '['])
+        || text.contains("://")
+        || wireguard::recognizes(text)
+        || json::recognizes_native_yaml(text)
+    {
         return parse_document(text);
     }
     parse_document(document_text(&decode_base64(text)?)?)
@@ -62,8 +81,14 @@ fn document_text(input: &[u8]) -> Result<&str, ClientError> {
 }
 
 fn parse_document(text: &str) -> Result<Vec<ProxyProfile>, ClientError> {
+    if wireguard::recognizes(text) {
+        return wireguard::parse(text).map(|profile| vec![profile]);
+    }
     if text.starts_with(['{', '[']) {
         return json::parse_document(text);
+    }
+    if json::recognizes_native_yaml(text) {
+        return json::parse_native_yaml(text);
     }
     collect_profiles(
         text.lines().map(str::trim).filter(|line| !line.is_empty()),
@@ -100,7 +125,7 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, ClientError> {
         .ok_or(ClientError::InvalidSubscription)
 }
 
-fn endpoint_host(host: &str) -> Result<String, ClientError> {
+pub(crate) fn endpoint_host(host: &str) -> Result<String, ClientError> {
     if host.is_empty() || host.len() > 253 {
         return Err(ClientError::InvalidSubscription);
     }
@@ -155,6 +180,7 @@ fn make_profile(
     Ok(ProxyProfile {
         profile_uuid: String::new(),
         name,
+        source: None,
         host,
         port,
         protocol,
@@ -338,7 +364,7 @@ fn websocket(
     })
 }
 
-fn bracket_host(host: &str) -> String {
+pub(crate) fn bracket_host(host: &str) -> String {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]")
     } else {

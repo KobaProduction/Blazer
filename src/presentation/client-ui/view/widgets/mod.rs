@@ -17,14 +17,12 @@ use super::settings_state::RoutingProfileDraft;
 use super::settings_state::{DesktopTheme, RoutingMutation};
 #[cfg(all(debug_assertions, feature = "demo"))]
 use super::view_model::ConfigurationPreview;
-use super::view_model::{CatalogOperation, Screen, SettingsPage, ViewState};
+use super::view_model::{ProbeScope, Screen, SettingsPage, ViewState};
 use layout::ViewportLayout;
 use vpn_presentation::Controller;
 use vpn_presentation::localization::{self, Key, Locale};
 use vpn_presentation::model::{self, ErrorNotice, Intent};
-#[cfg(all(debug_assertions, feature = "demo"))]
-use vpn_presentation::session::RequestId;
-use vpn_presentation::session::{ClientSnapshot, ConnectionMode};
+use vpn_presentation::session::{ClientSnapshot, ConnectionMode, RequestId};
 
 #[cfg(all(debug_assertions, feature = "demo"))]
 pub use controls::selector_capture_id;
@@ -91,7 +89,7 @@ impl BlazerView {
             }
             Some(ConfigurationPreview::EditProfile) => {
                 if let Some(profile) = snapshot.profiles.first() {
-                    self.state.open_profile_editor(&profile.profile_uuid);
+                    self.state.open_profile_editor(profile);
                 }
             }
             None => {}
@@ -155,7 +153,12 @@ impl BlazerView {
 
     #[cfg(all(debug_assertions, feature = "demo"))]
     pub fn preview_subscription_refresh(&mut self, uuid: &str, request: RequestId) {
-        self.state.catalog_operation = Some((CatalogOperation::Refresh(uuid.to_owned()), request));
+        self.state.subscription_refresh = Some((uuid.to_owned(), request));
+    }
+
+    #[cfg(all(debug_assertions, feature = "demo"))]
+    pub fn preview_profile_probe(&mut self, uuid: &str, request: RequestId) {
+        self.state.probe = Some((ProbeScope::Profile(uuid.to_owned()), request));
     }
 
     fn handle_intent(&mut self, ctx: &egui::Context, intent: Intent) {
@@ -176,7 +179,9 @@ impl BlazerView {
     fn submit(&mut self, intent: Intent) {
         self.state.dismissed_error = None;
         let removal = matches!(intent, Intent::ConfirmRemoval(_));
+        let update_profile = matches!(intent, Intent::UpdateProfile { .. });
         let save_telemetry = matches!(intent, Intent::SetTelemetrySettings { .. });
+        let save_probe = matches!(intent, Intent::SetProbeSettings(_));
         let save_provider_settings = matches!(
             intent,
             Intent::SaveSubscription {
@@ -202,13 +207,17 @@ impl BlazerView {
             Intent::RemoveRoutingProfile { .. } => Some(RoutingMutation::Remove),
             _ => None,
         };
-        let catalog_operation = match &intent {
-            Intent::RefreshSubscription(uuid) => Some(CatalogOperation::Refresh(uuid.clone())),
-            Intent::ProbeProfile(uuid) => Some(CatalogOperation::ProbeProfile(uuid.clone())),
-            Intent::ProbeProfiles(uuid) => Some(CatalogOperation::ProbeGroup(uuid.clone())),
+        let refresh = match &intent {
+            Intent::RefreshSubscription(uuid) => Some(uuid.clone()),
+            _ => None,
+        };
+        let probe = match &intent {
+            Intent::ProbeProfile(uuid) => Some(ProbeScope::Profile(uuid.clone())),
+            Intent::ProbeProfiles(uuid) => Some(ProbeScope::Group(uuid.clone())),
             _ => None,
         };
         let request = self.controller.submit(intent);
+        self.track_configuration_submission(configuration, update_profile, request);
         self.state
             .track_provider_edit(request.filter(|_| save_provider_settings));
         self.state.routing_reconnect.track_edit(
@@ -219,27 +228,53 @@ impl BlazerView {
                 .pending_reconnect
                 .as_ref(),
         );
-        if save_telemetry && let Some(draft) = &mut self.state.telemetry_settings {
-            draft.pending = request;
-        }
+        self.track_settings_submission(save_telemetry, save_probe, request);
         if request.is_some() && removal {
             self.state.removal = None;
-        }
-        if configuration && let Some(draft) = &mut self.state.configuration {
-            draft.pending = request;
-            draft.feedback = self
-                .controller
-                .submission_error()
-                .map(|error| (self.controller.snapshot().revision, error));
         }
         if let Some(pending) = request.zip(routing) {
             self.state.desktop_settings.routing.pending = Some(pending);
         }
-        if let Some(pending) = catalog_operation.zip(request) {
-            if matches!(&pending.0, CatalogOperation::Refresh(_)) {
-                self.state.refreshed_subscription = None;
-            }
-            self.state.catalog_operation = Some(pending);
+        if let Some(pending) = refresh.zip(request) {
+            self.state.refreshed_subscription = None;
+            self.state.subscription_refresh = Some(pending);
+        }
+        if let Some(pending) = probe.zip(request) {
+            self.state.probe = Some(pending);
+        }
+    }
+
+    fn track_settings_submission(
+        &mut self,
+        telemetry: bool,
+        probe: bool,
+        request: Option<RequestId>,
+    ) {
+        if telemetry && let Some(draft) = &mut self.state.telemetry_settings {
+            draft.pending = request;
+        }
+        if probe && let Some(draft) = &mut self.state.desktop_settings.ping.draft {
+            draft.pending = request;
+        }
+    }
+
+    fn track_configuration_submission(
+        &mut self,
+        importing: bool,
+        editing: bool,
+        request: Option<RequestId>,
+    ) {
+        let feedback = self
+            .controller
+            .submission_error()
+            .map(|error| (self.controller.snapshot().revision, error));
+        if importing && let Some(draft) = &mut self.state.configuration {
+            draft.pending = request;
+            draft.feedback = feedback;
+        }
+        if editing && let Some(draft) = &mut self.state.profile_editor {
+            draft.pending = request;
+            draft.feedback = feedback;
         }
     }
 
@@ -276,6 +311,8 @@ impl BlazerView {
         self.state.set_language(self.controller.snapshot().language);
         self.state
             .update_configuration_request(self.controller.snapshot());
+        self.state
+            .update_profile_request(self.controller.snapshot());
         let snapshot = self.controller.snapshot();
         self.state.routing_reconnect.update(snapshot);
         let refresh_error = self.state.update_catalog_request(snapshot, Instant::now());
@@ -356,35 +393,19 @@ impl<'a> ViewFrame<'a> {
             self.screen(ui, screen);
             return;
         }
-        let scrolls = screen != Screen::Settings(SettingsPage::Logs);
-        let inset = self.layout.content_inset();
-        let mut outer_inset = egui::Margin::same(inset);
-        let content_inset = if scrolls {
-            outer_inset.right = 0;
-            egui::Margin {
-                right: inset,
-                ..egui::Margin::ZERO
-            }
-        } else {
-            egui::Margin::ZERO
-        };
-        egui::Frame::new().inner_margin(outer_inset).show(ui, |ui| {
+        let layout = self.layout;
+        if screen == Screen::Settings(SettingsPage::Logs) {
             egui::Frame::new()
-                .inner_margin(content_inset)
-                .show(ui, |ui| self.workspace_header(ui, screen));
-            if scrolls {
-                ui.spacing_mut().scroll = egui::style::ScrollStyle {
-                    content_margin: content_inset,
-                    dormant_handle_opacity: 0.45,
-                    ..egui::style::ScrollStyle::solid()
-                };
-                egui::ScrollArea::vertical()
-                    .id_salt(screen)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.screen(ui, screen));
-            } else {
-                self.screen(ui, screen);
-            }
+                .inner_margin(layout.content_inset())
+                .show(ui, |ui| {
+                    self.workspace_header(ui, screen);
+                    self.screen(ui, screen);
+                });
+            return;
+        }
+        layout.scroll_frame().show(ui, |ui| {
+            layout.scroll_header(ui, |ui| self.workspace_header(ui, screen));
+            layout.vertical_scroll(ui, screen, |ui| self.screen(ui, screen));
         });
     }
 
@@ -422,6 +443,41 @@ impl<'a> ViewFrame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_content_stays_below_the_top_header_at_each_width() {
+        for width in [980.0, 760.0, 360.0] {
+            let context = egui::Context::default();
+            let snapshot = ClientSnapshot {
+                busy: false,
+                ..Default::default()
+            };
+            let mut state = ViewState::default();
+            state.navigate(Screen::Settings(SettingsPage::Index));
+            let mut view = ViewFrame::new(&mut state, &snapshot, false, None);
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 840.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| view.render(ui),
+            );
+            output.textures_delta.clear();
+            let first_section = view.tr(Key::InterfaceSettings);
+            assert!(
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                        if text.galley.job.text == first_section
+                            && text.visual_bounding_rect().top() < 140.0
+                            && shape.clip_rect.contains_rect(text.visual_bounding_rect()))
+                }),
+                "first settings section is outside the top of the viewport at {width} points",
+            );
+        }
+    }
 
     #[test]
     fn resizing_keeps_navigation_and_sidebar_preference() {

@@ -21,11 +21,10 @@ const APP: &str = "blazer.exe";
 const MANIFEST: &str = "blazer-package.json";
 const ZIP_NAME: &str = "release.zip";
 const WORK_PREFIX: &str = ".blazer-update-";
-const REQUIRED: &[&str] = &[APP, "blazecore.exe", "wintun.dll", "LICENSE", MANIFEST];
+const REQUIRED: &[&str] = &[APP, "blazecore.exe", "LICENSE", MANIFEST];
 const EXTRAS: &[&str] = &[
     "LICENSE-BLAZECORE",
     "LICENSE-NOTO-EMOJI",
-    "LICENSE-WINTUN",
     "THIRD_PARTY_NOTICES.md",
 ];
 

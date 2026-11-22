@@ -26,6 +26,8 @@ vpn-presentation.workspace = true
 [target.'cfg(windows)'.dependencies]
 client-cli.workspace = true
 client-core.workspace = true
+eframe = { workspace = true, features = ["persistence"] }
+egui-winit = { version = "=0.37.0", default-features = false, features = ["serde"] }
 reqwest = { workspace = true, features = ["blocking", "native-tls"] }
 serde.workspace = true
 serde_json.workspace = true

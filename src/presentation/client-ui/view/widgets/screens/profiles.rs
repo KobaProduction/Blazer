@@ -5,7 +5,7 @@ use vpn_presentation::session::{
 use super::ViewFrame;
 use crate::view::settings_state::PingDisplay;
 use crate::view::theme;
-use crate::view::view_model::CatalogOperation;
+use crate::view::view_model::ProbeScope;
 use crate::view::widgets::connection_controls::CONNECTION_CONTROL_WIDTH;
 use crate::view::widgets::controls::SELECTOR_HEIGHT;
 use crate::view::widgets::flags::{paint_flag, server_name};
@@ -118,9 +118,7 @@ impl ViewFrame<'_> {
                 };
                 egui::RichText::new(text).color(theme::ping_color(ui.visuals(), milliseconds))
             }
-            Some(ProfileLatency::TimedOut | ProfileLatency::Unreachable) => {
-                egui::RichText::new("×").color(theme::ping_failure_color(ui.visuals()))
-            }
+            Some(_) => egui::RichText::new("×").color(theme::ping_failure_color(ui.visuals())),
             None => egui::RichText::new("TCP"),
         };
         let tooltip = latency.map_or_else(
@@ -130,7 +128,7 @@ impl ViewFrame<'_> {
                 self.message(Key::PingTcpResult, &[("result", &result)])
             },
         );
-        let blocked = self.tcp_probe_blocked();
+        let blocked = self.probe_blocked();
         let button = egui::Button::new(label)
             .frame_when_inactive(false)
             .truncate();
@@ -185,7 +183,6 @@ impl ViewFrame<'_> {
         compact: bool,
         display: PingDisplay,
     ) {
-        let latency = self.profile_latency(profile);
         let (width, top) = if compact {
             (49.0, rect.center().y)
         } else {
@@ -195,19 +192,28 @@ impl ViewFrame<'_> {
             egui::pos2(rect.right() - width, top),
             egui::pos2(rect.right() - 6.0, rect.bottom()),
         );
+        self.profile_ping_at(ui, ping_rect, profile, display);
+    }
+
+    fn profile_ping_at(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        profile: &ProfileSummary,
+        display: PingDisplay,
+    ) {
         if self.profile_probe_pending(profile) {
             egui::Spinner::new().paint_at(
                 ui,
-                egui::Rect::from_center_size(
-                    ping_rect.right_center() - egui::vec2(8.0, 0.0),
-                    egui::Vec2::splat(14.0),
-                ),
+                egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(14.0)),
             );
             return;
         }
-        ui.put(ping_rect, |ui: &mut egui::Ui| {
-            self.ping_indicator(ui, latency, display, egui::Align::Max)
-        });
+        if let Some(latency) = self.profile_latency(profile) {
+            ui.put(rect, |ui: &mut egui::Ui| {
+                self.ping_indicator(ui, latency, display)
+            });
+        }
     }
 
     pub(super) fn selected_profile_ping(
@@ -215,34 +221,29 @@ impl ViewFrame<'_> {
         ui: &mut egui::Ui,
         profile: Option<&ProfileSummary>,
     ) {
-        if let Some(profile) = profile {
+        if let Some(profile) = profile
+            && (self.profile_probe_pending(profile) || self.profile_latency(profile).is_some())
+        {
             let provider = profile
                 .subscription_uuid
                 .as_deref()
                 .and_then(|uuid| self.subscription_provider(uuid))
                 .map(|provider| &provider.display);
-            self.ping_indicator(
-                ui,
-                self.profile_latency(profile),
-                self.group_ping_display(provider),
-                egui::Align::Center,
-            );
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+            self.profile_ping_at(ui, rect, profile, self.group_ping_display(provider));
         }
     }
 
     fn ping_indicator(
         &self,
         ui: &mut egui::Ui,
-        latency: Option<ProfileLatency>,
+        latency: ProfileLatency,
         display: PingDisplay,
-        align: egui::Align,
     ) -> egui::Response {
-        let description = latency.map_or_else(
-            || self.tr(Key::PingNotMeasured).to_owned(),
-            |latency| self.ping_status(latency),
-        );
+        let description = self.ping_status(latency);
         let value = match latency {
-            Some(ProfileLatency::Reachable { milliseconds }) => {
+            ProfileLatency::Reachable { milliseconds } => {
                 let color = theme::ping_color(ui.visuals(), milliseconds);
                 if display == PingDisplay::Icon {
                     return ping_badge(ui, color, false).on_hover_text(description);
@@ -251,7 +252,7 @@ impl ViewFrame<'_> {
                     .small()
                     .color(color)
             }
-            Some(ProfileLatency::TimedOut | ProfileLatency::Unreachable) => {
+            _ => {
                 let color = theme::ping_failure_color(ui.visuals());
                 let badge = ping_badge(ui, color, true);
                 badge.widget_info(|| {
@@ -259,13 +260,12 @@ impl ViewFrame<'_> {
                 });
                 return badge.on_hover_text(description);
             }
-            None => egui::RichText::new("—").small().weak(),
         };
         ui.add(
             egui::Label::new(value)
                 .selectable(false)
                 .truncate()
-                .halign(align),
+                .halign(egui::Align::Center),
         )
         .on_hover_text(description)
     }
@@ -279,7 +279,7 @@ impl ViewFrame<'_> {
         let pending = profile.is_some_and(|profile| self.profile_probe_pending(profile));
         let label = self.tr(Key::PingTest);
         let mut button = egui::Button::new(label).truncate();
-        if pending {
+        if pending && !prominent {
             let spinner = egui::Atom::paint(egui::Vec2::splat(14.0), |ui, args| {
                 egui::Spinner::new().paint_at(ui, args.rect);
             });
@@ -311,7 +311,7 @@ impl ViewFrame<'_> {
     }
 
     fn profile_ping_unavailable(&self, profile: Option<&ProfileSummary>) -> Option<Key> {
-        self.tcp_probe_blocked().or_else(|| {
+        self.probe_blocked().or_else(|| {
             if self.snapshot.profiles.is_empty() {
                 Some(Key::NoAvailableServers)
             } else {
@@ -320,12 +320,15 @@ impl ViewFrame<'_> {
         })
     }
 
-    pub(super) fn tcp_probe_blocked(&self) -> Option<Key> {
-        if self.snapshot.busy || self.view.catalog_operation.is_some() {
+    pub(super) fn probe_blocked(&self) -> Option<Key> {
+        if self.snapshot.busy
+            || self.view.subscription_refresh.is_some()
+            || self.view.probe.is_some()
+        {
             Some(Key::Working)
         } else if self.snapshot.cleanup_required {
             Some(Key::CleanupRequired)
-        } else if !self.snapshot.tcp_probe_available {
+        } else if !self.snapshot.profile_probe_available {
             Some(Key::PingTunUnavailable)
         } else {
             None
@@ -344,9 +347,9 @@ impl ViewFrame<'_> {
     }
 
     fn probe_pending(&self, id: &str, subscription_uuid: Option<&str>) -> bool {
-        match &self.view.catalog_operation {
-            Some((CatalogOperation::ProbeProfile(uuid), _)) => uuid == id,
-            Some((CatalogOperation::ProbeGroup(uuid), _)) => uuid
+        match &self.view.probe {
+            Some((ProbeScope::Profile(uuid), _)) => uuid == id,
+            Some((ProbeScope::Group(uuid), _)) => uuid
                 .as_deref()
                 .is_none_or(|uuid| subscription_uuid == Some(uuid)),
             _ => false,
@@ -361,6 +364,13 @@ impl ViewFrame<'_> {
             ),
             ProfileLatency::TimedOut => self.tr(Key::PingTimedOut).to_owned(),
             ProfileLatency::Unreachable => self.tr(Key::PingUnreachable).to_owned(),
+            ProfileLatency::CheckUnreachable => self.tr(Key::PingCheckUnreachable).to_owned(),
+            ProfileLatency::Failed(error) => {
+                let notice = model::ErrorNotice::Client(error);
+                notice
+                    .text_with_code(self.view.locale, notice.key())
+                    .into_owned()
+            }
         }
     }
 
@@ -375,7 +385,7 @@ impl ViewFrame<'_> {
         let response = ui.put(rect, button);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
         if response.on_hover_text(label).clicked() {
-            self.view.open_profile_editor(&profile.profile_uuid);
+            self.view.open_profile_editor(profile);
         }
     }
 }

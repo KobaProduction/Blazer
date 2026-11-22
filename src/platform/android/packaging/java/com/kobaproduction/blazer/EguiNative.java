@@ -6,7 +6,7 @@ import java.lang.ref.WeakReference;
 final class EguiNative {
     private static volatile WeakReference<EguiSurface> surface = new WeakReference<>(null);
 
-    static native long create();
+    static native long create(boolean updatesAvailable);
     static native void destroy(long handle);
     static native void surfaceReset(long handle);
     static native byte[] render(long handle, int width, int height, float density, long nowNanos);
@@ -33,7 +33,7 @@ final class EguiNative {
 
     static boolean requestVpnConsent(long handle) {
         EguiSurface view = find(handle);
-        return view != null && view.postToActivity(EguiActivity::requestVpnConsent);
+        return view != null && view.postToActivity(MainActivity::requestVpnConsent);
     }
 
     static boolean pickQrImage(long handle, String title) {
@@ -41,8 +41,14 @@ final class EguiNative {
         return view != null && view.postToActivity(activity -> activity.pickQrImage(title));
     }
 
-    static boolean captureQrImage(long handle) {
-        return false;
+    static boolean scanQrCamera(long handle, String title, String hint, String cancel, String error) {
+        EguiSurface view = find(handle);
+        return view != null && view.postToActivity(activity -> activity.scanQrCamera(title, hint, cancel, error));
+    }
+
+    static void openUpdates(long handle, String error) {
+        EguiSurface view = find(handle);
+        if (view != null) view.postToActivity(activity -> activity.openUpdates(error));
     }
 
     private static EguiSurface find(long handle) {

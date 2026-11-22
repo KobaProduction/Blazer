@@ -17,8 +17,9 @@ try {
         'blazer' = @('client-ui', 'client-cli', 'client-core', 'vpn-application', 'vpn-presentation', 'vpn-image-import')
         'vpn-android' = @('client-ui', 'client-core', 'vpn-infrastructure', 'vpn-presentation', 'vpn-image-import')
         'blazer-linux' = @('client-ui', 'client-core', 'vpn-infrastructure', 'vpn-presentation')
-        'blazer-macos-preview' = @('client-ui', 'vpn-presentation')
-        'blazer-ios-preview' = @('client-ui', 'vpn-presentation')
+        'blazer-macos' = @('client-ui', 'client-core', 'vpn-application', 'vpn-infrastructure', 'vpn-presentation')
+        'blazer-ios' = @('client-ui', 'client-core', 'vpn-application', 'vpn-infrastructure', 'vpn-presentation')
+        'observer-bridge' = @('vpn-application', 'vpn-infrastructure')
         'client-cli' = @('client-core')
     }
     $manifestLocations = @{
@@ -32,8 +33,9 @@ try {
         'blazer' = 'src/platform/windows/Cargo.toml'
         'vpn-android' = 'src/platform/android/Cargo.toml'
         'blazer-linux' = 'src/platform/linux/Cargo.toml'
-        'blazer-macos-preview' = 'src/platform/macos/Cargo.toml'
-        'blazer-ios-preview' = 'src/platform/ios/Cargo.toml'
+        'blazer-macos' = 'src/platform/macos/Cargo.toml'
+        'blazer-ios' = 'src/platform/ios/Cargo.toml'
+        'observer-bridge' = 'src/platform/apple/observer-bridge/Cargo.toml'
         'client-cli' = 'src/presentation/client-cli/Cargo.toml'
     }
     $workspacePackages = @($metadata.packages | Where-Object { $_.id -in $metadata.workspace_members })
@@ -57,9 +59,9 @@ try {
                 $dependency.name -notin @('chrono', 'egui', 'epaint_default_fonts', 'image', 'serde_json', 'skrifa')) {
                 throw "Unexpected dependency in the shared egui view: $($dependency.name)"
             }
-            if ($package.name -in @('blazer-macos-preview', 'blazer-ios-preview') -and
+            if ($package.name -in @('blazer-macos', 'blazer-ios') -and
                 $dependency.name -eq 'eframe' -and 'glow' -in $dependency.features) {
-                throw 'Apple previews must use the Metal renderer'
+                throw 'Apple clients must use the Metal renderer'
             }
         }
         $manifest = Get-Content -Raw -LiteralPath $package.manifest_path

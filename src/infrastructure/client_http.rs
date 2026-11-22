@@ -171,7 +171,9 @@ impl HttpTransport {
 }
 
 #[cfg(target_os = "android")]
-fn android_tls(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, ClientError> {
+pub(crate) fn android_tls(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::ClientBuilder, ClientError> {
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),

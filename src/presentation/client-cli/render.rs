@@ -1,6 +1,7 @@
 use client_core::{
-    ClientError, ClientSnapshot, ConnectionMode, DnsPolicy, Language, ProfileLatency,
-    ProfileUnavailableReason, RouteAction, RouteTarget, RoutingSelection,
+    ClientError, ClientSnapshot, ConnectionMode, DnsPolicy, Language, ProbeHttpMethod, ProbeMethod,
+    ProbeStrategy, ProfileLatency, ProfileUnavailableReason, RouteAction, RouteTarget,
+    RoutingSelection,
 };
 
 use crate::command::Completion;
@@ -17,6 +18,14 @@ pub fn help() {
     println!("  language en|ru");
     println!("  mode proxy|system-proxy|tun");
     println!("  local-proxy-port <0-65535>");
+    println!("  ping-settings");
+    println!(
+        "  ping-settings <auto|tcp|icmp|proxy> <get|head> <timeout-ms> <warmup|cold> <1-5> <last|min|average|median>"
+    );
+    println!("Ping settings updates read the HTTP(S) check URL from stdin until EOF.");
+    println!(
+        "HTTPS probes always warm the connection before recording samples, including when cold is selected."
+    );
     println!("  routing | routing show <profile-uuid>");
     println!("  routing add <title> | routing edit <profile-uuid> <title>");
     println!("  routing copy <profile-uuid> <title>");
@@ -162,6 +171,38 @@ pub fn settings(snapshot: &ClientSnapshot) {
     println!("language={language}");
     println!("mode={mode}");
     println!("local_proxy_port={}", snapshot.local_proxy_port);
+    ping_settings(snapshot);
+}
+
+pub fn ping_settings(snapshot: &ClientSnapshot) {
+    let settings = &snapshot.probe_settings;
+    let method = match settings.method {
+        ProbeMethod::Automatic => "auto",
+        ProbeMethod::Tcp => "tcp",
+        ProbeMethod::Icmp => "icmp",
+        ProbeMethod::Proxy => "proxy",
+    };
+    let http_method = match settings.http_method {
+        ProbeHttpMethod::Get => "get",
+        ProbeHttpMethod::Head => "head",
+    };
+    let strategy = match settings.strategy {
+        ProbeStrategy::Last => "last",
+        ProbeStrategy::Minimum => "min",
+        ProbeStrategy::Average => "average",
+        ProbeStrategy::Median => "median",
+    };
+    println!("ping_method={method}");
+    println!("ping_http_method={http_method}");
+    println!("ping_timeout_ms={}", settings.timeout_ms);
+    println!("ping_warmup={}", settings.warmup);
+    println!(
+        "ping_http_warmup_required={}",
+        settings.http_warmup_required()
+    );
+    println!("ping_attempts={}", settings.attempts);
+    println!("ping_strategy={strategy}");
+    println!("ping_url={}", settings.url);
 }
 
 pub fn diagnostics(snapshot: &ClientSnapshot) {
@@ -206,6 +247,7 @@ pub fn routing(snapshot: &ClientSnapshot, uuid: Option<&str>) -> Result<(), Clie
         "routing_local_proxy_supported={}",
         routing.local_proxy_available
     );
+    println!("routing_tun_supported={}", routing.tun_available);
     println!(
         "routing_global={}",
         routing
@@ -317,6 +359,8 @@ fn probe_result(result: &ProfileLatency) -> String {
         }
         ProfileLatency::TimedOut => "probe=timed_out".to_owned(),
         ProfileLatency::Unreachable => "probe=unreachable".to_owned(),
+        ProfileLatency::CheckUnreachable => "probe=check_target_unreachable".to_owned(),
+        ProfileLatency::Failed(error) => format!("probe=failed error={error:?}"),
     }
 }
 

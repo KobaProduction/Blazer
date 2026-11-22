@@ -21,6 +21,8 @@ pub fn ui_host() -> UiHost {
 #[cfg(windows)]
 mod windows {
     use std::fmt::Write as _;
+    use std::io::Read as _;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use client_ui::{UiHost, decode_qr_file};
@@ -35,7 +37,17 @@ mod windows {
         );
         UiHost {
             device_info: Some(device),
-            reports_wintun: true,
+            pick_configuration: Some(Arc::new(|title| {
+                rfd::FileDialog::new()
+                    .set_title(title)
+                    .add_filter(
+                        "VPN",
+                        &["conf", "vpn", "vpnuri", "json", "yaml", "yml", "txt"],
+                    )
+                    .pick_file()
+                    .map(read_configuration)
+                    .transpose()
+            })),
             pick_qr_image: Some(Arc::new(|title| {
                 rfd::FileDialog::new()
                     .set_title(title)
@@ -45,9 +57,24 @@ mod windows {
                     .transpose()
             })),
             capture_qr_image: Some(Arc::new(|| capture_qr_image().map(Some))),
-            request_tunnel_start: None,
-            app_updates: None,
+            ..UiHost::default()
         }
+    }
+
+    fn read_configuration(path: PathBuf) -> Result<String, Key> {
+        let limit = vpn_presentation::import::MAX_TEXT_BYTES;
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(limit as u64 + 1).read_to_end(&mut data))
+            .map_err(|_| Key::ImportUnreadableConfiguration)?;
+        if data.len() > limit {
+            return Err(Key::ImportFileTooLarge);
+        }
+        let text = String::from_utf8(data).map_err(|_| Key::ImportUnreadableConfiguration)?;
+        if vpn_presentation::import::payload(&text).is_empty() {
+            return Err(Key::ImportUnreadableConfiguration);
+        }
+        Ok(text)
     }
 
     fn capture_qr_image() -> Result<String, Key> {

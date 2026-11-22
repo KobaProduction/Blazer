@@ -1,6 +1,6 @@
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-use vpn_presentation::session::ClientError;
+use vpn_domain::client::ClientError;
 
 const FORMAT: &[u8] = b"BZLC01\0";
 const NONCE_BYTES: usize = 24;

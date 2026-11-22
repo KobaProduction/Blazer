@@ -11,9 +11,7 @@ use super::{
     ENTRY_WIDTH, GROUP_GAP, ViewFrame, choice, choice_row, divider, group, link_row, setting_row,
     toggle_row,
 };
-use crate::view::settings_state::{
-    AdvancedSettings, PerAppMode, PingDisplay, PingMethod, ServerSort, SubscriptionSettings,
-};
+use crate::view::settings_state::{AdvancedSettings, PerAppMode, ServerSort, SubscriptionSettings};
 use crate::view::view_model::SettingsPage;
 use crate::view::widgets::controls::roomy_input;
 
@@ -62,8 +60,6 @@ impl ViewFrame<'_> {
                 toggle_row(ui, locale, label, value);
                 divider(ui);
             }
-            self.mode_toggle(ui, Key::ModeSystemProxy, ConnectionMode::SystemProxy);
-            divider(ui);
             toggle_row(
                 ui,
                 locale,
@@ -214,33 +210,6 @@ impl ViewFrame<'_> {
                 });
             }
         });
-    }
-
-    pub(super) fn ping_settings(&mut self, ui: &mut egui::Ui) {
-        let locale = self.view.locale;
-        let ping = &mut self.view.desktop_settings.ping;
-        group(ui, None, |ui| {
-            choice_row(
-                ui,
-                locale,
-                Key::PingMethod,
-                &mut ping.method,
-                &[(PingMethod::Tcp, Key::PingTcp)],
-            );
-            divider(ui);
-            choice_row(
-                ui,
-                locale,
-                Key::PingDisplay,
-                &mut ping.display_override,
-                &[
-                    (None, Key::Automatic),
-                    (Some(PingDisplay::Time), Key::PingTime),
-                    (Some(PingDisplay::Icon), Key::PingIcon),
-                ],
-            );
-        });
-        ui.weak(localization::text(locale, Key::PingMethodHelp));
     }
 
     pub(super) fn inbounds(&mut self, ui: &mut egui::Ui) {

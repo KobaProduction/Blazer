@@ -12,7 +12,6 @@ path = "main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 client-ui.workspace = true
-chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 eframe = { workspace = true, features = ["clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"] }
 getrandom = "=0.4.3"
 secret-service = { version = "=5.2.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
