@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use vpn_presentation::localization::{Key, Locale};
 use vpn_presentation::model::{ErrorNotice, Removal, locale};
 use vpn_presentation::session::{
-    ClientError, ClientEvent, ClientEventKind, ClientSnapshot, Language, ProfileSummary, RequestId,
-    RoutingReconnect, TelemetryMode, TelemetrySettingsSummary,
+    ClientError, ClientEvent, ClientEventKind, ClientSnapshot, ConnectionStatus, Language,
+    ProfileSummary, RequestId, RoutingReconnect, TelemetryMode, TelemetrySettingsSummary,
 };
 
 use super::import_source::ImportSource;
@@ -276,6 +276,79 @@ pub(super) struct ProfileEditor {
     pub feedback: Option<(u64, ErrorNotice)>,
 }
 
+#[derive(Default)]
+pub(super) struct TunStartNotice {
+    connection_blocked: bool,
+    seen: Option<(Option<u64>, ErrorNotice)>,
+    current: Option<ErrorNotice>,
+}
+
+impl TunStartNotice {
+    pub fn update(&mut self, snapshot: &ClientSnapshot, error: Option<ErrorNotice>) {
+        self.update_connection_state(snapshot, error);
+        let Some(error) = error.filter(|error| error.is_tun_start_blocked()) else {
+            return;
+        };
+        let sequence = snapshot
+            .diagnostic_events
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                ClientEventKind::Failed(failure) if ErrorNotice::Client(failure) == error => {
+                    Some(event.sequence)
+                }
+                _ => None,
+            });
+        let is_new = match self.seen {
+            None => true,
+            Some((seen, previous)) => {
+                previous != error || sequence.is_some_and(|sequence| Some(sequence) != seen)
+            }
+        };
+        if is_new {
+            self.seen = Some((sequence, error));
+            self.current = Some(error);
+        }
+    }
+
+    fn update_connection_state(&mut self, snapshot: &ClientSnapshot, error: Option<ErrorNotice>) {
+        if snapshot.connection != ConnectionStatus::Failed {
+            self.connection_blocked = false;
+            return;
+        }
+        let outcome = snapshot
+            .diagnostic_events
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                ClientEventKind::ConnectionStarting
+                | ClientEventKind::Connected(_)
+                | ClientEventKind::Disconnected => Some(false),
+                ClientEventKind::Failed(error)
+                    if ErrorNotice::Client(error).is_tun_start_blocked() =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            });
+        self.connection_blocked = outcome.unwrap_or_else(|| {
+            error.map_or(self.connection_blocked, ErrorNotice::is_tun_start_blocked)
+        });
+    }
+
+    pub fn current(&self) -> Option<ErrorNotice> {
+        self.current
+    }
+
+    pub fn connection_blocked(&self) -> bool {
+        self.connection_blocked
+    }
+
+    pub fn dismiss(&mut self) {
+        self.current = None;
+    }
+}
+
 pub struct ViewState {
     pub(super) host: super::host::UiHost,
     pub screen: Screen,
@@ -296,6 +369,7 @@ pub struct ViewState {
     pub(super) refreshed_subscription: Option<(String, Instant)>,
     pub(super) subscription_errors: SubscriptionErrors,
     pub(super) dismissed_error: Option<(u64, ErrorNotice)>,
+    pub(super) tun_start_notice: TunStartNotice,
     pub(super) desktop_settings: DesktopSettings,
     pub subscription_routing_uuid: Option<String>,
     pub(super) preview: bool,
@@ -325,6 +399,7 @@ impl Default for ViewState {
             refreshed_subscription: None,
             subscription_errors: SubscriptionErrors::default(),
             dismissed_error: None,
+            tun_start_notice: TunStartNotice::default(),
             desktop_settings: DesktopSettings::default(),
             subscription_routing_uuid: None,
             preview: false,

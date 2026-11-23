@@ -19,6 +19,34 @@ const FIELD_HEIGHT: f32 = 32.0;
 const FOOTER_HEIGHT: f32 = 36.0;
 
 impl ViewFrame<'_> {
+    pub(super) fn tun_start_error_dialog(&mut self, ui: &egui::Ui) {
+        let Some(notice) = self.view.tun_start_notice.current() else {
+            return;
+        };
+        let modal = egui::Modal::new(egui::Id::unique("tun-start-error"))
+            .frame(dialog_frame(ui, 20))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(modal_content_width(ui, 420.0, 64.0));
+                ui.heading(self.tr(Key::CatalogBlazeCoreTun));
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(notice.text(self.view.locale)).wrap());
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(super::controls::action_button(
+                        ui,
+                        self.tr(Key::Close),
+                        104.0,
+                    ))
+                    .clicked()
+                })
+                .inner
+            });
+        if modal.inner || modal.should_close() {
+            self.view.tun_start_notice.dismiss();
+            ui.ctx().request_repaint();
+        }
+    }
+
     pub(super) fn subscription_error_dialog(&mut self, ui: &egui::Ui) {
         let Some(error) = self.view.subscription_errors.current() else {
             return;

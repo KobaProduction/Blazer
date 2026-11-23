@@ -174,6 +174,13 @@ pub enum ErrorNotice {
 }
 
 impl ErrorNotice {
+    pub fn is_tun_start_blocked(self) -> bool {
+        matches!(
+            self,
+            Self::Client(ClientError::TunConflict(_) | ClientError::TunPreflightUnavailable)
+        )
+    }
+
     pub fn key(self) -> Key {
         match self {
             Self::Local(key) => key,

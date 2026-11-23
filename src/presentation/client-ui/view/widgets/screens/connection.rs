@@ -74,11 +74,17 @@ impl<'a> ViewFrame<'a> {
     }
 
     fn connection_status(&self, ui: &mut egui::Ui) {
+        let connection = if self.snapshot.connection == ConnectionStatus::Failed
+            && self.view.tun_start_notice.connection_blocked()
+        {
+            ConnectionStatus::Disconnected
+        } else {
+            self.snapshot.connection
+        };
         ui.label(
-            egui::RichText::new(self.tr(viewmodel::state_key(
-                self.snapshot.connection,
-                self.snapshot.active_mode,
-            )))
+            egui::RichText::new(
+                self.tr(viewmodel::state_key(connection, self.snapshot.active_mode)),
+            )
             .size(17.0)
             .strong(),
         );

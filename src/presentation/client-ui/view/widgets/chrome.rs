@@ -290,6 +290,7 @@ impl ViewFrame<'_> {
 
     pub(super) fn error_banner(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = self.error
+            && !error.is_tun_start_blocked()
             && self.view.configuration.is_none()
             && self.view.dismissed_error != Some((self.snapshot.revision, error))
         {

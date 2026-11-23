@@ -364,6 +364,7 @@ impl<'a> ViewFrame<'a> {
         saving_mode: bool,
         error: Option<ErrorNotice>,
     ) -> Self {
+        view.tun_start_notice.update(snapshot, error);
         Self {
             view,
             snapshot,
@@ -376,10 +377,17 @@ impl<'a> ViewFrame<'a> {
 
     fn render(&mut self, ui: &mut egui::Ui) {
         self.layout = ViewportLayout::from_width(ui.available_width());
-        self.navigation(ui);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(ui.visuals().panel_fill))
-            .show(ui, |ui| self.workspace(ui));
+        let blocked = self.view.tun_start_notice.current().is_some();
+        ui.add_enabled_ui(!blocked, |ui| {
+            self.navigation(ui);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(ui.visuals().panel_fill))
+                .show(ui, |ui| self.workspace(ui));
+        });
+        if blocked {
+            self.tun_start_error_dialog(ui);
+            return;
+        }
         self.configuration_dialog(ui);
         self.profile_editor_dialog(ui);
         self.remove_confirmation(ui);
@@ -443,6 +451,102 @@ impl<'a> ViewFrame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_conflict_modal_is_exclusive_and_reopens_only_for_a_new_failure() {
+        use vpn_presentation::session::{
+            ClientError, ClientEvent, ClientEventKind, ConnectionStatus, TunAdapterKind,
+            TunConflict,
+        };
+
+        for error in [
+            ClientError::TunConflict(TunConflict::new(
+                "Other VPN",
+                "WireGuard Tunnel",
+                TunAdapterKind::WireGuard,
+            )),
+            ClientError::TunPreflightUnavailable,
+        ] {
+            let context = egui::Context::default();
+            let notice = ErrorNotice::Client(error);
+            let mut snapshot = ClientSnapshot {
+                connection: ConnectionStatus::Failed,
+                last_error: Some(error),
+                completed_request: Some(RequestId(1)),
+                diagnostic_events: vec![ClientEvent {
+                    sequence: 1,
+                    kind: ClientEventKind::Failed(error),
+                }],
+                busy: false,
+                ..Default::default()
+            };
+            let mut state = ViewState::default();
+            let mut shapes = Vec::new();
+            for _ in 0..6 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(980.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let mut view = ViewFrame::new(&mut state, &snapshot, false, Some(notice));
+                        view.render(ui);
+                        assert!(view.intent.is_none());
+                    },
+                );
+                output.textures_delta.clear();
+                shapes = output.shapes;
+            }
+            let texts: Vec<_> = shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| **text == notice.text(Locale::Russian))
+                    .count(),
+                1
+            );
+            assert!(!texts.contains(&localization::text(Locale::Russian, Key::Failed)));
+            assert_eq!(state.tun_start_notice.current(), Some(notice));
+            state.tun_start_notice.update(&snapshot, None);
+            assert_eq!(state.tun_start_notice.current(), Some(notice));
+            state.tun_start_notice.dismiss();
+            state.tun_start_notice.update(&snapshot, None);
+            assert!(state.tun_start_notice.connection_blocked());
+            snapshot.revision += 1;
+            snapshot.completed_request = Some(RequestId(2));
+            state.tun_start_notice.update(&snapshot, Some(notice));
+            assert_eq!(state.tun_start_notice.current(), None);
+            snapshot.diagnostic_events.clear();
+            state.tun_start_notice.update(&snapshot, Some(notice));
+            assert_eq!(state.tun_start_notice.current(), None);
+            snapshot.diagnostic_events.push(ClientEvent {
+                sequence: 3,
+                kind: ClientEventKind::Failed(error),
+            });
+            state.tun_start_notice.update(&snapshot, Some(notice));
+            assert_eq!(state.tun_start_notice.current(), Some(notice));
+            state.tun_start_notice.dismiss();
+            snapshot.diagnostic_events.push(ClientEvent {
+                sequence: 4,
+                kind: ClientEventKind::ConnectionStarting,
+            });
+            snapshot.diagnostic_events.push(ClientEvent {
+                sequence: 5,
+                kind: ClientEventKind::Failed(ClientError::EngineStart),
+            });
+            state.tun_start_notice.update(&snapshot, None);
+            assert!(!state.tun_start_notice.connection_blocked());
+        }
+    }
 
     #[test]
     fn settings_content_stays_below_the_top_header_at_each_width() {
