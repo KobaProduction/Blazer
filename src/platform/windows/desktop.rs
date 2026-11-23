@@ -10,7 +10,7 @@ mod window_state;
 
 pub use host::ui_host;
 #[cfg(windows)]
-pub use native::{apply_update, run, run_after_update, run_import};
+pub use native::{run, run_import};
 
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1014.0, 880.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [360.0, 420.0];

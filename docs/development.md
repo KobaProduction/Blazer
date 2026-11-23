@@ -23,6 +23,15 @@ unsafe внутри third-party GUI/SDK dependencies.
 Проверки выполняются локально, включая обязательный pre-push.
 GitHub Actions служит для сборки и публикации Windows-выпусков. Пуш в `main`
 обновляет prerelease `preview`, пуш тега `vX.Y` выпускает стабильную версию.
+Выпуск включает NSIS Setup и парные проверяемые update metadata. Внутренний ZIP
+сохраняется как источник закреплённого ядра следующей сборки, не как updater.
+Compiler NSIS 3.11 загружается только по закреплённому SHA-256;
+локально переиспользуется существующая установка. Контракт и приёмка:
+[Windows installation](windows-installation.md).
+Immutable Setup требует чистого checkout; стабильный выпуск дополнительно
+требует точного тега. Для проверки незакоммиченной реализации используйте
+`build-windows.ps1 -Configuration Release -DevelopmentInstaller`: артефакт
+с текущим клиентом блокирует установку до UAC/SCM и не является релизом.
 
 ## Команды и gate
 

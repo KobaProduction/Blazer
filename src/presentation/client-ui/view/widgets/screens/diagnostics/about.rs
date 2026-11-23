@@ -168,7 +168,7 @@ impl ViewFrame<'_> {
         let status = (updates.status)();
         let enabled = !matches!(
             status,
-            AppUpdateStatus::Checking | AppUpdateStatus::Downloading
+            AppUpdateStatus::Checking | AppUpdateStatus::Downloading | AppUpdateStatus::Installing
         );
         if self.update_check_row(ui, enabled) {
             (updates.check)();
@@ -208,8 +208,12 @@ impl ViewFrame<'_> {
             AppUpdateStatus::Unpublished => {
                 ui.label(self.tr(Key::AboutUpdateUnpublished));
             }
-            AppUpdateStatus::Failed => {
+            AppUpdateStatus::Failed { details } => {
                 ui.label(self.tr(Key::AboutUpdateFailed));
+                ui.add(egui::Label::new(details).wrap());
+            }
+            AppUpdateStatus::Cancelled { code } => {
+                ui.label(self.message(Key::AboutUpdateCancelled, &[("code", &code.to_string())]));
             }
             AppUpdateStatus::Available {
                 version,
@@ -228,6 +232,12 @@ impl ViewFrame<'_> {
                 {
                     download();
                 }
+                if updates.download.is_none() {
+                    ui.add(egui::Label::new(self.tr(Key::AboutUpdateManaged)).wrap());
+                }
+            }
+            AppUpdateStatus::Installing => {
+                ui.add(egui::Label::new(self.tr(Key::AboutUpdateInstalling)).wrap());
             }
             AppUpdateStatus::Downloading => {
                 ui.horizontal_wrapped(|ui| {

@@ -35,20 +35,6 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             }
             return Ok(client_cli::launch(arguments));
         }
-        Some(argument) if argument == "--apply-update" => {
-            if let Err(error) = blazer::apply_update(arguments) {
-                rfd::MessageDialog::new()
-                    .set_title(title)
-                    .set_description(format!("Не удалось установить обновление.\n{error}"))
-                    .set_level(rfd::MessageLevel::Error)
-                    .show();
-                return Ok(ExitCode::FAILURE);
-            }
-        }
-        Some(argument) if argument == "--finish-update" && arguments.len() == 1 => {
-            recover_proxy_for_window()?;
-            blazer::run_after_update(arguments.next().expect("one update directory argument"))?;
-        }
         #[cfg(all(debug_assertions, feature = "demo"))]
         Some(argument) if argument == "--demo" => demo_launch::run(arguments)?,
         Some(argument) => {

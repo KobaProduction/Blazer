@@ -15,8 +15,14 @@ pub enum AppUpdateStatus {
     Checking,
     Current,
     Unpublished,
-    Failed,
+    Failed {
+        details: String,
+    },
+    Cancelled {
+        code: i32,
+    },
     Downloading,
+    Installing,
     Ready {
         version: String,
     },

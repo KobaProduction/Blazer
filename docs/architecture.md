@@ -554,6 +554,10 @@ Application обращается к движку через `ClientEnginePort`. 
 версию в Rust при сборке. Она используется в `VERSIONINFO`, `--version`,
 GUI, User-Agent по умолчанию и OpenTelemetry. Для обычной локальной сборки
 источник версии — `workspace.package.version` в `Cargo.toml`.
+Identity-bearing Setup требует чистого checkout: stable — только `-ReleaseArchive`
+на теге, обычный `-Installer` — preview. `-DevelopmentInstaller` создаёт отдельный
+неустанавливаемый compile-check executable из текущих исходников; он не публикуется
+и не представляет dirty-байты как immutable release.
 Android берёт `versionName` из тега для прямого выпуска или debug APK с
 `-TaggedVersion`. Значение `versionCode` по умолчанию равно
 `1 + X × 1 000 000 + Y × 1 000` при `X ≤ 2099` и `Y ≤ 999`.
@@ -562,24 +566,30 @@ application ID этот номер должен расти при каждой �
 сборку того же `versionName`. iOS записывает `X.Y.0` в `CFBundleShortVersionString`
 и хранит отдельный `CFBundleVersion`. [Подготовка выпуска для Apple](https://developer.apple.com/documentation/Xcode/preparing-your-app-for-distribution)
 
-Следуя разделению в RedmiBook Manager, `vpn-application` сравнивает числовые
-версии, Windows-адаптер выполняет запрос, а `client-ui` показывает результат.
-Проверка запускается вручную и выполняется в фоне. По умолчанию используется
-публичный `https://api.github.com/repos/KobaProduction/Blazer/releases/latest`.
-Сборка может задать HTTPS-адрес метаданных с тем же форматом через
-`BLAZER_RELEASE_FEED_URL`. HTTP 404 от `latest` отображается как отсутствие
-опубликованных стабильных выпусков.
+Следуя разделению в RedmiBook Manager, `vpn-application` владеет политикой
+версии и build identity, Windows-адаптер проверяет GitHub и установщик,
+а `client-ui` показывает состояния. Маркетинговая версия остаётся `X.Y`,
+идентичность сборки содержит полный коммит и положительный bounded sequence
+из `git rev-list --first-parent --count HEAD`. Стабильный канал читает
+`/releases/latest` и не принимает preview. Preview сначала проверяет стабильный
+выпуск для перехода с тем же или более новым `X.Y`, затем `/releases/tags/preview`.
+Новое preview с тем же `X.Y` требует другого коммита и большего sequence;
+повтор текущего коммита не предлагается. HTTPS override `BLAZER_RELEASE_FEED_URL`
+сохраняет тот же строгий контракт метаданных.
 
-Клиент принимает стабильный выпуск с более новой версией и точным именем
-`Blazer-X.Y-windows-x86_64.zip`. У файла должны быть ожидаемый URL в
-`KobaProduction/Blazer`, ненулевой размер и SHA-256 в метаданных. Скрипт
-`build-windows.ps1` с `-Configuration Release -ReleaseArchive` создаёт такой
-архив с `blazer-package.json` и печатает его SHA-256. GitHub Release и архив
-публикуются под одним стабильным тегом. [GitHub Releases REST API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
+Основной артефакт — `Blazer-X.Y-windows-x86_64-setup.exe`, для preview —
+`Blazer-preview-COMMIT12-SEQUENCE-windows-x86_64-setup.exe`.
+Парный `-update.json` содержит schema, version, channel, sequence, commit и
+setup `{name,size,sha256}`. Клиент проверяет bounded JSON, его GitHub SHA-256,
+согласованность канала, версии и имени, точный URL этого репозитория, digest и
+размер Setup в JSON и GitHub API, затем фактические скачанные байты.
+Authenticode не объявляется проверенным: доверие этой поставки основано на
+HTTPS GitHub и закреплённых метаданных, а не на отсутствующем сертификате подписи.
 
 Workflow `releases.yml` обновляет существующий prerelease `preview` после пуша
-в `main`. Он загружает новый ZIP, проверяет его SHA-256 на GitHub, переносит
-тег `preview` на собранный коммит и удаляет прежние ZIP этого канала. Номер
+в `main`. Он загружает новый Setup, парный JSON и внутренний ZIP ядра,
+проверяет их SHA-256 на GitHub, переносит тег `preview` на собранный коммит
+и удаляет прежние артефакты этого канала. Номер
 прогона GitHub Actions и коммит указываются в описании сборки. Стабильные теги
 `vX.Y` и их выпуски публикуются отдельно по явному пушу тега. Windows-клиент
 на стабильном канале читает только `/latest`. Установленный prerelease может
@@ -591,14 +601,18 @@ Workflow `releases.yml` обновляет существующий prerelease `
 репозитория `BLAZER_WINDOWS_ENGINE_ARCHIVE_URL`. Упаковщик всегда сверяет
 SHA-256 ядра с утверждённым значением в исходниках.
 
-Скачивание ограничено GitHub и его хостами артефактов. Клиент сверяет длину
-и SHA-256 перед подтверждением. Установка доступна из распакованного Windows
-выпуска в отдельном каталоге с манифестом пакета. После подтверждения и
-отключения VPN копия текущего `blazer.exe` ждёт завершения приложения,
-повторно сверяет архив, распаковывает разрешённые файлы и заменяет каталог
-пакета. При ошибке замены или запуска восстанавливается предыдущий каталог.
-После запуска нового окна служебные файлы удаляются. Данные пользователя
-хранятся отдельно от пакета. Правила распространения для Android и iOS описаны
+ZIP остаётся только внутренним источником закреплённого ядра для release-сборки,
+не запасным форматом updater. Обновление приложения выполняет тот же NSIS Setup,
+который отвечает за клиент, ядро, Wintun и службу. Встроенная установка доступна
+только из управляемого `Program Files\Blazer` с согласованными protected HKLM и
+`blazer-installation.json`; portable-каталог получает ссылку на мастер установки.
+Проверенный Setup удерживается read-lock до завершения мастера и запускается
+обычным процессом с `/UPDATE`. Он сам запрашивает UAC после подтверждения;
+updater не закрывает окно при запуске или отмене. Установщик закрывает только
+подтверждённые процессы управляемого продукта перед транзакцией службы/файлов.
+Ошибки и код завершения показываются пользователю. Каталог пользовательских
+данных не входит в пакет. Подробнее: [Windows installation](windows-installation.md).
+Правила распространения для Android и iOS описаны
 в [платформенном контракте](platforms.md#каналы-мобильных-обновлений).
 
 ## OpenTelemetry и диагностика

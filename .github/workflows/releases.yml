@@ -26,12 +26,12 @@ jobs:
       - name: Install project toolchain
         shell: pwsh
         run: rustup toolchain install 1.95.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
-      - name: Build Windows package
+      - name: Build Windows installer, update metadata and core seed
         shell: pwsh
         env:
           BLAZER_WINDOWS_ENGINE_ARCHIVE_URL: ${{ vars.BLAZER_WINDOWS_ENGINE_ARCHIVE_URL }}
         run: ./scripts/release-github.ps1 -Stage Build
-      - name: Publish package
+      - name: Publish verified installer and replace the previous preview artifacts
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

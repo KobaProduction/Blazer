@@ -151,10 +151,11 @@ BlazeCore. Тот подключается к службе BlazeCoreTun, кот�
 после сигнала готовности ядра. При завершении процесса служба освобождает
 маршруты и адаптер. Для подключения используется обычный сеанс Windows.
 
-Службу устанавливают один раз для SID пользователя по
-[инструкции BlazeCore](https://github.com/ArthurKoba/BlazeCore/blob/master/docs/platforms.md#windows-tun-service).
-Wintun входит в комплект службы. Локальный SOCKS5/HTTP-прокси доступен
-независимо от службы.
+Windows Setup объединяет клиент, ядро, Wintun и управление службой для SID
+пользователя. Новый lifecycle установщика требует отдельной приёмки в Windows VM;
+наличие кода и сборка Setup не доказывают установку/обновление SCM на машине.
+Ручной контракт ядра: [BlazeCore](https://github.com/ArthurKoba/BlazeCore/blob/master/docs/platforms.md#windows-tun-service).
+Локальный SOCKS5/HTTP-прокси доступен независимо от службы.
 
 Отдельный тест локального прокси после повторного чтения каталога подтвердил
 TLS ALPN `http/1.1` и передачу байтов для Xray JSON, sing-box JSON в Base64 и URI.

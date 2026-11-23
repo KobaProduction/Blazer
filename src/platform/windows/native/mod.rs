@@ -1,6 +1,5 @@
 //! Composition root for the eframe renderer and the client core.
 
-use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,22 +14,14 @@ use vpn_presentation::localization::{self, Key, Locale};
 use vpn_presentation::model::error_key;
 
 pub fn run() -> eframe::Result {
-    run_window(None, None)
+    run_window(None)
 }
 
 pub fn run_import(input: String) -> eframe::Result {
-    run_window(Some(input), None)
+    run_window(Some(input))
 }
 
-pub fn run_after_update(work: OsString) -> eframe::Result {
-    run_window(None, Some(work))
-}
-
-pub fn apply_update(arguments: impl Iterator<Item = OsString>) -> std::io::Result<()> {
-    updates::package::apply(arguments)
-}
-
-fn run_window(import: Option<String>, completed_update: Option<OsString>) -> eframe::Result {
+fn run_window(import: Option<String>) -> eframe::Result {
     let client_options = ClientCoreOptions {
         subscription_refresh: SubscriptionRefreshMode::Automatic,
         ..ClientCoreOptions::default()
@@ -49,9 +40,6 @@ fn run_window(import: Option<String>, completed_update: Option<OsString>) -> efr
             let mut window = create_window(creation, client_options)?;
             if let Some(input) = import {
                 window.prefill_import(input);
-            }
-            if let Some(work) = completed_update {
-                updates::package::schedule_cleanup(work);
             }
             Ok(Box::new(
                 NativeView::new(window, true).with_window_placement(creation),
@@ -75,7 +63,7 @@ fn create_window(
         context.request_repaint();
     }));
     let mut host = ui_host();
-    host.app_updates = updates::controls(&creation.egui_ctx);
+    host.app_updates = Some(updates::controls(&creation.egui_ctx));
     Ok(BlazerView::new(
         &creation.egui_ctx,
         Controller::new(client, dirty),

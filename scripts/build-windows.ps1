@@ -6,14 +6,24 @@ param(
     [string]$BlazeCorePath,
     [string]$BlazeCoreLicensePath,
     [switch]$ReleaseArchive,
-    [switch]$PreviewArchive
+    [switch]$PreviewArchive,
+    [switch]$Installer,
+    [switch]$DevelopmentInstaller,
+    [string]$NsisCompiler,
+    [string]$WintunPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'release-version.ps1')
-if (($ReleaseArchive -or $PreviewArchive) -and $Configuration -ne 'Release') { throw 'Release archives require -Configuration Release.' }
+. (Join-Path $PSScriptRoot 'installer/toolchain.ps1')
+$buildInstaller = $Installer -or $ReleaseArchive -or $PreviewArchive -or $DevelopmentInstaller
+$installerChannel = if ($ReleaseArchive) { 'stable' } else { 'preview' }
+if ($buildInstaller -and $Configuration -ne 'Release') { throw 'Installer/release packaging requires -Configuration Release.' }
 if ($ReleaseArchive -and $PreviewArchive) { throw 'Select one archive channel.' }
+if ($DevelopmentInstaller -and ($Installer -or $ReleaseArchive -or $PreviewArchive)) {
+    throw 'DevelopmentInstaller is a separate compile-check mode and cannot publish release artifacts.'
+}
 
 function Assert-PackageDirectory {
     param([string]$Directory)
@@ -150,16 +160,22 @@ function Build-Package {
     $previousVersion = $env:BLAZER_RELEASE_VERSION
     $previousUserAgent = $env:BLAZER_RELEASE_USER_AGENT
     $previousPreview = $env:BLAZER_PREVIEW_BUILD
+    $previousCommit = $env:BLAZER_RELEASE_COMMIT
+    $previousSequence = $env:BLAZER_RELEASE_SEQUENCE
     try {
         $env:BLAZER_RELEASE_VERSION = $releaseVersion
         $env:BLAZER_RELEASE_USER_AGENT = if ($releaseVersion) { "Blazer/$releaseVersion" } else { $null }
-        $env:BLAZER_PREVIEW_BUILD = if ($PreviewArchive) { '1' } else { $null }
+        $env:BLAZER_PREVIEW_BUILD = if ($buildInstaller -and $installerChannel -eq 'preview') { '1' } else { $null }
+        $env:BLAZER_RELEASE_COMMIT = $releaseCommit
+        $env:BLAZER_RELEASE_SEQUENCE = if ($releaseSequence) { $releaseSequence.ToString([Globalization.CultureInfo]::InvariantCulture) } else { $null }
         & cargo build --locked --target $target --target-dir $targetDirectory -p blazer --bin blazer @profileArguments
         if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for Blazer (exit $LASTEXITCODE)." }
     } finally {
         $env:BLAZER_RELEASE_VERSION = $previousVersion
         $env:BLAZER_RELEASE_USER_AGENT = $previousUserAgent
         $env:BLAZER_PREVIEW_BUILD = $previousPreview
+        $env:BLAZER_RELEASE_COMMIT = $previousCommit
+        $env:BLAZER_RELEASE_SEQUENCE = $previousSequence
     }
 
     $directory = Join-Path $output 'client'
@@ -170,6 +186,11 @@ function Build-Package {
         @{ Name = 'blazecore.exe'; Source = $BlazeCorePath; ExpectedSha256 = $engineSha256 }
     )
     $files += @(Get-EngineNoticeFiles $BlazeCoreLicensePath)
+    if ($buildInstaller) {
+        $driverDigest = (Get-BlazerInstallerInputs).wintun.sha256
+        $driver = Resolve-PackageWintun $driverDigest
+        $files += @{ Name = 'wintun.dll'; Source = $driver; ExpectedSha256 = $driverDigest }
+    }
     $executable = Join-Path $directory 'blazer.exe'
     Assert-PackageDirectory $directory
     Assert-PackageFileReplaceable $executable
@@ -182,28 +203,57 @@ function Build-Package {
     # For an existing package, replace the executable first so a late launch blocks publication.
     # A fresh package becomes launchable only after its companion files are installed.
     $files = if ([IO.File]::Exists($executable)) { @($app) + $files } else { $files + @($app) }
-    $marker = $null
-    try {
-        if ($ReleaseArchive -or $PreviewArchive) {
-            Assert-PackageDirectory $output
-            [IO.Directory]::CreateDirectory($output) | Out-Null
-            $marker = Join-Path $output ".blazer-package-$([Guid]::NewGuid().ToString('N')).tmp"
-            $versionInfo = (Get-Item -LiteralPath $app.Source).VersionInfo.ProductVersion
-            if ($versionInfo -cne $releaseVersion) { throw 'The Windows executable version does not match the Git tag.' }
-            $channel = if ($PreviewArchive) { 'preview' } else { 'stable' }
-            $manifest = @{ version = $releaseVersion; target = 'windows-x86_64'; channel = $channel } | ConvertTo-Json -Compress
-            [IO.File]::WriteAllText($marker, $manifest)
-            $files += @{ Name = 'blazer-package.json'; Source = $marker }
-        }
-        Publish-Package 'client' $directory $files
-        if ($Configuration -eq 'Debug') {
-            Update-BlazerShellIcon $executable
-        }
-        Write-Output $executable
-        if ($ReleaseArchive -or $PreviewArchive) { Write-ReleaseArchive $directory $files }
-    } finally {
-        if ($marker) { [IO.File]::Delete($marker) }
+    if ($buildInstaller) {
+        $versionInfo = (Get-Item -LiteralPath $app.Source).VersionInfo.ProductVersion
+        if ($versionInfo -cne $releaseVersion) { throw 'The Windows executable version does not match the installer version.' }
     }
+    Publish-Package 'client' $directory $files
+    if ($Configuration -eq 'Debug') { Update-BlazerShellIcon $executable }
+    Write-Output $executable
+    if ($ReleaseArchive -or $PreviewArchive) { Write-ReleaseArchive $directory $files }
+    if ($buildInstaller) {
+        $installerOptions = @{
+            PackageDirectory = $directory; OutputDirectory = $output
+            Version = $releaseVersion; Channel = $installerChannel
+            Commit = $releaseCommit; Sequence = $releaseSequence; Files = $files
+        }
+        if ($NsisCompiler) { $installerOptions.NsisCompiler = $NsisCompiler }
+        if ($DevelopmentInstaller) { $installerOptions.Development = $true }
+        & (Join-Path $PSScriptRoot 'installer/build-setup.ps1') @installerOptions
+    }
+}
+
+function Resolve-PackageWintun {
+    param([string]$Digest)
+    $driver = $WintunPath
+    if (-not $driver) {
+        $candidate = Join-Path $output 'client/wintun.dll'
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+            (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -ieq $Digest) {
+            $driver = $candidate
+        }
+    }
+    Get-BlazerWintunDriver -Driver $driver -CacheDirectory (Join-Path $targetDirectory 'windows-inputs')
+}
+
+function Get-PackageBuildIdentity {
+    $commit = git -C $repo rev-parse HEAD
+    $count = git -C $repo rev-list --first-parent --count HEAD
+    if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[a-f0-9]{40}$' -or
+        $count -cnotmatch '^[1-9][0-9]*$' -or [long]$count -gt [int]::MaxValue) {
+        throw 'Could not resolve the immutable Git build identity.'
+    }
+    if (($env:BLAZER_RELEASE_COMMIT -and $env:BLAZER_RELEASE_COMMIT -cne $commit) -or
+        ($env:BLAZER_RELEASE_SEQUENCE -and $env:BLAZER_RELEASE_SEQUENCE -cne $count)) {
+        throw 'Configured build identity differs from the checked-out source.'
+    }
+    if (-not $DevelopmentInstaller) {
+        $changes = git -C $repo status --porcelain --untracked-files=normal
+        if ($LASTEXITCODE -ne 0 -or $changes) {
+            throw 'An immutable installer requires a clean checkout. Use DevelopmentInstaller only for a non-installable compile check.'
+        }
+    }
+    @{ Commit = $commit; Sequence = [int]$count }
 }
 
 function Write-ReleaseArchive {
@@ -238,8 +288,11 @@ function Write-ReleaseArchive {
 
 $repo = Split-Path -Parent $PSScriptRoot
 $releaseVersion = if ($ReleaseArchive) { Get-ReleaseVersion $repo }
-    elseif ($PreviewArchive) { Get-WorkspaceAppVersion $repo 'blazer' }
+    elseif ($PreviewArchive -or $Installer -or $DevelopmentInstaller) { Get-WorkspaceAppVersion $repo 'blazer' }
     else { $null }
+$identity = if ($buildInstaller) { Get-PackageBuildIdentity } else { $null }
+$releaseCommit = if ($identity) { $identity.Commit } else { $null }
+$releaseSequence = if ($identity) { $identity.Sequence } else { $null }
 $target = 'x86_64-pc-windows-msvc'
 $targetDirectory = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repo) }
     else { Join-Path $repo 'target' }

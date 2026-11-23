@@ -177,6 +177,13 @@ pwsh -NoProfile -File scripts/build-windows.ps1
 
 По умолчанию скрипт собирает Debug. Для Release передайте
 `-Configuration Release`.
+`-Configuration Release -Installer` дополнительно собирает единый Windows
+Setup с клиентом, закреплённым BlazeCore, Wintun и управлением службой туннеля.
+Этот preview требует чистого checkout. Для незакоммиченных исходников есть
+`-Configuration Release -DevelopmentInstaller`: неустанавливаемый compile-check
+артефакт с текущим клиентом, без публикации и без заявления immutable identity.
+Установщик использует мастер NSIS с русским и английским интерфейсом;
+целевой каталог — `C:\Program Files\Blazer`.
 `-OutputDirectory` меняет общую родительскую папку пакетов.
 Пакет содержит `LICENSE`. Скрипт ищет `blazecore.exe` с
 закреплённым SHA-256 в Windows release-пакете или debug-сборке соседнего BlazeCore
@@ -193,12 +200,15 @@ pwsh -NoProfile -File scripts/build-windows.ps1
 открывает страницу приложения в магазине. iOS использует версию тега и отдельный
 номер сборки, а обновления поставляются через App Store или TestFlight.
 
-`-Configuration Release -ReleaseArchive` собирает Windows ZIP из чистого checkout
+`-Configuration Release -ReleaseArchive` собирает Windows Setup из чистого checkout
 тега для [GitHub Releases](https://github.com/KobaProduction/Blazer/releases).
 Пуш в `main` обновляет единственный [Windows prerelease](https://github.com/KobaProduction/Blazer/releases/tag/preview).
-Стабильный ZIP публикуется по тегу `vX.Y`.
-В Windows проверьте обновления в разделе «О программе», затем скачайте пакет
-и подтвердите установку. [Контракт выпусков](docs/architecture.md#версионирование-и-выпуски)
+Стабильный Setup публикуется по тегу `vX.Y`. Номер preview — количество
+first-parent коммитов Git; полный коммит отличает сборки с одинаковым `X.Y`.
+В Windows проверьте обновления в разделе «О программе», скачайте проверенный
+установщик и подтвердите установку в мастере. Отмена мастера или UAC оставляет
+приложение открытым. [Установка и границы проверки](docs/windows-installation.md) ·
+[Контракт выпусков](docs/architecture.md#версионирование-и-выпуски)
 
 ## Локальные проверки Windows
 
