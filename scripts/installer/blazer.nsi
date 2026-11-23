@@ -36,7 +36,8 @@ Var PowerShell
 !define MUI_ABORTWARNING
 !define MUI_CUSTOMFUNCTION_ABORT OnSetupAbort
 !define MUI_CUSTOMFUNCTION_UNABORT un.OnSetupAbort
-!define MUI_FINISHPAGE_RUN "$INSTDIR\blazer.exe"
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION RequestAppLaunch
 !define MUI_FINISHPAGE_RUN_TEXT "Blazer"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${APP_LICENSE}"
@@ -53,8 +54,8 @@ LangString Cancelled ${LANG_ENGLISH} "Administrator permission was cancelled. Bl
 LangString Cancelled ${LANG_RUSSIAN} "Разрешение администратора отменено. Blazer не закрывался."
 LangString WrongPlatform ${LANG_ENGLISH} "Blazer requires 64-bit Windows 10 or newer."
 LangString WrongPlatform ${LANG_RUSSIAN} "Для Blazer требуется 64-разрядная Windows 10 или новее."
-LangString StartNormally ${LANG_ENGLISH} "Start this installer normally, without 'Run as administrator'. It will request administrator permission after confirmation."
-LangString StartNormally ${LANG_RUSSIAN} "Запустите установщик обычным способом, без «Запуск от имени администратора». Он запросит права после подтверждения."
+LangString StartNormally ${LANG_ENGLISH} "Start this installer normally, without 'Run as administrator'. It requests administrator permission immediately at startup."
+LangString StartNormally ${LANG_RUSSIAN} "Запустите установщик обычным способом, без «Запуск от имени администратора». Права запрашиваются сразу при запуске."
 
 !macro InitBootstrap Prefix
 Function ${Prefix}Initialize
@@ -178,7 +179,6 @@ Function ${Prefix}Initialize
       valid_pid_${Prefix}:
       IntOp $0 $0 + 1
     ${Loop}
-    SetSilent silent
     Return
     invalid_${Prefix}:
       SetErrorLevel 2
@@ -207,6 +207,39 @@ Function ${Prefix}Initialize
     SetErrorLevel 2
     Quit
   ${EndIf}
+  ; The original medium-token process remains alive, preserving its SID even
+  ; when UAC uses another administrator's credentials. It never shows a wizard.
+  ClearErrors
+!if "${Prefix}" S== "un."
+  ExecShellWait "runas" "$EXEPATH" '/ELEVATED=1 /OPERATORSID=$OperatorSid /BOOTSTRAPPID=$BootstrapPid /TRANSACTION=$Transaction _?=$INSTDIR' SW_SHOWNORMAL
+!else
+  ExecShellWait "runas" "$EXEPATH" '/ELEVATED=1 /OPERATORSID=$OperatorSid /BOOTSTRAPPID=$BootstrapPid /TRANSACTION=$Transaction' SW_SHOWNORMAL
+!endif
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONINFORMATION "$(Cancelled)" /SD IDOK
+    SetErrorLevel 1223
+    Quit
+  ${EndIf}
+!if "${Prefix}" S== "un."
+  ClearErrors
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "ProductId"
+  ${If} ${Errors}
+    SetErrorLevel 0
+    Quit
+  ${EndIf}
+!else
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "LastSetupTransaction"
+  ${If} $0 == $Transaction
+    Call LaunchRequestedApp
+    SetErrorLevel 0
+    Quit
+  ${EndIf}
+!endif
+  Call ${Prefix}RelaunchRestored
+  ; ExecShellWait does not expose the child exit code. Without a committed
+  ; transaction, cancellation/failure is conservatively reported as code 2.
+  SetErrorLevel 2
+  Quit
 FunctionEnd
 !macroend
 !insertmacro InitBootstrap ""
@@ -223,6 +256,31 @@ Function OnSetupAbort
 FunctionEnd
 Function un.OnSetupAbort
   SetErrorLevel 1602
+FunctionEnd
+
+Function RequestAppLaunch
+  ; The elevated Finish checkbox records intent; it never starts the GUI.
+  StrCmp $Elevated "1" 0 request_launch_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "LastSetupTransaction"
+  StrCmp $0 $Transaction 0 request_launch_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "ProductId"
+  StrCmp $0 "${PRODUCT_ID}" 0 request_launch_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "InstallDirectory"
+  StrCmp $0 $INSTDIR 0 request_launch_done
+  WriteRegStr HKLM "${PRODUCT_KEY}" "LastLaunchTransaction" "$Transaction"
+  request_launch_done:
+FunctionEnd
+
+Function LaunchRequestedApp
+  StrCmp $Elevated "0" 0 launch_requested_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "LastLaunchTransaction"
+  StrCmp $0 $Transaction 0 launch_requested_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "ProductId"
+  StrCmp $0 "${PRODUCT_ID}" 0 launch_requested_done
+  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "InstallDirectory"
+  StrCmp $0 $INSTDIR 0 launch_requested_done
+  Exec '"$INSTDIR\blazer.exe"'
+  launch_requested_done:
 FunctionEnd
 
 !macro RelaunchFunction Prefix
@@ -316,22 +374,12 @@ Section "Blazer"
     nsExec::ExecToLog '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Install -PayloadDirectory "$StageDirectory\payload" -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
     Pop $0
     !insertmacro CleanupStage
-    SetErrorLevel $0
-    Quit
-  ${EndIf}
-  ClearErrors
-  ExecShellWait "runas" "$EXEPATH" '/ELEVATED=1 /OPERATORSID=$OperatorSid /BOOTSTRAPPID=$BootstrapPid /TRANSACTION=$Transaction /S' SW_HIDE
-  ${If} ${Errors}
-    MessageBox MB_OK|MB_ICONINFORMATION "$(Cancelled)" /SD IDOK
-    SetErrorLevel 1223
-    Abort
-  ${EndIf}
-  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "LastSetupTransaction"
-  ${If} $0 != $Transaction
-    Call RelaunchRestored
-    MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
-    SetErrorLevel 2
-    Abort
+    ${If} $0 != "0"
+      MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    SetErrorLevel 0
   ${EndIf}
   SetErrorLevel 0
 SectionEnd
@@ -342,23 +390,12 @@ Section "Uninstall"
     nsExec::ExecToLog '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Uninstall -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
     Pop $0
     !insertmacro CleanupStage
-    SetErrorLevel $0
-    Quit
-  ${EndIf}
-  ClearErrors
-  ExecShellWait "runas" "$EXEPATH" '/ELEVATED=1 /OPERATORSID=$OperatorSid /BOOTSTRAPPID=$BootstrapPid /TRANSACTION=$Transaction /S _?=$INSTDIR' SW_HIDE
-  ${If} ${Errors}
-    MessageBox MB_OK|MB_ICONINFORMATION "$(Cancelled)" /SD IDOK
-    SetErrorLevel 1223
-    Abort
-  ${EndIf}
-  ClearErrors
-  ReadRegStr $0 HKLM "${PRODUCT_KEY}" "ProductId"
-  ${IfNot} ${Errors}
-    Call un.RelaunchRestored
-    MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
-    SetErrorLevel 2
-    Abort
+    ${If} $0 != "0"
+      MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    SetErrorLevel 0
   ${EndIf}
   SetErrorLevel 0
 SectionEnd

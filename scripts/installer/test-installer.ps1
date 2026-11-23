@@ -4,10 +4,13 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$env:PSModulePath = [IO.Path]::Combine($PSHOME,'Modules')
 foreach ($name in @('transaction.ps1','paths.ps1','service.ps1','provider.ps1')) {
     . (Join-Path $PSScriptRoot $name)
 }
 $script:ProductionServiceStartPolicy = ${function:Start-BlazerServiceIfRequired}
+$script:ProductionRegistryPath = ${function:Assert-BlazerRegistryPath}
+$script:NativeGetAcl = Get-Command -Name Get-Acl -CommandType Cmdlet
 
 $script:FixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BlazerInstallerTests-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($script:FixtureRoot) | Out-Null
@@ -261,12 +264,70 @@ function Test-PriorServiceStates {
     }
 }
 
+function New-RegistrySecurityFixture {
+    param([string]$Owner='S-1-5-32-544',[bool]$Protected=$true,
+        [string]$Principal='S-1-5-32-545',[Security.AccessControl.RegistryRights]$Rights='ReadKey')
+    $acl=[Security.AccessControl.RegistrySecurity]::new()
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($Owner))
+    $acl.SetAccessRuleProtection($Protected,$false)
+    $acl.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new(
+        [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),'FullControl','Allow'))
+    $acl.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new(
+        [Security.Principal.SecurityIdentifier]::new($Principal),$Rights,'Allow'))
+    $acl
+}
+
+function Test-RegistrySecurityPolicy {
+    foreach($owner in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')){
+        $acl=New-RegistrySecurityFixture -Owner $owner
+        Assert-BlazerRegistrySecurity $acl $true
+        Assert-BlazerRegistrySecurity $acl $false
+    }
+    $terminal=New-RegistrySecurityFixture -Principal 'S-1-5-13' -Rights 'SetValue,CreateSubKey,Delete'
+    Assert-BlazerRegistrySecurity $terminal $false
+    Assert-Throws { Assert-BlazerRegistrySecurity $terminal $true } 'unsafe access-control'
+    $unprotected=New-RegistrySecurityFixture -Protected $false
+    Assert-BlazerRegistrySecurity $unprotected $false
+    Assert-Throws { Assert-BlazerRegistrySecurity $unprotected $true } 'protected DACL'
+    $untrusted=New-RegistrySecurityFixture -Owner 'S-1-5-21-111-222-333-1001'
+    Assert-Throws { Assert-BlazerRegistrySecurity $untrusted $false } 'unprivileged owner'
+    Assert-Throws { Assert-BlazerRegistrySecurity $untrusted $true } 'unprivileged owner'
+    foreach($rights in @([Security.AccessControl.RegistryRights]::ChangePermissions,
+        [Security.AccessControl.RegistryRights]::TakeOwnership,([Enum]::ToObject([Security.AccessControl.RegistryRights],[int]0x10000000)))){
+        $unsafe=New-RegistrySecurityFixture -Principal 'S-1-5-13' -Rights $rights
+        Assert-Throws { Assert-BlazerRegistrySecurity $unsafe $false } 'unsafe access-control'
+    }
+    $genericWrite=New-RegistrySecurityFixture -Principal 'S-1-5-13' -Rights ([Enum]::ToObject([Security.AccessControl.RegistryRights],[int]0x40000000))
+    Assert-BlazerRegistrySecurity $genericWrite $false
+    Assert-Throws { Assert-BlazerRegistrySecurity $genericWrite $true } 'unsafe access-control'
+}
+
+function Test-NativeRegistryReadOnlyPreflight {
+    Assert-True ([Environment]::Is64BitProcess) 'Native registry preflight must run in the 64-bit PS5.1 view.'
+    function Get-Acl {
+        param([string]$Path)
+        $allowed=@(
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\KobaProduction\Blazer',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\KobaProduction',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\KobaProduction.Blazer.Windows',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows',
+            'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft'
+        )
+        if($Path -cnotin $allowed){throw 'Readonly preflight attempted an unexpected ACL namespace.'}
+        & $script:NativeGetAcl -Path $Path
+    }
+    & $script:ProductionRegistryPath $script:BlazerRegistry
+    & $script:ProductionRegistryPath $script:BlazerUninstallRegistry
+}
+
 try {
-    foreach ($test in @('Test-GracefulProcessOrdering','Test-BackupAndRestore','Test-FreshRegistrationRollbackPreservesForeignFiles','Test-AtomicJson','Test-CleanupTombstone','Test-OperationOrdering','Test-UpgradePolicy','Test-PriorServiceStates')) {
+    foreach ($test in @('Test-GracefulProcessOrdering','Test-BackupAndRestore','Test-FreshRegistrationRollbackPreservesForeignFiles','Test-AtomicJson','Test-CleanupTombstone','Test-OperationOrdering','Test-UpgradePolicy','Test-PriorServiceStates','Test-RegistrySecurityPolicy','Test-NativeRegistryReadOnlyPreflight')) {
         & $test
         Write-Output ($test + ': PASS')
     }
-    Write-Output 'Installer helper acceptance PASS; mocked OS adapters only, no native SCM/registry lifecycle claim.'
+    Write-Output 'Installer helper acceptance PASS; no native SCM/registry mutations. Explicit readonly HKLM ACL preflight was exercised.'
 } finally {
     $resolved=[IO.Path]::GetFullPath($script:FixtureRoot)
     $parent=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')

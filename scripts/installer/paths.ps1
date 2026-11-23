@@ -130,26 +130,40 @@ function Set-BlazerUninstallRegistration {
 
 function Assert-BlazerRegistryPath {
     param([string]$Path)
-    $trusted = @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
-    for ($cursor=$Path; $cursor -ne 'SOFTWARE'; $cursor=$cursor.Substring(0,$cursor.LastIndexOf('\'))) {
+    if ($Path -cnotin @($script:BlazerRegistry,$script:BlazerUninstallRegistry)) { throw 'Unexpected product registry namespace.' }
+    $cursor = $Path
+    while ($cursor -ine 'SOFTWARE') {
         $registryPath = 'Registry::HKEY_LOCAL_MACHINE\' + $cursor
-        if (-not (Test-Path -LiteralPath $registryPath)) { continue }
-        $acl = Get-Acl -LiteralPath $registryPath
-        $sidType = [Security.Principal.SecurityIdentifier]
-        if ($acl.GetOwner($sidType).Value -notin $trusted) { throw 'An installation registry key has an unprivileged owner.' }
-        $mask = [int][Security.AccessControl.RegistryRights]'SetValue,CreateSubKey,Delete,ChangePermissions,TakeOwnership' -bor 0x50000000
-        foreach ($rule in $acl.GetAccessRules($true,$true,$sidType)) {
-            if ($rule.AccessControlType -eq 'Allow' -and ($rule.RegistryRights -band $mask) -and
-                -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
-                $rule.IdentityReference.Value -notin $trusted) { throw 'An installation registry key is writable by an unprivileged principal.' }
+        if (Test-Path -LiteralPath $registryPath) {
+            # Windows PowerShell 5.1 misresolves registry Get-Acl -LiteralPath.
+            # Escape the fixed path rather than enabling wildcard selection.
+            $acl = Get-Acl -Path ([Management.Automation.WildcardPattern]::Escape($registryPath))
+            Assert-BlazerRegistrySecurity $acl ($cursor -ceq $Path)
         }
+        $cursor = $cursor.Substring(0,$cursor.LastIndexOf('\'))
+    }
+}
+
+function Assert-BlazerRegistrySecurity {
+    param([Security.AccessControl.RegistrySecurity]$Acl, [bool]$Private)
+    $trusted = @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $sidType = [Security.Principal.SecurityIdentifier]
+    if ($Acl.GetOwner($sidType).Value -notin $trusted) { throw 'An installation registry key has an unprivileged owner.' }
+    if ($Private -and -not $Acl.AreAccessRulesProtected) { throw 'An owned registry key must have a protected DACL.' }
+    $rights = if ($Private) { 'SetValue,CreateSubKey,Delete,ChangePermissions,TakeOwnership' }
+        else { 'ChangePermissions,TakeOwnership' }
+    $generic = if ($Private) { 0x50000000 } else { 0x10000000 }
+    $mask = [int][Security.AccessControl.RegistryRights]$rights -bor $generic
+    foreach ($rule in $Acl.GetAccessRules($true,$true,$sidType)) {
+        if ($rule.AccessControlType -eq 'Allow' -and ($rule.RegistryRights -band $mask) -and
+            -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            $rule.IdentityReference.Value -notin $trusted) { throw 'An installation registry key has unsafe access-control permissions.' }
     }
 }
 
 function Set-BlazerProtectedRegistry {
     param([string]$Path)
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
-    try { $key=$base.CreateSubKey($Path); $key.Dispose() } finally { $base.Dispose() }
+    if ($Path -cnotin @($script:BlazerRegistry,$script:BlazerUninstallRegistry)) { throw 'Unexpected product registry namespace.' }
     $acl = [Security.AccessControl.RegistrySecurity]::new()
     $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
     $acl.SetAccessRuleProtection($true,$false)
@@ -159,7 +173,16 @@ function Set-BlazerProtectedRegistry {
     }
     $acl.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new(
         [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), 'ReadKey', 'ContainerInherit', 'None', 'Allow'))
-    Set-Acl -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\' + $Path) -AclObject $acl
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
+    try {
+        $key = $base.CreateSubKey($Path, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $acl)
+        try {
+            # CreateSubKey can return a concurrently precreated key. Never adopt
+            # it by overwriting its owner/DACL before checking the actual handle.
+            Assert-BlazerRegistrySecurity $key.GetAccessControl() $true
+            $key.SetAccessControl($acl)
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
 }
 
 function Set-BlazerProtectedDirectory {
