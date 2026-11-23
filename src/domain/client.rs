@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 mod graph;
 mod probe;
+mod tun_conflict;
 pub use graph::{
     GraphGroup, GraphMatch, GraphNetwork, GraphObservatory, GraphOutbound, GraphOutboundKind,
     GraphRule, GraphStrategy, GraphTarget, ProbeReport, ProxyGraph, record_graph_probe,
     select_least_ping,
 };
+pub use tun_conflict::{TunAdapterKind, TunConflict};
 mod xhttp;
 pub use probe::{ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy};
 mod xray_tls_profiles;
@@ -96,6 +98,8 @@ pub enum ClientError {
     SystemProxyUnavailable,
     SystemProxyRestoreFailed,
     TunServiceUnavailable,
+    TunConflict(TunConflict),
+    TunPreflightUnavailable,
     LinuxTunUnavailable,
     EngineReadiness,
     EngineStopped,

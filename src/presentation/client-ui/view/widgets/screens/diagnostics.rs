@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use vpn_presentation::APP_VERSION;
 use vpn_presentation::localization::Key;
-use vpn_presentation::model::{error_key, state_key};
+use vpn_presentation::model::{ErrorNotice, error_key, state_key};
 use vpn_presentation::session::{ClientError, ClientEventKind, ConnectionStatus};
 
 use super::ViewFrame;
@@ -45,6 +45,8 @@ impl LogTab {
                 | ClientError::EngineStart
                 | ClientError::EngineReadiness
                 | ClientError::EngineStopped
+                | ClientError::TunConflict(_)
+                | ClientError::TunPreflightUnavailable
                 | ClientError::TunServiceUnavailable
                 | ClientError::LinuxTunUnavailable
                 | ClientError::ShutdownTimeout,
@@ -229,7 +231,12 @@ impl ViewFrame<'_> {
             let (category, message) = event_labels(event.kind);
             let sequence = event.sequence;
             let category = self.tr(category);
-            let message = self.tr(message);
+            let message = match event.kind {
+                ClientEventKind::Failed(error @ ClientError::TunConflict(_)) => {
+                    ErrorNotice::Client(error).text(self.view.locale)
+                }
+                _ => self.tr(message).into(),
+            };
             if self.view.preview {
                 let seconds = sequence.min(599);
                 let _ = write!(

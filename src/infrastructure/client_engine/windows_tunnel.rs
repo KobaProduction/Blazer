@@ -8,6 +8,7 @@ use windows_service::{
 use zeroize::Zeroizing;
 
 use super::{BlazeCoreProcess, managed_tunnel};
+mod preflight;
 
 pub(super) fn start(
     engine: &mut BlazeCoreProcess,
@@ -16,6 +17,7 @@ pub(super) fn start(
     cancel: &Cancellation,
 ) -> Result<(), ClientError> {
     cancel.check()?;
+    preflight::require_no_external_vpn(cancel)?;
     require_running_service()?;
     let document = Zeroizing::new(managed_tunnel::render(profile, routing)?);
     let directory = engine.prepare_profile(profile, &document, cancel)?;

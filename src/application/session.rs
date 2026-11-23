@@ -7,8 +7,8 @@ use vpn_domain::client::TelemetrySettings;
 pub use vpn_domain::client::{
     ClientError, ConnectionMode, DEFAULT_SUBSCRIPTION_USER_AGENT, Language,
     MAX_SUBSCRIPTION_USER_AGENT_BYTES, ProbeHttpMethod, ProbeMethod, ProbeSettings, ProbeStrategy,
-    ProfileUnavailableReason, Secret, TelemetryMode, UnavailableProfile,
-    validate_subscription_user_agent,
+    ProfileUnavailableReason, Secret, TelemetryMode, TunAdapterKind, TunConflict,
+    UnavailableProfile, validate_subscription_user_agent,
 };
 pub use vpn_domain::provider::{
     ProviderChangeKind, ProviderKey, ProviderMetadataClass, SubscriptionUsage,

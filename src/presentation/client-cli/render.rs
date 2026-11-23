@@ -120,6 +120,16 @@ pub fn profiles(snapshot: &ClientSnapshot) {
 }
 
 pub fn error_message(error: ClientError) -> String {
+    if let ClientError::TunConflict(conflict) = error {
+        return format!(
+            "error=TunConflict adapter={:?} description={:?} — Cannot start BlazeCore TUN while another VPN is active. Disconnect the other VPN and try again; system proxy remains available.",
+            conflict.name(),
+            conflict.description()
+        );
+    }
+    if error == ClientError::TunPreflightUnavailable {
+        return "error=TunPreflightUnavailable — Could not check active Windows VPN connections. TUN was not started. Try again; system proxy remains available.".to_owned();
+    }
     if let ClientError::SubscriptionHttp(error) = error {
         let status = error.status();
         return error.detail().map_or_else(
@@ -384,4 +394,23 @@ pub fn connection(snapshot: &ClientSnapshot, mode: ConnectionMode) -> Result<(),
         routing_selection("routing_active", Some(selection));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client_core::{TunAdapterKind, TunConflict};
+
+    #[test]
+    fn tun_conflict_preserves_local_adapter_details_and_action() {
+        let message = error_message(ClientError::TunConflict(TunConflict::new(
+            "AmneziaVPN",
+            "WireGuard Tunnel",
+            TunAdapterKind::WireGuard,
+        )));
+        assert!(message.contains("error=TunConflict"));
+        assert!(message.contains("adapter=\"AmneziaVPN\""));
+        assert!(message.contains("description=\"WireGuard Tunnel\""));
+        assert!(message.contains("Disconnect the other VPN"));
+    }
 }

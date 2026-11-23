@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::localization::{Key, Locale, text};
+use crate::localization::{self, Key, Locale, text};
 use crate::session::{
     ClientError, ClientSnapshot, ConnectionMode, ConnectionStatus, Language, ModeCapabilities,
     ProbeSettings, ProfileSummary, ProfileUnavailableReason, Secret, TelemetryBearerChange,
@@ -186,6 +186,22 @@ impl ErrorNotice {
             Self::Client(ClientError::SubscriptionHttp(_)) => {
                 self.text_with_code(locale, self.key())
             }
+            Self::Client(ClientError::TunConflict(conflict)) => {
+                let name = conflict.name();
+                let description = conflict.description();
+                let adapter = match (
+                    name.is_empty(),
+                    description.is_empty() || name == description,
+                ) {
+                    (true, _) => description.to_owned(),
+                    (false, true) => name.to_owned(),
+                    (false, false) => format!("{name} ({description})"),
+                };
+                Cow::Owned(
+                    localization::format(locale, Key::TunConflict, &[("adapter", &adapter)])
+                        .unwrap_or_else(|_| text(locale, Key::TunPreflightUnavailable).to_owned()),
+                )
+            }
             _ => Cow::Borrowed(text(locale, self.key())),
         }
     }
@@ -198,6 +214,9 @@ impl ErrorNotice {
                     || format!("HTTP {status}"),
                     |detail| format!("HTTP {status} — {detail}"),
                 ))
+            }
+            Self::Client(ClientError::TunConflict(_)) => {
+                Cow::Owned(format!("TunConflict — {}", self.text(locale)))
             }
             Self::Client(error) => Cow::Owned(format!("{error:?} — {}", text(locale, message))),
             Self::Local(_) => Cow::Borrowed(text(locale, message)),
@@ -232,6 +251,8 @@ pub fn error_key(error: ClientError) -> Key {
         ClientError::EngineStart => Key::EngineFailed,
         ClientError::SystemProxyUnavailable => Key::SystemProxyUnavailable,
         ClientError::SystemProxyRestoreFailed => Key::SystemProxyRestoreFailed,
+        ClientError::TunConflict(_) => Key::TunConflict,
+        ClientError::TunPreflightUnavailable => Key::TunPreflightUnavailable,
         ClientError::TunServiceUnavailable => Key::TunServiceUnavailable,
         ClientError::LinuxTunUnavailable => Key::LinuxTunUnavailable,
         ClientError::EngineReadiness => Key::EngineReadiness,
@@ -245,6 +266,36 @@ pub fn error_key(error: ClientError) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_conflict_names_the_adapter_and_explains_recovery_in_both_locales() {
+        use crate::session::{TunAdapterKind, TunConflict};
+
+        let error = ErrorNotice::Client(ClientError::TunConflict(TunConflict::new(
+            "AmneziaVPN",
+            "WireGuard Tunnel",
+            TunAdapterKind::WireGuard,
+        )));
+        for (locale, recovery) in [
+            (Locale::Russian, "Отключите другой VPN"),
+            (Locale::English, "Disconnect the other VPN"),
+        ] {
+            let message = error.text(locale);
+            assert!(message.contains("AmneziaVPN (WireGuard Tunnel)"));
+            assert!(message.contains(recovery));
+            assert!(!message.contains("{adapter}"));
+            assert!(
+                error
+                    .text_with_code(locale, error.key())
+                    .contains("AmneziaVPN")
+            );
+        }
+        assert_eq!(error.key(), Key::TunConflict);
+        assert_eq!(
+            error_key(ClientError::TunPreflightUnavailable),
+            Key::TunPreflightUnavailable
+        );
+    }
 
     #[test]
     fn hidden_details_apply_only_to_profiles_from_the_provider_subscription() {
