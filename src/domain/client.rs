@@ -413,7 +413,7 @@ impl ProxyProfile {
             && self.protocol.name() == other.protocol.name()
     }
 
-    fn same_connection_settings(&self, other: &Self) -> bool {
+    pub fn same_connection_settings(&self, other: &Self) -> bool {
         self.protocol == other.protocol
             && self.transport == other.transport
             && self.security == other.security

@@ -27,6 +27,8 @@ use crate::telemetry::Telemetry;
 type Notifier = Arc<dyn Fn() + Send + Sync>;
 const COMMAND_CAPACITY: usize = 32;
 const ENGINE_CHECK_INTERVAL: Duration = Duration::from_millis(400);
+mod probes;
+use probes::ProbeQueue;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum SubscriptionRefreshMode {
@@ -365,8 +367,24 @@ fn validate_command(command: &ClientCommand) -> Result<(), ClientError> {
             }
             Subscription::validate_title(name)?;
         }
-        ClientCommand::UpdateProfile { profile_uuid, text } => {
+        ClientCommand::UpdateProfile {
+            profile_uuid,
+            text,
+            title,
+        } => {
             validate_profile_update(profile_uuid, text)?;
+            if let Some(title) = title {
+                Subscription::validate_title(title)?;
+            }
+        }
+        ClientCommand::RenameProfile {
+            profile_uuid,
+            title,
+        } => {
+            if profile_uuid.is_empty() || profile_uuid.len() > 64 {
+                return Err(ClientError::InvalidInput);
+            }
+            Subscription::validate_title(title)?;
         }
         ClientCommand::AddSubscription { title: name, url }
         | ClientCommand::UpdateSubscription {
@@ -507,11 +525,20 @@ impl WorkerContext {
     }
 
     fn publish(&self, update: impl FnOnce(&mut ClientSnapshot)) {
-        if let Ok(mut snapshot) = self.snapshot.write() {
-            update(&mut snapshot);
+        self.publish_if(|snapshot| {
+            update(snapshot);
+            true
+        });
+    }
+
+    fn publish_if(&self, update: impl FnOnce(&mut ClientSnapshot) -> bool) {
+        if let Ok(mut snapshot) = self.snapshot.write()
+            && update(&mut snapshot)
+        {
             snapshot.revision = snapshot.revision.saturating_add(1);
+            drop(snapshot);
+            self.notify();
         }
-        self.notify();
     }
 
     fn notify(&self) {
@@ -652,6 +679,11 @@ fn run_worker(
     state.record(ClientEventKind::Started);
     state.publish(&application, &context, false, None, None);
     state.drive(&mut application, &context, &receiver, subscription_refresh);
+    // The facade's existing shutdown deadline remains bounded. Keep ownership
+    // of in-flight resources until their cancellable adapters actually exit.
+    while state.probes.active() {
+        let _ = state.probes.cancel_and_wait(&mut application, &context);
+    }
     let result = application.disconnect();
     state.finish_disconnect(result);
     state.record(match result {
@@ -684,6 +716,7 @@ impl WorkerState {
     ) {
         let mut refresh = RefreshDriver::new(mode, application);
         loop {
+            self.probes.poll(application, context);
             refresh.publish_deadline(application, context);
             let engine_wait =
                 (self.connection == ConnectionStatus::Connected).then_some(ENGINE_CHECK_INTERVAL);
@@ -691,6 +724,7 @@ impl WorkerState {
                 .wait(application)
                 .into_iter()
                 .chain(engine_wait)
+                .chain(self.probes.active().then_some(Duration::from_millis(20)))
                 .min();
             match receive_command(receiver, wait) {
                 Ok(message) => {
@@ -759,6 +793,16 @@ impl WorkerState {
         id: RequestId,
         schedule: &mut AutomaticRefresh,
     ) {
+        if matches!(
+            command,
+            ClientCommand::Connect { .. }
+                | ClientCommand::Disconnect
+                | ClientCommand::ReconnectRouting { .. }
+        ) && let Err(error) = self.probes.cancel_and_wait(application, context)
+        {
+            self.publish(application, context, false, Some(error), Some(id));
+            return;
+        }
         let handled_subscription = refresh_or_removal(&command).map(str::to_owned);
         let result = match command {
             ClientCommand::ReconnectRouting { pending } => {
@@ -923,6 +967,7 @@ fn next_refresh<'a>(
 }
 
 struct WorkerState {
+    probes: ProbeQueue,
     connection: ConnectionStatus,
     local_proxy: Option<String>,
     cleanup_required: bool,
@@ -934,6 +979,7 @@ struct WorkerState {
 impl WorkerState {
     fn new(telemetry_settings: &TelemetrySettings, subscription_hwid: Option<Secret>) -> Self {
         Self {
+            probes: ProbeQueue::default(),
             connection: ConnectionStatus::Disconnected,
             local_proxy: None,
             cleanup_required: false,
@@ -1002,6 +1048,10 @@ impl WorkerState {
         context.publish(|snapshot| {
             snapshot.profiles = profiles;
             snapshot.profile_latencies = application.profile_latencies().clone();
+            snapshot.profile_probes.retain(|uuid, status| {
+                status.state != ProfileProbeState::Finished
+                    || snapshot.profile_latencies.contains_key(uuid)
+            });
             snapshot.profile_probe_available =
                 !self.cleanup_required && application.can_probe_profile();
             snapshot.probe_settings.clone_from(&catalog.settings.probe);
@@ -1133,29 +1183,22 @@ impl WorkerState {
         command: ClientCommand,
         request_id: RequestId,
     ) -> Result<(), ClientError> {
-        let started = Instant::now();
-        let cancel = Cancellation::new(context.cancellation.clone(), request_id.0);
-        let result = if self.cleanup_required {
+        let (profile, subscription, bulk) = match command {
+            ClientCommand::ProbeProfile { profile_uuid } => (Some(profile_uuid), None, false),
+            ClientCommand::ProbeProfiles { subscription_uuid } => (None, subscription_uuid, true),
+            _ => return Err(ClientError::InvalidInput),
+        };
+        let jobs = if self.cleanup_required {
             Err(ClientError::DisconnectFirst)
         } else {
-            execute(application, command, &cancel)
+            application.prepare_profile_probes(profile.as_deref(), subscription.as_deref())
         };
-        if let Err(error) = result {
-            self.telemetry
-                .record_with_duration(ClientEventKind::Failed(error), Some(started.elapsed()));
+        match jobs {
+            Ok(jobs) => self.probes.submit(jobs, request_id, subscription, bulk),
+            Err(error) => self.probes.reject(request_id, error),
         }
-        context.publish(|snapshot| {
-            snapshot
-                .profile_latencies
-                .clone_from(application.profile_latencies());
-            snapshot.completed_request = Some(request_id);
-            snapshot.last_error = result.err();
-            if result.is_err() {
-                snapshot.diagnostics = self.telemetry.summary();
-                snapshot.diagnostic_events = self.telemetry.events();
-            }
-        });
-        result
+        self.probes.poll(application, context);
+        Ok(())
     }
 
     fn handle_routing_reconnect(
@@ -1342,9 +1385,20 @@ fn execute(
         ClientCommand::ImportText { title, text } => {
             application.import_text(&title, text.as_bytes())
         }
-        ClientCommand::UpdateProfile { profile_uuid, text } => {
-            application.update_profile(&profile_uuid, text.expose().as_bytes(), cancel)
-        }
+        ClientCommand::UpdateProfile {
+            profile_uuid,
+            text,
+            title,
+        } => application.update_profile(
+            &profile_uuid,
+            text.expose().as_bytes(),
+            title.as_deref(),
+            cancel,
+        ),
+        ClientCommand::RenameProfile {
+            profile_uuid,
+            title,
+        } => application.rename_profile(&profile_uuid, &title, cancel),
         ClientCommand::SelectProfile { profile_uuid } => application.select_profile(&profile_uuid),
         ClientCommand::ProbeProfile { profile_uuid } => {
             application.probe_profile(&profile_uuid, cancel)
@@ -1485,7 +1539,9 @@ fn command_event(command: &ClientCommand) -> Option<ClientEventKind> {
         }
         ClientCommand::RemoveSubscription { .. } => ClientEventKind::SubscriptionRemoved,
         ClientCommand::ImportText { .. } => ClientEventKind::ProfilesImported,
-        ClientCommand::UpdateProfile { .. } => ClientEventKind::ProfileUpdated,
+        ClientCommand::UpdateProfile { .. } | ClientCommand::RenameProfile { .. } => {
+            ClientEventKind::ProfileUpdated
+        }
         ClientCommand::SelectProfile { .. } => ClientEventKind::ProfileSelected,
         ClientCommand::ProbeProfile { .. }
         | ClientCommand::ProbeProfiles { .. }

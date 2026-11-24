@@ -10,32 +10,62 @@ impl ClientApplication {
         &mut self,
         profile_uuid: &str,
         input: &[u8],
+        title: Option<&str>,
         cancel: &Cancellation,
     ) -> Result<(), ClientError> {
         cancel.check()?;
+        let index = self.manual_profile_index(profile_uuid)?;
         if self.active_profile_uuid() == Some(profile_uuid) {
             return Err(ClientError::DisconnectFirst);
         }
-        let index = self
-            .catalog
-            .profiles
-            .iter()
-            .position(|item| item.profile.profile_uuid == profile_uuid)
-            .ok_or(ClientError::ProfileNotFound)?;
-        if self.profile_source_hidden(&self.catalog.profiles[index]) {
-            return Err(ClientError::UnsupportedFeature);
+        if let Some(title) = title {
+            Subscription::validate_title(title)?;
         }
         let [mut profile]: [ProxyProfile; 1] = self
             .normalize_profiles(input)?
             .try_into()
             .map_err(|_| ClientError::InvalidSubscription)?;
         profile.profile_uuid = profile_uuid.to_owned();
+        if let Some(title) = title {
+            profile.name = title.to_owned();
+        }
         let mut candidate = self.catalog.clone();
         candidate.profiles[index].profile = profile;
         cancel.check()?;
         self.commit(candidate)?;
         self.profile_latencies.remove(profile_uuid);
         Ok(())
+    }
+
+    pub fn rename_profile(
+        &mut self,
+        profile_uuid: &str,
+        title: &str,
+        cancel: &Cancellation,
+    ) -> Result<(), ClientError> {
+        cancel.check()?;
+        let index = self.manual_profile_index(profile_uuid)?;
+        Subscription::validate_title(title)?;
+        if self.catalog.profiles[index].profile.name == title {
+            return Ok(());
+        }
+        let mut candidate = self.catalog.clone();
+        candidate.profiles[index].profile.name = title.to_owned();
+        cancel.check()?;
+        self.commit(candidate)
+    }
+
+    fn manual_profile_index(&self, profile_uuid: &str) -> Result<usize, ClientError> {
+        let index = self
+            .catalog
+            .profiles
+            .iter()
+            .position(|item| item.profile.profile_uuid == profile_uuid)
+            .ok_or(ClientError::ProfileNotFound)?;
+        if self.catalog.profiles[index].subscription_uuid.is_some() {
+            return Err(ClientError::UnsupportedFeature);
+        }
+        Ok(index)
     }
 
     pub fn profile_source_hidden(&self, profile: &CatalogProfile) -> bool {

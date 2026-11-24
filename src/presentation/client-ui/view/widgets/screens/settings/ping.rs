@@ -4,7 +4,7 @@ use vpn_presentation::session::{ProbeHttpMethod, ProbeMethod, ProbeSettings, Pro
 
 use super::{ENTRY_WIDTH, ViewFrame, choice_row, divider, group, setting_row, toggle_row};
 use crate::view::settings_state::{PingDisplay, ProbeSettingsDraft};
-use crate::view::widgets::controls::{roomy_input, selector, selector_option};
+use crate::view::widgets::controls::{primary_action, roomy_input, selector, selector_option};
 
 impl ViewFrame<'_> {
     pub(super) fn ping_settings(&mut self, ui: &mut egui::Ui) {
@@ -70,10 +70,7 @@ fn probe_form(
     }
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let save = ui
-            .add_enabled(
-                draft.is_dirty(),
-                egui::Button::new(tr(Key::Save)).min_size(egui::vec2(124.0, 32.0)),
-            )
+            .add_enabled(draft.is_dirty(), primary_action(ui, tr(Key::Save)))
             .clicked();
         if draft.pending.is_some() {
             ui.spinner();

@@ -1,17 +1,20 @@
+mod profile_editor;
+
 use std::borrow::Cow;
 
 use egui::class::HasClasses;
 
 use super::ViewFrame;
-use super::controls::{feedback, paint_spinner, roomy_input};
-use super::flags::server_name;
+use super::controls::{
+    ACTION_WIDTH, SELECTOR_HEIGHT, destructive_action, feedback, paint_spinner, primary_action,
+    roomy_input, secondary_action,
+};
 use super::layout::{ViewportLayout, modal_content_width};
 use super::screens::{toggle, toggle_width};
-use crate::view::view_model::{ConfigurationDraft, ConfigurationKind, ProfileEditor};
+use crate::view::view_model::{ConfigurationDraft, ConfigurationKind};
 use vpn_presentation::import::{self, ImportKind};
 use vpn_presentation::localization::{Key, Locale};
-use vpn_presentation::model::{ErrorNotice, Intent, Removal, profile_details_hidden};
-use vpn_presentation::session::{ProfileSummary, Secret};
+use vpn_presentation::model::{ErrorNotice, Intent, Removal};
 
 const DIALOG_WIDTH: f32 = 728.0;
 const DIALOG_PADDING: i8 = 28;
@@ -62,7 +65,7 @@ impl ViewFrame<'_> {
                 );
                 ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.button(self.tr(Key::Close)).clicked()
+                    ui.add(secondary_action(ui, self.tr(Key::Close))).clicked()
                 })
                 .inner
             });
@@ -410,7 +413,7 @@ impl ViewFrame<'_> {
             egui::vec2(ui.available_width(), FOOTER_HEIGHT),
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                let mut button = egui::Button::new(self.tr(key)).min_size(egui::vec2(110.0, 34.0));
+                let mut button = primary_action(ui, self.tr(key));
                 button.set_class(crate::view::theme::DISABLED_BUTTON, !can_submit);
                 let response = ui.add_enabled(can_submit, button);
                 let response = if draft.pending.is_some() {
@@ -433,154 +436,6 @@ impl ViewFrame<'_> {
         .inner
     }
 
-    pub(super) fn profile_editor_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(mut draft) = self.view.profile_editor.take() else {
-            return;
-        };
-        let Some(profile) = self
-            .snapshot
-            .profiles
-            .iter()
-            .find(|row| row.profile_uuid == draft.uuid)
-        else {
-            return;
-        };
-        let pending = draft.pending.is_some();
-        let modal = egui::Modal::new(egui::Id::unique("profile-editor"))
-            .frame(dialog_frame(ui, 16))
-            .show(ui.ctx(), |ui| {
-                self.profile_editor_contents(ui, profile, &mut draft)
-            });
-        if !pending && modal.should_close() {
-            self.view.dismissed_error = draft.feedback;
-            return;
-        }
-        if modal.inner {
-            self.emit(Intent::UpdateProfile {
-                profile_uuid: draft.uuid.clone(),
-                text: Secret::new(import::payload(&draft.text)),
-            });
-        }
-        self.view.profile_editor = Some(draft);
-    }
-
-    fn profile_editor_contents(
-        &mut self,
-        ui: &mut egui::Ui,
-        profile: &ProfileSummary,
-        draft: &mut ProfileEditor,
-    ) -> bool {
-        ui.set_width(modal_content_width(ui, DIALOG_WIDTH, 56.0));
-        ui.horizontal(|ui| {
-            let width = (ui.available_width() - 32.0).max(0.0);
-            ui.add_sized(
-                [width, FIELD_HEIGHT],
-                egui::Label::new(egui::RichText::new(self.tr(Key::EditConfiguration)).size(22.0))
-                    .truncate(),
-            );
-            if ui
-                .add_enabled(draft.pending.is_none(), egui::Button::new("×"))
-                .on_hover_text(self.tr(Key::Close))
-                .clicked()
-            {
-                ui.close();
-            }
-        });
-        ui.add(egui::Label::new(server_name(&profile.name)).truncate());
-        ui.add_space(6.0);
-        let hidden = profile_details_hidden(self.snapshot, profile);
-        if hidden {
-            draft.text.clear();
-            ui.label(self.tr(Key::ProfileHidden));
-        } else {
-            self.profile_source_field(ui, profile, draft);
-        }
-        ui.add_space(8.0);
-        self.profile_editor_actions(ui, profile, draft, hidden)
-    }
-
-    fn profile_source_field(
-        &self,
-        ui: &mut egui::Ui,
-        profile: &ProfileSummary,
-        draft: &mut ProfileEditor,
-    ) {
-        let label = if profile.protocol == "AmneziaWG" && profile.source.is_some() {
-            Key::AmneziaProfileParameters
-        } else if profile.source.is_some() {
-            Key::ProfileSource
-        } else {
-            Key::ProfileSourceMissing
-        };
-        ui.weak(self.tr(label));
-        let height = (ui.ctx().content_rect().height() - 240.0).clamp(80.0, 410.0);
-        egui::ScrollArea::both().max_height(height).show(ui, |ui| {
-            let edit = egui::TextEdit::multiline(&mut draft.text)
-                .id_salt(("profile-source", &draft.uuid))
-                .code_editor()
-                .desired_rows(12)
-                .desired_width(ui.available_width())
-                .char_limit(import::MAX_TEXT_BYTES);
-            if ui.add_enabled(draft.pending.is_none(), edit).changed() {
-                draft.feedback = None;
-            }
-        });
-        if let Some((_, error)) = draft.feedback {
-            feedback(
-                ui,
-                &error.text_with_code(self.view.locale, error.key()),
-                None,
-            );
-        }
-    }
-
-    fn profile_editor_actions(
-        &mut self,
-        ui: &mut egui::Ui,
-        profile: &ProfileSummary,
-        draft: &ProfileEditor,
-        hidden: bool,
-    ) -> bool {
-        let active = self.snapshot.active_profile_uuid.as_ref() == Some(&draft.uuid);
-        let enabled = !active && !self.snapshot.busy && draft.pending.is_none();
-        ui.horizontal_wrapped(|ui| {
-            if draft.pending.is_some() {
-                ui.spinner();
-            } else {
-                self.profile_ping_button(ui, Some(profile), false);
-            }
-            if ui
-                .add_enabled(enabled, egui::Button::new(self.tr(Key::Remove)))
-                .clicked()
-            {
-                self.view.removal = Some(Removal::Profile(draft.uuid.clone()));
-                ui.close();
-            }
-            if hidden {
-                return false;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = import::payload(&draft.text);
-                let changed = !text.is_empty()
-                    && profile
-                        .source
-                        .as_ref()
-                        .is_none_or(|source| source.expose() != text);
-                let button =
-                    ui.add_enabled(enabled && changed, egui::Button::new(self.tr(Key::Save)));
-                if active {
-                    button
-                        .on_disabled_hover_text(self.tr(Key::DisconnectFirst))
-                        .clicked()
-                } else {
-                    button.clicked()
-                }
-            })
-            .inner
-        })
-        .inner
-    }
-
     pub(super) fn remove_confirmation(&mut self, ui: &mut egui::Ui) {
         let Some(removal) = self.view.removal.clone() else {
             return;
@@ -589,7 +444,10 @@ impl ViewFrame<'_> {
             Removal::Subscription(_) => Key::RemoveSubscriptionConfirm,
             Removal::Profile(_) => Key::ProfileRemoved,
         };
-        let dialog = egui::Modal::new(egui::Id::unique("remove-confirmation"))
+        let id = egui::Id::unique("remove-confirmation");
+        let width = modal_content_width(ui, 340.0, 48.0);
+        let dialog = egui::Modal::new(id)
+            .area(egui::Modal::default_area(id).default_width(width))
             .frame(dialog_frame(ui, 20))
             .show(ui.ctx(), |ui| self.remove_confirmation_contents(ui, key));
         if dialog.inner == FormAction::Submit {
@@ -601,17 +459,19 @@ impl ViewFrame<'_> {
     }
 
     fn remove_confirmation_contents(&self, ui: &mut egui::Ui, question: Key) -> FormAction {
-        ui.set_width(modal_content_width(ui, 360.0, 40.0));
-        ui.vertical_centered(|ui| {
-            ui.add(egui::Label::new(self.tr(question)).wrap());
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let size = egui::vec2(104.0, 34.0);
+        let width = modal_content_width(ui, 340.0, 48.0);
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        ui.vertical_centered(|ui| ui.add(egui::Label::new(self.tr(question)).wrap()));
+        ui.add_space(12.0);
+        ui.with_layout(
+            egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center),
+            |ui| {
+                let button_width = ((width - ui.spacing().item_spacing.x) / 2.0).min(ACTION_WIDTH);
                 if ui
                     .add(
-                        egui::Button::new(self.tr(Key::Cancel))
-                            .frame_when_inactive(false)
-                            .min_size(size),
+                        secondary_action(ui, self.tr(Key::Cancel))
+                            .min_size(egui::vec2(button_width, SELECTOR_HEIGHT)),
                     )
                     .clicked()
                 {
@@ -620,16 +480,16 @@ impl ViewFrame<'_> {
                 if ui
                     .add_enabled(
                         !self.snapshot.busy,
-                        egui::Button::new(self.tr(Key::ConfirmRemove)).min_size(size),
+                        destructive_action(ui, self.tr(Key::ConfirmRemove))
+                            .min_size(egui::vec2(button_width, SELECTOR_HEIGHT)),
                     )
                     .clicked()
                 {
                     return FormAction::Submit;
                 }
                 FormAction::None
-            })
-            .inner
-        })
+            },
+        )
         .inner
     }
 }

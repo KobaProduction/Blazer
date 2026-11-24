@@ -149,9 +149,22 @@ fn backend_command(intent: Intent) -> ClientCommand {
         },
         Intent::ReconnectRouting(pending) => ClientCommand::ReconnectRouting { pending },
         Intent::ImportProfiles { title, text } => ClientCommand::ImportText { title, text },
-        Intent::UpdateProfile { profile_uuid, text } => {
-            ClientCommand::UpdateProfile { profile_uuid, text }
-        }
+        Intent::RenameProfile {
+            profile_uuid,
+            title,
+        } => ClientCommand::RenameProfile {
+            profile_uuid,
+            title,
+        },
+        Intent::UpdateProfile {
+            profile_uuid,
+            text,
+            title,
+        } => ClientCommand::UpdateProfile {
+            profile_uuid,
+            text,
+            title,
+        },
         Intent::SaveSubscription {
             subscription_uuid: Some(subscription_uuid),
             title,

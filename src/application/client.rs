@@ -19,6 +19,7 @@ pub use vpn_domain::client::{
 pub use crate::cancellation::{Cancellation, CancellationSignal};
 use crate::session::{ModeCapabilities, ProfileLatency, RoutingProfile, TelemetryBearerChange};
 pub use ports::*;
+pub use probe::{PreparedProfileProbe, ProbeRevision};
 
 pub struct ClientApplication {
     catalog: Catalog,
@@ -91,17 +92,31 @@ impl ClientApplication {
     fn commit(&mut self, candidate: Catalog) -> Result<(), ClientError> {
         candidate.validate()?;
         self.services.store.save(&candidate)?;
-        self.profile_latencies.retain(|uuid, _| {
-            candidate
+        if !self.profile_latencies.is_empty() {
+            let old_profiles = self
+                .catalog
                 .profiles
                 .iter()
-                .any(|item| item.profile.profile_uuid == *uuid)
-                || candidate
+                .map(|item| (item.profile.profile_uuid.as_str(), &item.profile))
+                .collect::<HashMap<_, _>>();
+            let new_profiles = candidate
+                .profiles
+                .iter()
+                .map(|item| (item.profile.profile_uuid.as_str(), &item.profile))
+                .collect::<HashMap<_, _>>();
+            self.profile_latencies.retain(|uuid, _| {
+                if let Some(new) = new_profiles.get(uuid.as_str()) {
+                    return old_profiles
+                        .get(uuid.as_str())
+                        .is_some_and(|old| old.same_connection_settings(new));
+                }
+                candidate
                     .subscriptions
                     .iter()
                     .flat_map(|subscription| &subscription.unavailable_profiles)
                     .any(|row| row.probe_id.as_ref() == Some(uuid))
-        });
+            });
+        }
         self.catalog = candidate;
         Ok(())
     }

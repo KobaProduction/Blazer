@@ -450,7 +450,10 @@ fn subscription_user_agent(
     }
     let can_save = enabled && valid && input != saved;
     let clicked = ui
-        .add_enabled(can_save, egui::Button::new(tr(Key::Save)))
+        .add_enabled(
+            can_save,
+            crate::view::widgets::controls::primary_action(ui, tr(Key::Save)),
+        )
         .clicked();
     (can_save && (clicked || enter))
         .then(|| Intent::SetSubscriptionUserAgent((!input.is_empty()).then(|| Secret::new(input))))
@@ -492,7 +495,10 @@ fn inbound_port(
     }
     let can_save = enabled && port.is_some_and(|value| value != saved);
     let clicked = ui
-        .add_enabled(can_save, egui::Button::new(tr(Key::Save)))
+        .add_enabled(
+            can_save,
+            crate::view::widgets::controls::primary_action(ui, tr(Key::Save)),
+        )
         .clicked();
     port.filter(|_| can_save && (submit || clicked))
 }

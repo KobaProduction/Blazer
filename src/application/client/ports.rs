@@ -46,7 +46,19 @@ pub trait UuidPort: Send {
     fn new_uuid(&self) -> String;
 }
 
+/// An owned, cancellable measurement. It must release its resources before returning.
+pub type OwnedProbeTask = Box<dyn FnOnce(&Cancellation) -> Result<Duration, ClientError> + Send>;
+pub const MAX_CONCURRENT_PROFILE_PROBES: usize = 5;
+
 pub trait ProfileProbePort: Send {
+    fn prepare_probe(
+        &self,
+        _host: String,
+        _port: u16,
+        _settings: ProbeSettings,
+    ) -> Result<OwnedProbeTask, ClientError> {
+        Err(ClientError::UnsupportedFeature)
+    }
     fn supports_icmp(&self) -> bool {
         false
     }
@@ -90,6 +102,15 @@ impl RunningConnection {
 }
 
 pub trait ClientEnginePort: Send {
+    fn prepare_profile_probe(
+        &self,
+        _profile: &ProxyProfile,
+        _active: Option<&ProxyProfile>,
+        _reuse_active_proxy: bool,
+        _settings: &ProbeSettings,
+    ) -> Result<OwnedProbeTask, ClientError> {
+        Err(ClientError::UnsupportedFeature)
+    }
     fn capabilities(&self) -> ModeCapabilities;
     /// Checks that this engine can represent the profile without starting a connection.
     fn validate_profile(&self, profile: &ProxyProfile) -> Result<(), ClientError>;

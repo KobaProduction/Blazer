@@ -989,10 +989,18 @@ fn dialog_buttons(ui: &mut egui::Ui, locale: Locale, confirm: Key, enabled: bool
             let confirm = ui
                 .add_enabled(
                     enabled,
-                    egui::Button::new(localization::text(locale, confirm)),
+                    crate::view::widgets::controls::primary_action(
+                        ui,
+                        localization::text(locale, confirm),
+                    ),
                 )
                 .clicked();
-            let cancel = ui.button(localization::text(locale, Key::Cancel)).clicked();
+            let cancel = ui
+                .add(crate::view::widgets::controls::secondary_action(
+                    ui,
+                    localization::text(locale, Key::Cancel),
+                ))
+                .clicked();
             DialogButtons { confirm, cancel }
         },
     )

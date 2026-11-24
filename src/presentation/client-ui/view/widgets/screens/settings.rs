@@ -169,8 +169,18 @@ impl ViewFrame<'_> {
                 ui.heading(self.tr(Key::ResetSettings));
                 ui.label(self.tr(Key::ResetSettingsConfirm));
                 ui.horizontal_wrapped(|ui| {
-                    cancel = ui.button(self.tr(Key::Cancel)).clicked();
-                    reset = ui.button(self.tr(Key::ResetSettings)).clicked();
+                    cancel = ui
+                        .add(crate::view::widgets::controls::secondary_action(
+                            ui,
+                            self.tr(Key::Cancel),
+                        ))
+                        .clicked();
+                    reset = ui
+                        .add(crate::view::widgets::controls::primary_action(
+                            ui,
+                            self.tr(Key::ResetSettings),
+                        ))
+                        .clicked();
                 });
             });
         if reset {

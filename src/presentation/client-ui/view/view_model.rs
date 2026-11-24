@@ -177,12 +177,6 @@ pub(super) struct ConfigurationDraft {
     pub source: ImportSource,
 }
 
-#[derive(PartialEq, Eq)]
-pub(super) enum ProbeScope {
-    Group(Option<String>),
-    Profile(String),
-}
-
 #[derive(Default)]
 pub(super) struct RoutingReconnectPrompt {
     edit: Option<(RequestId, Option<RoutingReconnect>)>,
@@ -271,8 +265,11 @@ impl SubscriptionErrors {
 
 pub(super) struct ProfileEditor {
     pub uuid: String,
+    pub title: String,
     pub text: String,
     pub pending: Option<RequestId>,
+    pub probe_request: Option<RequestId>,
+    pub probe_feedback: Option<(u64, ErrorNotice)>,
     pub feedback: Option<(u64, ErrorNotice)>,
 }
 
@@ -364,7 +361,6 @@ pub struct ViewState {
     pub(super) configuration: Option<ConfigurationDraft>,
     pub(super) profile_editor: Option<ProfileEditor>,
     pub(super) subscription_refresh: Option<(String, RequestId)>,
-    pub(super) probe: Option<(ProbeScope, RequestId)>,
     pub(super) routing_reconnect: RoutingReconnectPrompt,
     pub(super) refreshed_subscription: Option<(String, Instant)>,
     pub(super) subscription_errors: SubscriptionErrors,
@@ -394,7 +390,6 @@ impl Default for ViewState {
             configuration: None,
             profile_editor: None,
             subscription_refresh: None,
-            probe: None,
             routing_reconnect: RoutingReconnectPrompt::default(),
             refreshed_subscription: None,
             subscription_errors: SubscriptionErrors::default(),
@@ -500,13 +495,6 @@ impl ViewState {
             self.refreshed_subscription = None;
         }
         let done = snapshot.completed_request?;
-        if self
-            .probe
-            .as_ref()
-            .is_some_and(|(_, pending)| pending.0 <= done.0)
-        {
-            self.probe = None;
-        }
         if self.subscription_refresh.as_ref()?.1.0 > done.0 {
             return None;
         }
@@ -556,11 +544,14 @@ impl ViewState {
     pub(super) fn open_profile_editor(&mut self, profile: &ProfileSummary) {
         self.profile_editor = Some(ProfileEditor {
             uuid: profile.profile_uuid.clone(),
+            title: profile.name.clone(),
             text: profile
                 .source
                 .as_ref()
                 .map_or_else(String::new, |source| source.expose().to_owned()),
             pending: None,
+            probe_request: None,
+            probe_feedback: None,
             feedback: None,
         });
     }
@@ -770,14 +761,12 @@ mod tests {
     fn probe_completion_leaves_a_queued_subscription_refresh_pending() {
         let mut state = ViewState::default();
         let now = Instant::now();
-        state.probe = Some((ProbeScope::Profile("server".into()), RequestId(1)));
         state.subscription_refresh = Some(("sub".into(), RequestId(2)));
         let snapshot = ClientSnapshot {
             completed_request: Some(RequestId(1)),
             ..ClientSnapshot::default()
         };
         assert_eq!(state.update_catalog_request(&snapshot, now), None);
-        assert!(state.probe.is_none());
         assert_eq!(
             state.subscription_refresh,
             Some(("sub".into(), RequestId(2)))

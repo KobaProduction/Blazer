@@ -3,6 +3,23 @@ use egui::class::HasClasses;
 use crate::view::theme::{BUTTON_TEXT, DISABLED_BUTTON};
 
 pub(super) const SELECTOR_HEIGHT: f32 = 34.0;
+pub(super) const ACTION_WIDTH: f32 = 124.0;
+
+pub(super) fn primary_action<'a>(ui: &egui::Ui, label: &'a str) -> egui::Button<'a> {
+    action_button(ui, label, ACTION_WIDTH)
+}
+
+pub(super) fn secondary_action<'a>(ui: &egui::Ui, label: &'a str) -> egui::Button<'a> {
+    let mut button = primary_action(ui, label);
+    button.set_class(crate::view::theme::SECONDARY_BUTTON, true);
+    button
+}
+
+pub(super) fn destructive_action<'a>(ui: &egui::Ui, label: &'a str) -> egui::Button<'a> {
+    let mut button = primary_action(ui, label);
+    button.set_class(crate::view::theme::DESTRUCTIVE_BUTTON, true);
+    button
+}
 
 pub(super) fn action_button<'a>(ui: &egui::Ui, label: &'a str, width: f32) -> egui::Button<'a> {
     egui::Button::new(label)

@@ -70,6 +70,11 @@ pub enum ClientCommand {
     UpdateProfile {
         profile_uuid: String,
         text: Secret,
+        title: Option<String>,
+    },
+    RenameProfile {
+        profile_uuid: String,
+        title: String,
     },
     SelectProfile {
         profile_uuid: String,
@@ -284,6 +289,35 @@ pub enum ProfileLatency {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileProbeState {
+    Queued,
+    Running,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileProbeStatus {
+    pub request_id: RequestId,
+    pub method: ProbeMethod,
+    pub state: ProfileProbeState,
+    pub error: Option<ClientError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeBatchProgress {
+    pub request_id: RequestId,
+    pub subscription_uuid: Option<String>,
+    pub total: usize,
+    pub completed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeCompletion {
+    pub request_id: RequestId,
+    pub error: Option<ClientError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientEventKind {
     Started,
     SubscriptionUpdated,
@@ -374,6 +408,9 @@ pub struct ClientSnapshot {
     pub profiles: Vec<ProfileSummary>,
     pub unavailable_profiles: HashMap<String, Vec<UnavailableProfile>>,
     pub profile_latencies: HashMap<String, ProfileLatency>,
+    pub profile_probes: HashMap<String, ProfileProbeStatus>,
+    pub probe_batches: Vec<ProbeBatchProgress>,
+    pub probe_completions: Vec<ProbeCompletion>,
     pub profile_probe_available: bool,
     pub probe_settings: ProbeSettings,
     pub probe_icmp_available: bool,
@@ -412,6 +449,9 @@ impl Default for ClientSnapshot {
             profiles: Vec::new(),
             unavailable_profiles: HashMap::new(),
             profile_latencies: HashMap::new(),
+            profile_probes: HashMap::new(),
+            probe_batches: Vec::new(),
+            probe_completions: Vec::new(),
             profile_probe_available: false,
             probe_settings: ProbeSettings::default(),
             probe_icmp_available: false,

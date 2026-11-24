@@ -8,6 +8,9 @@ const BUTTON_HOVER: Color32 = Color32::from_rgb(255, 171, 115);
 const BUTTON_PRESSED: Color32 = Color32::from_rgb(230, 118, 56);
 pub(super) const BUTTON_TEXT: Color32 = Color32::from_gray(20);
 pub(super) const DISABLED_BUTTON: ClassName = ClassName::from_static("blazer::disabled_button");
+pub(super) const SECONDARY_BUTTON: ClassName = ClassName::from_static("blazer::secondary_button");
+pub(super) const DESTRUCTIVE_BUTTON: ClassName =
+    ClassName::from_static("blazer::destructive_button");
 
 struct Palette {
     background: Color32,
@@ -72,7 +75,11 @@ impl StyleProvider<ButtonStyle> for AccentButtons {
     fn style(&mut self, args: &StyleArgs<'_>) -> ButtonStyle {
         let mut button: ButtonStyle = DefaultStyle.style(args);
         let classes = args.classes;
-        if button.atom_layout.frame.fill == Color32::TRANSPARENT
+        if classes.has_class(&DESTRUCTIVE_BUTTON) && args.state != WidgetState::Noninteractive {
+            return destructive_style(button, args);
+        }
+        if classes.has_class(&SECONDARY_BUTTON)
+            || button.atom_layout.frame.fill == Color32::TRANSPARENT
             || classes.has_class(&Button::CLASS_HIDE_FRAME_WHEN_INACTIVE)
             || classes.has_class(&Button::CLASS_SELECTED)
             || classes.has_class(&DISABLED_BUTTON)
@@ -90,6 +97,18 @@ impl StyleProvider<ButtonStyle> for AccentButtons {
         button.atom_layout.text_style.color = BUTTON_TEXT;
         button
     }
+}
+
+fn destructive_style(mut button: ButtonStyle, args: &StyleArgs<'_>) -> ButtonStyle {
+    let color = ping_failure_color(&args.style.visuals);
+    let strength = match args.state {
+        WidgetState::Active => 0.24,
+        WidgetState::Hovered => 0.18,
+        _ => 0.10,
+    };
+    button.atom_layout.frame.fill = color.gamma_multiply(strength);
+    button.atom_layout.text_style.color = color;
+    button
 }
 
 pub(super) fn success_color(visuals: &Visuals) -> Color32 {

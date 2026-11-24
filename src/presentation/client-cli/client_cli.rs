@@ -103,14 +103,62 @@ fn complete(
     updates: &Receiver<()>,
     command: ClientCommand,
 ) -> Result<ClientSnapshot, ClientError> {
+    let probe = matches!(
+        &command,
+        ClientCommand::ProbeProfile { .. } | ClientCommand::ProbeProfiles { .. }
+    );
+    let bulk = matches!(&command, ClientCommand::ProbeProfiles { .. });
     let request = client.send(command).map_err(|error| match error {
         SubmitError::Rejected(error) => error,
         SubmitError::Busy => ClientError::Timeout,
         SubmitError::Stopped => ClientError::EngineStopped,
     })?;
+    if probe {
+        return wait_for_probe(client, updates, request, bulk);
+    }
     wait_for(client, updates, |snapshot| {
         snapshot.completed_request == Some(request)
     })
+}
+
+fn wait_for_probe(
+    client: &ClientHandle,
+    updates: &Receiver<()>,
+    request: client_core::RequestId,
+    bulk: bool,
+) -> Result<ClientSnapshot, ClientError> {
+    let initial = client.snapshot();
+    let count = if bulk {
+        initial.profiles.len()
+            + initial
+                .unavailable_profiles
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+    } else {
+        1
+    }
+    .max(1);
+    // Include warm-up, bounded cold-connection retries and process readiness.
+    // WireGuard profiles can intentionally be serialized, so do not divide this
+    // upper bound by the worker count.
+    let per_profile = u64::from(initial.probe_settings.timeout_ms)
+        * (3 * u64::from(initial.probe_settings.attempts) + 3)
+        + 20_000;
+    let deadline = Instant::now() + Duration::from_millis(per_profile.saturating_mul(count as u64));
+    loop {
+        let snapshot = client.snapshot();
+        if let Some(completion) = snapshot
+            .probe_completions
+            .iter()
+            .find(|item| item.request_id == request)
+        {
+            return completion.error.map_or(Ok(snapshot), Err);
+        }
+        updates
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| ClientError::Timeout)?;
+    }
 }
 
 fn wait_for(

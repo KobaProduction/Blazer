@@ -8,11 +8,24 @@ use tokio::task::JoinSet;
 use vpn_application::client::{Cancellation, ClientError, ProfileProbePort};
 use vpn_domain::client::{ProbeMethod, ProbeSettings};
 
-const MAX_CONCURRENT_PROBES: usize = 24;
+const MAX_CONCURRENT_PROBES: usize = vpn_application::client::MAX_CONCURRENT_PROFILE_PROBES;
 
 pub struct TcpProfileProbe;
 
 impl ProfileProbePort for TcpProfileProbe {
+    fn prepare_probe(
+        &self,
+        host: String,
+        port: u16,
+        settings: ProbeSettings,
+    ) -> Result<vpn_application::client::OwnedProbeTask, ClientError> {
+        Ok(Box::new(move |cancel| {
+            Self.connect_times(&[(&host, port)], &settings, cancel)?
+                .into_iter()
+                .next()
+                .ok_or(ClientError::Network)?
+        }))
+    }
     fn supports_icmp(&self) -> bool {
         cfg!(windows)
     }

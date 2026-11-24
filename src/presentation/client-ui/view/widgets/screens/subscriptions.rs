@@ -11,7 +11,7 @@ use vpn_presentation::session::{
 use super::ViewFrame;
 use crate::view::settings_state::{PingDisplay, ServerSort};
 use crate::view::theme;
-use crate::view::view_model::{ConfigurationKind, ProbeScope};
+use crate::view::view_model::ConfigurationKind;
 use crate::view::widgets::controls::{SELECTOR_HEIGHT, more_button, paint_spinner, roomy_input};
 use crate::view::widgets::icons::{Icon, paint_failure_badge};
 use vpn_presentation::localization::{Key, Locale};
@@ -776,6 +776,11 @@ impl<'a> ViewFrame<'a> {
     }
 
     fn ping_blocked(&self, subscription_uuid: Option<&str>) -> Option<Key> {
+        if self.snapshot.probe_batches.iter().any(|batch| {
+            batch.completed < batch.total && batch.subscription_uuid.as_deref() == subscription_uuid
+        }) {
+            return Some(Key::Working);
+        }
         if let Some(reason) = self.probe_blocked() {
             return Some(reason);
         }
@@ -807,9 +812,10 @@ impl<'a> ViewFrame<'a> {
         let blocked = self.ping_blocked(subscription_uuid);
         let button = catalog_icon_button(ui, self.tr(key), blocked.is_none());
         let center = button.rect.center();
-        let probing = matches!(&self.view.probe,
-            Some((ProbeScope::Group(current), _)) if current.as_deref() == subscription_uuid);
-        if probing {
+        let batch = self.snapshot.probe_batches.iter().find(|batch| {
+            batch.completed < batch.total && batch.subscription_uuid.as_deref() == subscription_uuid
+        });
+        if batch.is_some() {
             paint_spinner(ui, center, TOOL_SPINNER_SIZE);
         } else {
             let stroke = ui.style().interact(&button).fg_stroke;
@@ -823,7 +829,14 @@ impl<'a> ViewFrame<'a> {
                 );
             }
         }
-        if let Some(reason) = blocked {
+        if let Some(batch) = batch {
+            button.on_disabled_hover_text(format!(
+                "{}: {}/{}",
+                self.tr(Key::PingRunning),
+                batch.completed,
+                batch.total
+            ));
+        } else if let Some(reason) = blocked {
             button.on_disabled_hover_text(self.tr(reason));
         } else if button.clicked() {
             self.emit(Intent::ProbeProfiles(subscription_uuid.map(str::to_owned)));
@@ -1106,7 +1119,6 @@ mod tests {
     #[test]
     fn probe_keeps_subscription_controls_available() {
         let mut state = ViewState::default();
-        state.probe = Some((ProbeScope::Profile("profile".into()), RequestId(1)));
         let snapshot = ClientSnapshot {
             busy: false,
             profile_probe_available: true,
@@ -1114,7 +1126,7 @@ mod tests {
         };
         let view = ViewFrame::new(&mut state, &snapshot, false, None);
         assert_eq!(view.subscription_change_blocked("subscription"), None);
-        assert_eq!(view.probe_blocked(), Some(Key::Working));
+        assert_eq!(view.probe_blocked(), None);
     }
 
     #[test]

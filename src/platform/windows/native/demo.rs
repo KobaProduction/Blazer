@@ -110,7 +110,9 @@ fn complete(snapshot: &mut ClientSnapshot, request: RequestId, command: ClientCo
         ClientCommand::RemoveProfile { .. } => Some(ClientEventKind::ProfileRemoved),
         ClientCommand::RemoveSubscription { .. } => Some(ClientEventKind::SubscriptionRemoved),
         ClientCommand::ImportText { .. } => Some(ClientEventKind::ProfilesImported),
-        ClientCommand::UpdateProfile { .. } => Some(ClientEventKind::ProfileUpdated),
+        ClientCommand::UpdateProfile { .. } | ClientCommand::RenameProfile { .. } => {
+            Some(ClientEventKind::ProfileUpdated)
+        }
         ClientCommand::AddSubscription { .. }
         | ClientCommand::UpdateSubscription { .. }
         | ClientCommand::RefreshSubscription { .. } => Some(ClientEventKind::SubscriptionUpdated),
@@ -197,15 +199,27 @@ fn apply(
                 Some(Secret::new(text)),
             );
         }
-        ClientCommand::UpdateProfile { profile_uuid, text } => {
+        ClientCommand::UpdateProfile {
+            profile_uuid,
+            text,
+            title,
+        } => {
+            if snapshot.active_profile_uuid.as_deref() == Some(profile_uuid.as_str()) {
+                return Err(ClientError::DisconnectFirst);
+            }
             let protocol = import_protocol(text.expose())?;
-            let profile = snapshot
-                .profiles
-                .iter_mut()
-                .find(|profile| profile.profile_uuid == profile_uuid)
-                .ok_or(ClientError::ProfileNotFound)?;
+            let profile = manual_profile_mut(snapshot, &profile_uuid)?;
             profile.protocol = protocol;
             profile.source = Some(text);
+            if let Some(title) = title {
+                profile.name = title;
+            }
+        }
+        ClientCommand::RenameProfile {
+            profile_uuid,
+            title,
+        } => {
+            manual_profile_mut(snapshot, &profile_uuid)?.name = title;
         }
         ClientCommand::AddSubscription { title, url } => {
             add_subscription(snapshot, request, title, url);
@@ -320,6 +334,21 @@ fn keep_valid_selection(snapshot: &mut ClientSnapshot) {
             })
             .count();
     }
+}
+
+fn manual_profile_mut<'a>(
+    snapshot: &'a mut ClientSnapshot,
+    uuid: &str,
+) -> Result<&'a mut ProfileSummary, ClientError> {
+    let profile = snapshot
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.profile_uuid == uuid)
+        .ok_or(ClientError::ProfileNotFound)?;
+    if profile.subscription_uuid.is_some() {
+        return Err(ClientError::UnsupportedFeature);
+    }
+    Ok(profile)
 }
 
 fn check_profile(snapshot: &ClientSnapshot, uuid: &str) -> Result<(), ClientError> {

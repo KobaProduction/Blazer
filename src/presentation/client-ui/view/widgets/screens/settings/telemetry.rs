@@ -102,7 +102,7 @@ fn telemetry_form(
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.add_enabled(
             allowed,
-            egui::Button::new(tr(action)).min_size(egui::vec2(124.0, 32.0)),
+            crate::view::widgets::controls::primary_action(ui, tr(action)),
         )
         .clicked()
     })

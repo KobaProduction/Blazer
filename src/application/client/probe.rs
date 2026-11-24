@@ -8,6 +8,8 @@ use crate::session::ProfileLatency;
 use vpn_domain::client::{ProbeMethod, ProbeSettings};
 
 type ProbeTarget<'a> = (&'a str, (&'a str, u16));
+mod background;
+pub use background::{PreparedProfileProbe, ProbeRevision};
 
 impl ClientApplication {
     pub fn supports_icmp_probe(&self) -> bool {

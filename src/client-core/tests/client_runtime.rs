@@ -28,6 +28,8 @@ const SUBSCRIPTION_PATH: &str = "/subscription?key=synthetic-url-token";
 const PROFILE_PASSWORD: &str = "synthetic-profile-password";
 const ECHO_PAYLOAD: &[u8] = b"blazer\x00echo\xff";
 const ENGINE_INCOMPATIBLE_XHTTP: &str = "vless://a5c41b77-fc31-4ab0-a275-1c67aa9aab31@localhost:7443?type=xhttp&security=tls&flow=xtls-rprx-vision#Engine-incompatible";
+#[path = "client_runtime/background_probe.rs"]
+mod background_probe;
 
 #[test]
 fn profile_source_edit_updates_the_selected_profile_and_persists_after_reload() {
@@ -48,6 +50,7 @@ fn profile_source_edit_updates_the_selected_profile_and_persists_after_reload() 
     let update = |text| ClientCommand::UpdateProfile {
         profile_uuid: profile_uuid.clone(),
         text: Secret::new(text),
+        title: None,
     };
     let request = backend.send(update("not a valid config"));
     let invalid = backend.wait(Some(request), "reject invalid profile source");
@@ -75,6 +78,147 @@ fn profile_source_edit_updates_the_selected_profile_and_persists_after_reload() 
     assert_eq!(restored.profiles[0].source.as_ref(), Some(source));
     assert_eq!(restored.profiles[0].server, "127.0.0.1:18002");
     reopened.handle.shutdown().expect("shutdown after reload");
+}
+
+#[test]
+fn profile_manual_amnezia_title_and_config_survive_restart_without_new_identity() {
+    let directory = TestDirectory::new();
+    let options = directory.options();
+    let mut backend = TestBackend::start(options.clone());
+    let input = "[Interface]\nPrivateKey = KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\n\
+        Address = 10.77.0.2/32\nDNS = 10.77.0.1\nI1 = <r 5>\n[Peer]\n\
+        PublicKey = F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ=\n\
+        AllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:51820";
+    let added = backend.run(ClientCommand::ImportText {
+        title: "Manual".into(),
+        text: input.into(),
+    });
+    let uuid = added.profiles[0].profile_uuid.clone();
+    assert_eq!(added.profiles[0].protocol, "AmneziaWG");
+    backend.handle.shutdown().unwrap();
+
+    let mut backend = TestBackend::start(options.clone());
+    let restored = backend.handle.snapshot();
+    let source = restored.profiles[0]
+        .source
+        .as_ref()
+        .expect("saved Amnezia editor source");
+    assert!(source.expose().contains("\"amneziawg\""));
+    assert!(source.expose().contains("\"dns_servers\""));
+    assert!(!format!("{restored:?}").contains("KioqKioq"));
+    let updated_source = source
+        .expose()
+        .replace("127.0.0.1:51820", "127.0.0.1:51821");
+    let updated = backend.run(ClientCommand::UpdateProfile {
+        profile_uuid: uuid.clone(),
+        text: Secret::new(updated_source),
+        title: Some("Edited Amnezia".into()),
+    });
+    assert_eq!(updated.profiles.len(), 1);
+    assert_eq!(updated.profiles[0].profile_uuid, uuid);
+    assert_eq!(updated.profiles[0].name, "Edited Amnezia");
+    assert_eq!(updated.profiles[0].server, "127.0.0.1:51821");
+    assert_eq!(updated.selected_profile_uuid.as_ref(), Some(&uuid));
+    backend.run(ClientCommand::RenameProfile {
+        profile_uuid: uuid.clone(),
+        title: "Renamed Amnezia".into(),
+    });
+    backend.handle.shutdown().unwrap();
+
+    let reopened = TestBackend::start(options);
+    let restored = reopened.handle.snapshot();
+    assert_renamed_amnezia_profile(&restored, &uuid);
+}
+
+fn assert_renamed_amnezia_profile(restored: &ClientSnapshot, uuid: &str) {
+    assert_eq!(restored.profiles[0].profile_uuid, uuid);
+    assert_eq!(restored.profiles[0].name, "Renamed Amnezia");
+    assert_eq!(restored.profiles[0].server, "127.0.0.1:51821");
+    assert_eq!(restored.selected_profile_uuid.as_deref(), Some(uuid));
+    let source = restored.profiles[0].source.as_ref().unwrap().expose();
+    assert!(source.contains("Renamed Amnezia"));
+    assert!(source.contains("\"dns_servers\""));
+}
+
+#[test]
+fn profile_subscription_origin_rejects_name_and_config_edits_without_writes() {
+    let directory = TestDirectory::new();
+    let backend = TestBackend::start(directory.options());
+    let server = loopback_listener();
+    for headers in [vec![], vec![("hide-settings", "1")]] {
+        let added = provider_add(
+            &backend,
+            &server,
+            &headers,
+            "socks5://127.0.0.1:19001#Primary",
+        );
+        let row = added.profiles.last().unwrap();
+        let uuid = row.profile_uuid.clone();
+        let previous = fs::read(directory.path.join("catalog.sealed")).unwrap();
+        for command in [
+            ClientCommand::RenameProfile {
+                profile_uuid: uuid.clone(),
+                title: "Unapproved".into(),
+            },
+            ClientCommand::UpdateProfile {
+                profile_uuid: uuid.clone(),
+                text: Secret::new("socks5://127.0.0.1:19005#Unapproved"),
+                title: Some("Unapproved".into()),
+            },
+        ] {
+            let request = backend.send(command);
+            let rejected = backend.wait(Some(request), "reject subscription profile mutation");
+            assert_eq!(rejected.last_error, Some(ClientError::UnsupportedFeature));
+            let saved = rejected
+                .profiles
+                .iter()
+                .find(|item| item.profile_uuid == uuid)
+                .unwrap();
+            assert_eq!(saved.name, "Primary");
+            assert_eq!(saved.source, row.source);
+            assert_eq!(rejected.selected_profile_uuid, added.selected_profile_uuid);
+            assert!(fs::read(directory.path.join("catalog.sealed")).unwrap() == previous);
+        }
+    }
+}
+
+#[test]
+fn profile_active_manual_rename_keeps_runtime_and_blocks_config_replacement() {
+    let directory = TestDirectory::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = routing_backend(
+        &directory,
+        RoutingEngineFixture {
+            calls: calls.clone(),
+            ..RoutingEngineFixture::default()
+        },
+    );
+    let imported = backend.run(ClientCommand::ImportText {
+        title: "Manual".into(),
+        text: "socks5://127.0.0.1:1080#Original".into(),
+    });
+    let uuid = imported.profiles[0].profile_uuid.clone();
+    let connected = backend.run(ClientCommand::Connect {
+        mode: ConnectionMode::LocalProxy,
+    });
+    let renamed = backend.run(ClientCommand::RenameProfile {
+        profile_uuid: uuid.clone(),
+        title: "Renamed while active".into(),
+    });
+    assert_eq!(renamed.profiles[0].name, "Renamed while active");
+    assert_eq!(renamed.connection, ConnectionStatus::Connected);
+    assert_eq!(renamed.active_profile_uuid.as_ref(), Some(&uuid));
+    assert_eq!(renamed.local_proxy, connected.local_proxy);
+    let request = backend.send(ClientCommand::UpdateProfile {
+        profile_uuid: uuid.clone(),
+        text: Secret::new("socks5://127.0.0.1:1081#Replacement"),
+        title: Some("Replacement".into()),
+    });
+    let rejected = backend.wait(Some(request), "reject active config edit");
+    assert_eq!(rejected.last_error, Some(ClientError::DisconnectFirst));
+    assert_eq!(rejected.profiles[0].name, "Renamed while active");
+    assert_eq!(rejected.active_profile_uuid.as_ref(), Some(&uuid));
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -951,7 +1095,7 @@ fn tcp_probe_reports_the_catalog_endpoint_without_starting_blazecore() {
         profile_uuid: profile_uuid.clone(),
     };
     let reachable = backend.run(probe());
-    assert_eq!(reachable.revision, imported.revision + 1);
+    assert!(reachable.revision > imported.revision);
     assert_eq!(reachable.profiles.len(), imported.profiles.len());
     assert_eq!(reachable.profiles[0].name, imported.profiles[0].name);
     assert_eq!(
@@ -1104,13 +1248,21 @@ fn tunnel_reports_its_mode_and_clears_it_on_disconnect() {
         profile_uuid: connected.selected_profile_uuid.unwrap(),
     });
     let rejected = backend.wait(Some(probe), "reject TCP probe while TUN is active");
-    assert_eq!(rejected.last_error, Some(ClientError::UnsupportedMode));
+    assert_eq!(
+        probe_error(&rejected, probe),
+        Some(ClientError::UnsupportedMode)
+    );
+    assert_eq!(rejected.last_error, None);
     assert!(rejected.profile_latencies.is_empty());
     let batch = backend.send(ClientCommand::ProbeProfiles {
         subscription_uuid: None,
     });
     let rejected = backend.wait(Some(batch), "reject TCP probe batch while TUN is active");
-    assert_eq!(rejected.last_error, Some(ClientError::UnsupportedMode));
+    assert_eq!(
+        probe_error(&rejected, batch),
+        Some(ClientError::UnsupportedMode)
+    );
+    assert_eq!(rejected.last_error, None);
     assert!(rejected.profile_latencies.is_empty());
     let disconnected = backend.run(ClientCommand::Disconnect);
     assert!(disconnected.profile_probe_available);
@@ -1203,7 +1355,11 @@ fn active_tunnel_probe_batch_rejects_other_profiles_without_tcp_connections() {
         profile_uuid: other.clone(),
     });
     let rejected = backend.wait(Some(request), "refuse another profile while TUN is active");
-    assert_eq!(rejected.last_error, Some(ClientError::DisconnectFirst));
+    assert_eq!(
+        probe_error(&rejected, request),
+        Some(ClientError::DisconnectFirst)
+    );
+    assert_eq!(rejected.last_error, None);
     assert!(calls.lock().unwrap().is_empty());
     assert!(rejected.profile_latencies.is_empty());
     let measured = backend.run(ClientCommand::ProbeProfiles {
@@ -1655,6 +1811,26 @@ struct TunnelFixture {
 }
 
 impl ClientEnginePort for TunnelFixture {
+    fn prepare_profile_probe(
+        &self,
+        profile: &ProxyProfile,
+        active: Option<&ProxyProfile>,
+        reuse: bool,
+        settings: &client_core::ProbeSettings,
+    ) -> Result<vpn_application::client::OwnedProbeTask, ClientError> {
+        let context = Self {
+            reported: self.reported,
+            running: self.running,
+            active_probe: self.active_probe,
+            probe_calls: self.probe_calls.clone(),
+        };
+        let profile = profile.clone();
+        let active = active.cloned();
+        let settings = settings.clone();
+        Ok(Box::new(move |cancel| {
+            context.probe_tunnel(&profile, active.as_ref(), reuse, &settings, cancel)
+        }))
+    }
     fn capabilities(&self) -> ModeCapabilities {
         ModeCapabilities {
             tun: true,
@@ -2129,7 +2305,15 @@ impl TestBackend {
         let deadline = Instant::now() + BACKEND_TIMEOUT;
         loop {
             let snapshot = self.handle.snapshot();
-            if !snapshot.busy && snapshot.completed_request == request {
+            if !snapshot.busy
+                && (snapshot.completed_request == request
+                    || request.is_some_and(|request| {
+                        snapshot
+                            .probe_completions
+                            .iter()
+                            .any(|completion| completion.request_id == request)
+                    }))
+            {
                 return snapshot;
             }
             self.changed
@@ -2142,6 +2326,7 @@ impl TestBackend {
         let request = self.send(command);
         let snapshot = self.wait(Some(request), "backend command");
         assert_eq!(snapshot.last_error, None, "{snapshot:?}");
+        assert_eq!(probe_error(&snapshot, request), None, "{snapshot:?}");
         snapshot
     }
 
@@ -2157,6 +2342,14 @@ impl TestBackend {
                 .expect("automatic refresh completed");
         }
     }
+}
+
+fn probe_error(snapshot: &ClientSnapshot, request: RequestId) -> Option<ClientError> {
+    snapshot
+        .probe_completions
+        .iter()
+        .find(|completion| completion.request_id == request)
+        .and_then(|completion| completion.error)
 }
 
 fn subscription_profiles(spare_name: &str) -> String {
@@ -2667,6 +2860,7 @@ fn provider_uses_fallback_advertised_in_the_subscription_body() {
     let request = backend.send(ClientCommand::UpdateProfile {
         profile_uuid: added.profiles[0].profile_uuid.clone(),
         text: Secret::new("socks5://127.0.0.1:19005#Unapproved"),
+        title: None,
     });
     let blocked = backend.wait(Some(request), "reject hidden profile edit");
     assert_eq!(blocked.last_error, Some(ClientError::UnsupportedFeature));

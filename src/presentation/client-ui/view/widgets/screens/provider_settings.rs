@@ -153,7 +153,10 @@ fn subscription_editor(
             ui.weak(tr(Key::SubscriptionDisconnectFirst));
         }
         if ui
-            .add_enabled(changed && writable, egui::Button::new(tr(Key::Save)))
+            .add_enabled(
+                changed && writable,
+                crate::view::widgets::controls::primary_action(ui, tr(Key::Save)),
+            )
             .clicked()
         {
             intent = Some(Intent::SaveSubscription {
@@ -250,7 +253,10 @@ fn fallback_form(
         ui.horizontal_wrapped(|ui| {
             let valid = enabled && !draft.fallback_url.trim().is_empty();
             if ui
-                .add_enabled(valid, egui::Button::new(tr(Key::Save)))
+                .add_enabled(
+                    valid,
+                    crate::view::widgets::controls::primary_action(ui, tr(Key::Save)),
+                )
                 .clicked()
             {
                 intent = Some(Intent::SetFallback {
@@ -260,7 +266,13 @@ fn fallback_form(
             }
             if configured
                 && ui
-                    .add_enabled(enabled, egui::Button::new(tr(Key::RemoveFallback)))
+                    .add_enabled(
+                        enabled,
+                        crate::view::widgets::controls::secondary_action(
+                            ui,
+                            tr(Key::RemoveFallback),
+                        ),
+                    )
                     .clicked()
             {
                 intent = Some(Intent::SetFallback {

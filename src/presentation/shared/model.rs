@@ -52,9 +52,14 @@ pub enum Intent {
         title: String,
         text: String,
     },
+    RenameProfile {
+        profile_uuid: String,
+        title: String,
+    },
     UpdateProfile {
         profile_uuid: String,
         text: Secret,
+        title: Option<String>,
     },
     SaveSubscription {
         subscription_uuid: Option<String>,

@@ -5,7 +5,6 @@ use vpn_presentation::session::{
 use super::ViewFrame;
 use crate::view::settings_state::PingDisplay;
 use crate::view::theme;
-use crate::view::view_model::ProbeScope;
 use crate::view::widgets::connection_controls::CONNECTION_CONTROL_WIDTH;
 use crate::view::widgets::controls::SELECTOR_HEIGHT;
 use crate::view::widgets::flags::{paint_flag, server_name};
@@ -311,20 +310,23 @@ impl ViewFrame<'_> {
     }
 
     fn profile_ping_unavailable(&self, profile: Option<&ProfileSummary>) -> Option<Key> {
-        self.probe_blocked().or_else(|| {
-            if self.snapshot.profiles.is_empty() {
-                Some(Key::NoAvailableServers)
-            } else {
-                profile.is_none().then_some(Key::SelectProfile)
-            }
-        })
+        self.probe_blocked()
+            .or_else(|| {
+                profile
+                    .filter(|profile| self.profile_probe_pending(profile))
+                    .map(|_| Key::Working)
+            })
+            .or_else(|| {
+                if self.snapshot.profiles.is_empty() {
+                    Some(Key::NoAvailableServers)
+                } else {
+                    profile.is_none().then_some(Key::SelectProfile)
+                }
+            })
     }
 
-    pub(super) fn probe_blocked(&self) -> Option<Key> {
-        if self.snapshot.busy
-            || self.view.subscription_refresh.is_some()
-            || self.view.probe.is_some()
-        {
+    pub(in crate::view::widgets) fn probe_blocked(&self) -> Option<Key> {
+        if self.snapshot.busy || self.view.subscription_refresh.is_some() {
             Some(Key::Working)
         } else if self.snapshot.cleanup_required {
             Some(Key::CleanupRequired)
@@ -346,17 +348,17 @@ impl ViewFrame<'_> {
         self.probe_pending(&profile.profile_uuid, profile.subscription_uuid.as_deref())
     }
 
-    fn probe_pending(&self, id: &str, subscription_uuid: Option<&str>) -> bool {
-        match &self.view.probe {
-            Some((ProbeScope::Profile(uuid), _)) => uuid == id,
-            Some((ProbeScope::Group(uuid), _)) => uuid
-                .as_deref()
-                .is_none_or(|uuid| subscription_uuid == Some(uuid)),
-            _ => false,
-        }
+    fn probe_pending(&self, id: &str, _subscription_uuid: Option<&str>) -> bool {
+        self.snapshot.profile_probes.get(id).is_some_and(|status| {
+            matches!(
+                status.state,
+                vpn_presentation::session::ProfileProbeState::Queued
+                    | vpn_presentation::session::ProfileProbeState::Running
+            )
+        })
     }
 
-    fn ping_status(&self, latency: ProfileLatency) -> String {
+    pub(in crate::view::widgets) fn ping_status(&self, latency: ProfileLatency) -> String {
         match latency {
             ProfileLatency::Reachable { milliseconds } => self.message(
                 Key::PingMilliseconds,

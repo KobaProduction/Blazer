@@ -229,6 +229,29 @@ impl BlazeCoreProcess {
 }
 
 impl ClientEnginePort for BlazeCoreProcess {
+    #[cfg(not(target_os = "android"))]
+    fn prepare_profile_probe(
+        &self,
+        profile: &ProxyProfile,
+        active: Option<&ProxyProfile>,
+        reuse_active_proxy: bool,
+        settings: &vpn_domain::client::ProbeSettings,
+    ) -> Result<vpn_application::client::OwnedProbeTask, ClientError> {
+        let mut context = Self::new(self.spec.clone(), self.data_directory.clone(), 0);
+        context.connection = self.connection;
+        let profile = profile.clone();
+        let active = active.cloned();
+        let settings = settings.clone();
+        Ok(Box::new(move |cancel| {
+            context.probe_tunnel_with_settings(
+                &profile,
+                active.as_ref(),
+                reuse_active_proxy,
+                &settings,
+                cancel,
+            )
+        }))
+    }
     fn capabilities(&self) -> vpn_application::session::ModeCapabilities {
         vpn_application::session::ModeCapabilities {
             local_proxy: true,

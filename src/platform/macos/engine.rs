@@ -30,6 +30,16 @@ impl MacEngine {
 }
 
 impl ClientEnginePort for MacEngine {
+    fn prepare_profile_probe(
+        &self,
+        profile: &ProxyProfile,
+        active: Option<&ProxyProfile>,
+        reuse: bool,
+        settings: &vpn_presentation::session::ProbeSettings,
+    ) -> Result<vpn_application::client::OwnedProbeTask, ClientError> {
+        self.proxy
+            .prepare_profile_probe(profile, active, reuse, settings)
+    }
     fn capabilities(&self) -> ModeCapabilities {
         ModeCapabilities {
             tun: true,

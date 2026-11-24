@@ -292,6 +292,7 @@ impl ViewFrame<'_> {
         if let Some(error) = self.error
             && !error.is_tun_start_blocked()
             && self.view.configuration.is_none()
+            && self.view.profile_editor.is_none()
             && self.view.dismissed_error != Some((self.snapshot.revision, error))
         {
             let message = error.text(self.view.locale);

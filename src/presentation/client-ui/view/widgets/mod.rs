@@ -17,7 +17,7 @@ use super::settings_state::RoutingProfileDraft;
 use super::settings_state::{DesktopTheme, RoutingMutation};
 #[cfg(all(debug_assertions, feature = "demo"))]
 use super::view_model::ConfigurationPreview;
-use super::view_model::{ProbeScope, Screen, SettingsPage, ViewState};
+use super::view_model::{Screen, SettingsPage, ViewState};
 use layout::ViewportLayout;
 use vpn_presentation::Controller;
 use vpn_presentation::localization::{self, Key, Locale};
@@ -158,7 +158,17 @@ impl BlazerView {
 
     #[cfg(all(debug_assertions, feature = "demo"))]
     pub fn preview_profile_probe(&mut self, uuid: &str, request: RequestId) {
-        self.state.probe = Some((ProbeScope::Profile(uuid.to_owned()), request));
+        let mut snapshot = self.controller.snapshot().clone();
+        snapshot.profile_probes.insert(
+            uuid.to_owned(),
+            vpn_presentation::session::ProfileProbeStatus {
+                request_id: request,
+                method: vpn_presentation::session::ProbeMethod::Tcp,
+                state: vpn_presentation::session::ProfileProbeState::Running,
+                error: None,
+            },
+        );
+        self.controller.preview(snapshot);
     }
 
     fn handle_intent(&mut self, ctx: &egui::Context, intent: Intent) {
@@ -179,7 +189,10 @@ impl BlazerView {
     fn submit(&mut self, intent: Intent) {
         self.state.dismissed_error = None;
         let removal = matches!(intent, Intent::ConfirmRemoval(_));
-        let update_profile = matches!(intent, Intent::UpdateProfile { .. });
+        let update_profile = matches!(
+            intent,
+            Intent::UpdateProfile { .. } | Intent::RenameProfile { .. }
+        );
         let save_telemetry = matches!(intent, Intent::SetTelemetrySettings { .. });
         let save_probe = matches!(intent, Intent::SetProbeSettings(_));
         let save_provider_settings = matches!(
@@ -211,12 +224,9 @@ impl BlazerView {
             Intent::RefreshSubscription(uuid) => Some(uuid.clone()),
             _ => None,
         };
-        let probe = match &intent {
-            Intent::ProbeProfile(uuid) => Some(ProbeScope::Profile(uuid.clone())),
-            Intent::ProbeProfiles(uuid) => Some(ProbeScope::Group(uuid.clone())),
-            _ => None,
-        };
+        let editor_probe = matches!(&intent, Intent::ProbeProfile(uuid) if self.state.profile_editor.as_ref().is_some_and(|draft| &draft.uuid == uuid));
         let request = self.controller.submit(intent);
+        self.track_editor_probe(editor_probe, request);
         self.track_configuration_submission(configuration, update_profile, request);
         self.state
             .track_provider_edit(request.filter(|_| save_provider_settings));
@@ -239,8 +249,15 @@ impl BlazerView {
             self.state.refreshed_subscription = None;
             self.state.subscription_refresh = Some(pending);
         }
-        if let Some(pending) = probe.zip(request) {
-            self.state.probe = Some(pending);
+    }
+
+    fn track_editor_probe(&mut self, editor_probe: bool, request: Option<RequestId>) {
+        if editor_probe && let Some(draft) = &mut self.state.profile_editor {
+            draft.probe_request = request;
+            draft.probe_feedback = self
+                .controller
+                .submission_error()
+                .map(|error| (self.controller.snapshot().revision, error));
         }
     }
 
