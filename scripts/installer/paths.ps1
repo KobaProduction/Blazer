@@ -7,6 +7,10 @@ function Get-BlazerDirectory {
     Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Blazer'
 }
 
+function Get-BlazerSetupStateDirectory {
+    Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'KobaProduction\Blazer'
+}
+
 function Assert-BlazerRegularPath {
     param([string]$Path, [string]$Root)
     $absolute = [IO.Path]::GetFullPath($Path).TrimEnd('\')

@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param()
+param([string[]]$Case = @())
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -47,6 +47,7 @@ function Set-BlazerProtectedDirectory { param([string]$Directory) Assert-Fixture
 function Assert-BlazerProtectedPath { param([string]$Path) Assert-FixturePath $Path }
 function Set-BlazerProtectedFile { param([string]$Path) Assert-FixturePath $Path }
 function Get-BlazerDirectory { Join-Path $script:FixtureRoot 'managed-program-files' }
+function Get-BlazerSetupStateDirectory { Join-Path $script:FixtureRoot 'machine-state' }
 function Get-BlazerShortcutPath { Join-Path $script:FixtureRoot 'start-menu/Blazer.lnk' }
 function Assert-BlazerShortcut { Assert-FixturePath (Get-BlazerShortcutPath) }
 function Set-BlazerShortcut { Assert-BlazerShortcut; $script:Events.Add('SetShortcut') }
@@ -147,6 +148,7 @@ function Test-BackupAndRestore {
     $state=@{Registration=@{Version='0.1';ProductId=$script:BlazerProduct};Service=$null;
         Inventory=$inventory;OperatorSid=$context.OperatorSid;Operation='Install'}
     $tx=New-BlazerTransaction $context $state
+    Set-BlazerTransactionProgress $tx 'files_changing'
     Assert-FixturePath $tx.JournalDirectory
     foreach ($name in $names) {
         $backup=Join-Path (Join-Path $tx.JournalDirectory 'previous') $name
@@ -164,6 +166,7 @@ function Test-FreshRegistrationRollbackPreservesForeignFiles {
     $context=New-Context 'fresh-rollback'
     $state=@{Registration=$null;Service=$null;Inventory=$null;OperatorSid=$context.OperatorSid;Operation='Install'}
     $tx=New-BlazerTransaction $context $state
+    Set-BlazerTransactionProgress $tx 'files_changing'
     [IO.Directory]::CreateDirectory($context.Directory) | Out-Null
     foreach ($name in @('blazer.exe','blazer-installation.json','blazer-owned-files.json','foreign.txt')) {
         [IO.File]::WriteAllText((Join-Path $context.Directory $name),$name)
@@ -173,6 +176,47 @@ function Test-FreshRegistrationRollbackPreservesForeignFiles {
     foreach ($name in @('blazer.exe','blazer-installation.json','blazer-owned-files.json')) {
         Assert-True (-not [IO.File]::Exists((Join-Path $context.Directory $name))) "Fresh rollback retained generated file: $name"
     }
+}
+
+function Test-EarlyCloseFailurePreservesRunningInstallation {
+    $context=New-Context 'early-close-failure'
+    [IO.Directory]::CreateDirectory($context.Directory) | Out-Null
+    foreach($name in @('blazer.exe','blazer-installation.json','blazer-owned-files.json')) {
+        [IO.File]::WriteAllText((Join-Path $context.Directory $name),('unchanged-' + $name))
+    }
+    $executable=Join-Path $context.Directory 'blazer.exe'
+    $hash=(Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    $state=@{Registration=@{Version='0.1';ProductId=$script:BlazerProduct};
+        Service=@{State='Running';StartMode='Auto'};OperatorSid=$context.OperatorSid;Operation='Install';
+        Inventory=@{files=@([pscustomobject]@{path='blazer.exe';sha256=$hash.ToLowerInvariant()})}}
+    $script:Events.Clear()
+    $provider=New-OrderingProvider $script:Events 'CloseApplication'
+    $script:EarlyCloseState=$state
+    $script:EarlyCloseContext=$context
+    $provider.Validate={param($operation) $script:EarlyCloseState}
+    $provider.Prepare={
+        param($saved,$operation)
+        $tx=New-BlazerTransaction $script:EarlyCloseContext $saved
+        $expected=Join-Path (Join-Path (Get-BlazerSetupStateDirectory) 'transactions') $script:EarlyCloseContext.Transaction
+        Assert-True ($tx.JournalDirectory -ieq $expected) 'Recovery state was not created under the machine-state root.'
+        Assert-True (@(Get-ChildItem -LiteralPath $script:EarlyCloseContext.Directory -Force).Count -eq 3) 'Installer state was written into the static application directory.'
+        $tx
+    }
+    $provider.Checkpoint={param($tx,$progress) $script:Events.Add('Checkpoint:' + $progress); Set-BlazerTransactionProgress $tx $progress}
+    $provider.Rollback={param($tx) Restore-BlazerTransaction $tx}
+    # Simulate the still-running GUI image: copying or deleting it must fail.
+    $locked=[IO.File]::Open($executable,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $failure=$null
+        try { Invoke-BlazerInstallation $provider Install } catch { $failure=$_.Exception }
+        Assert-True ($null -ne $failure) 'The injected close failure did not occur.'
+        Assert-True ($failure.Message -match 'SETUP_FAILED \[CloseApplication; NoChanges\]: injected-CloseApplication') ('Unexpected early-close outcome: ' + $failure.Message)
+        Assert-True ($failure.Data['SetupStage'] -ceq 'CloseApplication' -and $failure.Data['RollbackOutcome'] -ceq 'NoChanges') 'Structured failure metadata lost the stage or recovery outcome.'
+        Assert-True (($script:Events -join ',') -ceq 'CloseApplication') 'An early close failure touched the service, registration, files or a mutation checkpoint.'
+        Assert-True ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -ceq $hash) 'Early close failure changed the running client image.'
+        Assert-True ($state.Service.State -ceq 'Running') 'Early close failure changed the previous running state.'
+        Assert-True (-not [IO.Directory]::Exists((Join-Path (Get-BlazerSetupStateDirectory) 'transactions'))) 'Prepared-only recovery did not finish its journal.'
+    } finally { $locked.Dispose() }
 }
 
 function Test-AtomicJson {
@@ -191,7 +235,7 @@ function Test-AtomicJson {
 
 function Test-CleanupTombstone {
     $context=New-Context 'cleanup-tombstone'
-    $root=Join-Path (Split-Path -Parent $context.Directory) 'Blazer.Setup'
+    $root=Join-Path (Get-BlazerSetupStateDirectory) 'transactions'
     [IO.Directory]::CreateDirectory($root) | Out-Null
     Write-BlazerJson (Join-Path $root 'active.json') @{transaction=$context.Transaction;cleanup=$true}
     Repair-BlazerPendingTransaction $context
@@ -203,7 +247,8 @@ function New-OrderingProvider {
     param([Collections.Generic.List[string]]$Events,[string]$Failure)
     $provider=@{
         Validate={param($operation) $Events.Add('Validate'); @{Operation=$operation}}.GetNewClosure()
-        Prepare={param($state,$operation) $Events.Add('Prepare'); @{JournalDirectory='isolated-fixture'}}.GetNewClosure()
+        Prepare={param($state,$operation) $Events.Add('Prepare'); @{JournalDirectory='isolated-fixture';Progress='prepared'}}.GetNewClosure()
+        Checkpoint={param($transaction,$progress) $Events.Add('Checkpoint:' + $progress); $transaction.Progress=$progress}.GetNewClosure()
     }
     foreach ($name in @('CloseApplication','StopService','DeleteService','RemoveFiles','RemoveRegistration','ReplaceFiles','ConfigureService','RestoreServiceState','RegisterInstallation','Commit','Rollback')) {
         $stage=$name
@@ -215,13 +260,13 @@ function New-OrderingProvider {
 function Test-OperationOrdering {
     $events=[Collections.Generic.List[string]]::new()
     Invoke-BlazerInstallation (New-OrderingProvider $events '') Install
-    $expected='Validate,Prepare,CloseApplication,StopService,ReplaceFiles,ConfigureService,RestoreServiceState,RegisterInstallation,Commit'
+    $expected='Validate,Prepare,CloseApplication,Checkpoint:service_stopping,StopService,Checkpoint:files_changing,ReplaceFiles,ConfigureService,RestoreServiceState,RegisterInstallation,Commit'
     Assert-True (($events -join ',') -ceq $expected) 'Install operation ordering differs.'
     foreach ($stage in @('RestoreServiceState','RegisterInstallation','DeleteService')) {
         $events.Clear()
         $operation=if ($stage -eq 'DeleteService') {'Uninstall'} else {'Install'}
         $provider=New-OrderingProvider $events $stage
-        Assert-Throws { Invoke-BlazerInstallation $provider $operation } 'SETUP_ROLLED_BACK'
+        Assert-Throws { Invoke-BlazerInstallation $provider $operation } 'SETUP_FAILED'
         Assert-True ($events[$events.Count-1] -ceq 'Rollback' -and -not $events.Contains('Commit')) "Failure at $stage did not roll back before commit."
     }
 }
@@ -323,11 +368,14 @@ function Test-NativeRegistryReadOnlyPreflight {
 }
 
 try {
-    foreach ($test in @('Test-GracefulProcessOrdering','Test-BackupAndRestore','Test-FreshRegistrationRollbackPreservesForeignFiles','Test-AtomicJson','Test-CleanupTombstone','Test-OperationOrdering','Test-UpgradePolicy','Test-PriorServiceStates','Test-RegistrySecurityPolicy','Test-NativeRegistryReadOnlyPreflight')) {
+    $tests=@('Test-GracefulProcessOrdering','Test-BackupAndRestore','Test-FreshRegistrationRollbackPreservesForeignFiles','Test-EarlyCloseFailurePreservesRunningInstallation','Test-AtomicJson','Test-CleanupTombstone','Test-OperationOrdering','Test-UpgradePolicy','Test-PriorServiceStates','Test-RegistrySecurityPolicy','Test-NativeRegistryReadOnlyPreflight')
+    if(@($Case | Where-Object { $_ -notin $tests }).Count){throw 'Unknown installer acceptance case.'}
+    foreach ($test in $tests) {
+        if($Case.Count -gt 0 -and $test -notin $Case){continue}
         & $test
         Write-Output ($test + ': PASS')
     }
-    Write-Output 'Installer helper acceptance PASS; no native SCM/registry mutations. Explicit readonly HKLM ACL preflight was exercised.'
+    Write-Output 'Selected installer helper acceptance PASS; no native SCM/registry mutations.'
 } finally {
     $resolved=[IO.Path]::GetFullPath($script:FixtureRoot)
     $parent=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')

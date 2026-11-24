@@ -32,6 +32,8 @@ Var Arguments
 Var StageRoot
 Var StageDirectory
 Var PowerShell
+Var MaintenanceCode
+Var MaintenanceOutput
 
 !define MUI_ABORTWARNING
 !define MUI_CUSTOMFUNCTION_ABORT OnSetupAbort
@@ -48,8 +50,8 @@ Var PowerShell
 !insertmacro MUI_UNPAGE_FINISH
 !insertmacro MUI_LANGUAGE "English"
 !insertmacro MUI_LANGUAGE "Russian"
-LangString Failed ${LANG_ENGLISH} "Blazer maintenance failed (code 2). The previous installation was restored when possible. Retry this installer to recover an interrupted transaction. No unrelated service is removed."
-LangString Failed ${LANG_RUSSIAN} "Обслуживание Blazer не выполнено (код 2). Предыдущее состояние восстановлено, если это возможно. Повторите запуск установщика для восстановления прерванной операции. Посторонние службы не удаляются."
+LangString Failed ${LANG_ENGLISH} "Blazer maintenance failed (exit $MaintenanceCode).$\r$\n$MaintenanceOutput$\r$\nDetails and recovery state: $StageRoot. No unrelated service is removed."
+LangString Failed ${LANG_RUSSIAN} "Обслуживание Blazer завершилось ошибкой (код $MaintenanceCode).$\r$\n$MaintenanceOutput$\r$\nДиагностика и состояние восстановления: $StageRoot. Посторонние службы не удаляются."
 LangString Cancelled ${LANG_ENGLISH} "Administrator permission was cancelled. Blazer was not closed."
 LangString Cancelled ${LANG_RUSSIAN} "Разрешение администратора отменено. Blazer не закрывался."
 LangString WrongPlatform ${LANG_ENGLISH} "Blazer requires 64-bit Windows 10 or newer."
@@ -104,8 +106,9 @@ Function ${Prefix}Initialize
   Quit
 !endif
   SetRegView 64
+  SetShellVarContext all
   StrCpy $INSTDIR "$PROGRAMFILES64\Blazer"
-  StrCpy $StageRoot "$PROGRAMFILES64\Blazer.Setup.Stage"
+  StrCpy $StageRoot "$APPDATA\KobaProduction\Blazer"
   StrCpy $PowerShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
   ${IfNot} ${RunningX64}
     MessageBox MB_OK|MB_ICONSTOP "$(WrongPlatform)" /SD IDOK
@@ -306,13 +309,15 @@ FunctionEnd
 !macro CleanupStage
   SetOutPath "$TEMP"
   RMDir /r "$StageDirectory"
-  nsExec::ExecToStack `"$PowerShell" -NoLogo -NoProfile -NonInteractive -Command "$$env:PSModulePath=$$PSHOME+'\Modules';$$p=Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Blazer.Setup.Stage';$$items=@(Get-ChildItem -LiteralPath $$p -Force);if($$items.Count-eq 1-and $$items[0].Name-ceq 'owner.txt'){[IO.File]::Delete((Join-Path $$p 'owner.txt'));[IO.Directory]::Delete($$p)}"`
-  Pop $1
-  Pop $2
+  RMDir "$StageRoot\staging"
+!macroend
+
+!macro CleanupUninstalledState
+  RMDir "$INSTDIR"
 !macroend
 
 !macro ExtractMaintenance Suffix
-  ; Program Files is privileged before any helper script or payload is extracted.
+  ; Machine setup state is private before a helper or payload is extracted.
   !insertmacro ValidateStagingRoot ${Suffix}
   IfFileExists "$StageRoot\." stage_exists_${Suffix} stage_create_${Suffix}
   stage_exists_${Suffix}:
@@ -320,7 +325,7 @@ FunctionEnd
   FileOpen $0 "$StageRoot\owner.txt" r
   FileRead $0 $1
   FileClose $0
-  StrCmp $1 "${PRODUCT_ID}" stage_owned_${Suffix} stage_failed_${Suffix}
+  StrCmp $1 "${PRODUCT_ID}/1" stage_owned_${Suffix} stage_failed_${Suffix}
   stage_create_${Suffix}:
   CreateDirectory "$StageRoot"
   stage_owned_${Suffix}:
@@ -329,15 +334,21 @@ FunctionEnd
   Pop $1
   StrCmp $0 "0" +2
   Goto stage_failed_${Suffix}
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$StageRoot" /setowner "*S-1-5-32-544"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" +2
+  Goto stage_failed_${Suffix}
   FileOpen $0 "$StageRoot\owner.txt" w
-  FileWrite $0 "${PRODUCT_ID}"
+  FileWrite $0 "${PRODUCT_ID}/1"
   FileClose $0
   nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$StageRoot\owner.txt" /setowner "*S-1-5-32-544"'
   Pop $0
   Pop $1
   StrCmp $0 "0" +2
   Goto stage_failed_${Suffix}
-  StrCpy $StageDirectory "$StageRoot\$Transaction"
+  CreateDirectory "$StageRoot\staging"
+  StrCpy $StageDirectory "$StageRoot\staging\$Transaction"
   IfFileExists "$StageDirectory\." stage_failed_${Suffix}
   CreateDirectory "$StageDirectory"
   SetOutPath "$StageDirectory\maintenance"
@@ -353,8 +364,10 @@ FunctionEnd
   Goto stage_failed_${Suffix}
   Goto stage_ready_${Suffix}
   stage_failed_${Suffix}:
+    DetailPrint "Staging initialization failed: $1"
+    MessageBox MB_OK|MB_ICONSTOP "Cannot prepare $StageRoot.$\r$\n$1" /SD IDOK
     SetErrorLevel 2
-    Quit
+    Abort
   stage_ready_${Suffix}:
 !macroend
 
@@ -368,13 +381,17 @@ Section "Blazer"
     Pop $0
     Pop $1
     ${If} $0 != "0"
+      DetailPrint "Payload protection failed: $1"
+      MessageBox MB_OK|MB_ICONSTOP "Payload protection failed.$\r$\n$1" /SD IDOK
       SetErrorLevel 2
-      Quit
+      Abort
     ${EndIf}
-    nsExec::ExecToLog '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Install -PayloadDirectory "$StageDirectory\payload" -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
-    Pop $0
+    nsExec::ExecToStack '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Install -PayloadDirectory "$StageDirectory\payload" -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
+    Pop $MaintenanceCode
+    Pop $MaintenanceOutput
+    DetailPrint "$MaintenanceOutput"
     !insertmacro CleanupStage
-    ${If} $0 != "0"
+    ${If} $MaintenanceCode != "0"
       MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
       SetErrorLevel 2
       Abort
@@ -387,14 +404,17 @@ SectionEnd
 Section "Uninstall"
   ${If} $Elevated == "1"
     !insertmacro ExtractMaintenance uninstall
-    nsExec::ExecToLog '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Uninstall -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
-    Pop $0
+    nsExec::ExecToStack '"$PowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$StageDirectory\maintenance\maintenance.ps1" -Operation Uninstall -OperatorSid "$OperatorSid" -BootstrapPid $BootstrapPid -SetupPath "$EXEPATH" -Transaction "$Transaction"'
+    Pop $MaintenanceCode
+    Pop $MaintenanceOutput
+    DetailPrint "$MaintenanceOutput"
     !insertmacro CleanupStage
-    ${If} $0 != "0"
+    ${If} $MaintenanceCode != "0"
       MessageBox MB_OK|MB_ICONSTOP "$(Failed)" /SD IDOK
       SetErrorLevel 2
       Abort
     ${EndIf}
+    !insertmacro CleanupUninstalledState
     SetErrorLevel 0
   ${EndIf}
   SetErrorLevel 0

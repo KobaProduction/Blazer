@@ -102,7 +102,7 @@ function Remove-BlazerOwnedFiles {
 
 function New-BlazerTransaction {
     param([hashtable]$Context, [hashtable]$State)
-    $journalRoot = Join-Path (Split-Path -Parent $Context.Directory) 'Blazer.Setup'
+    $journalRoot = Join-Path (Get-BlazerSetupStateDirectory) 'transactions'
     [void](Assert-BlazerRegularPath $journalRoot (Split-Path -Parent $journalRoot))
     if ([IO.Directory]::Exists($journalRoot)) { Assert-BlazerProtectedPath $journalRoot }
     Set-BlazerProtectedDirectory $journalRoot
@@ -118,15 +118,24 @@ function New-BlazerTransaction {
     }
     $incoming = if ($State.Operation -eq 'Install') { @($Context.Payload.files | ForEach-Object { $_.path }) } else { @() }
     $transaction = @{ JournalDirectory=$journal; Directory=$Context.Directory; State=$State;
-        OldNames=$oldNames; Incoming=$incoming; Transaction=$Context.Transaction; Context=$Context }
+        OldNames=$oldNames; Incoming=$incoming; Transaction=$Context.Transaction; Context=$Context; Progress='prepared' }
     $saved = @{ schema=1; phase='pending'; directory=$Context.Directory; transaction=$Context.Transaction;
-        state=$State; old_names=$oldNames; incoming=$incoming }
+        state=$State; old_names=$oldNames; incoming=$incoming; progress='prepared' }
     Write-BlazerJson (Join-Path $journal 'journal.json') $saved
     foreach ($name in @('maintenance.ps1','transaction.ps1','paths.ps1','service.ps1','provider.ps1')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $journal $name)
     }
     Write-BlazerJson (Join-Path $journalRoot 'active.json') @{ transaction=$Context.Transaction }
     $transaction
+}
+
+function Set-BlazerTransactionProgress {
+    param([hashtable]$Transaction, [ValidateSet('service_stopping','files_changing')][string]$Progress)
+    $path = Join-Path $Transaction.JournalDirectory 'journal.json'
+    $saved = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+    $saved.progress = $Progress
+    Write-BlazerJson $path $saved
+    $Transaction.Progress = $Progress
 }
 
 function Set-BlazerIncomingFiles {
@@ -188,7 +197,7 @@ function Commit-BlazerTransaction {
 
 function Repair-BlazerPendingTransaction {
     param([hashtable]$Context)
-    $root = Join-Path (Split-Path -Parent $Context.Directory) 'Blazer.Setup'
+    $root = Join-Path (Get-BlazerSetupStateDirectory) 'transactions'
     $active = Join-Path $root 'active.json'
     if (-not [IO.File]::Exists($active)) { return }
     [void](Assert-BlazerRegularPath $active (Split-Path -Parent $root))
@@ -206,7 +215,9 @@ function Repair-BlazerPendingTransaction {
     Assert-BlazerProtectedPath (Join-Path $directory 'journal.json')
     $saved = Get-Content -Raw -LiteralPath (Join-Path $directory 'journal.json') | ConvertFrom-Json
     if ($saved.schema -ne 1 -or $saved.directory -ine $Context.Directory -or
-        $saved.transaction -cne $pointer.transaction) { throw 'Invalid setup recovery journal.' }
+        $saved.transaction -cne $pointer.transaction -or $saved.progress -cnotin @('prepared','service_stopping','files_changing')) {
+        throw 'Invalid setup recovery journal.'
+    }
     $state = @{}
     foreach ($property in $saved.state.PSObject.Properties) { $state[$property.Name]=$property.Value }
     if ($state.Registration) {
@@ -215,7 +226,7 @@ function Repair-BlazerPendingTransaction {
         $state.Registration=$registration
     }
     $transaction = @{ JournalDirectory=$directory; Directory=$Context.Directory; State=$state;
-        OldNames=@($saved.old_names); Incoming=@($saved.incoming); Transaction=$saved.transaction; Context=$Context }
+        OldNames=@($saved.old_names); Incoming=@($saved.incoming); Transaction=$saved.transaction; Context=$Context; Progress=$saved.progress }
     if ($saved.phase -eq 'committed') { Complete-BlazerTransaction $transaction }
     elseif ($saved.phase -eq 'pending') { Restore-BlazerTransaction $transaction }
     else { throw 'Unknown setup recovery phase.' }
@@ -224,6 +235,24 @@ function Repair-BlazerPendingTransaction {
 function Restore-BlazerTransaction {
     param([hashtable]$Transaction)
     $state = $Transaction.State
+    if ($Transaction.Progress -eq 'prepared') {
+        # Closing a window can fail before any service/file mutation. In that
+        # case copying the running EXE would itself break an intact installation.
+        Complete-BlazerTransaction $Transaction
+        return
+    }
+    if ($Transaction.Progress -eq 'service_stopping') {
+        $current = Get-BlazerServiceState
+        Assert-BlazerOwnedService $current $Transaction.Directory $state.OperatorSid
+        if ($state.Service -and -not $current) { throw 'The previous tunnel service disappeared before file replacement.' }
+        if ($state.Service -and $state.Service.State -eq 'Running' -and $current.State -ne 'Running') {
+            if ($current.State -eq 'Stop Pending') { Wait-BlazerService 'Stopped' }
+            Start-BlazerServiceIfRequired $state.Service $Transaction.Directory $state.OperatorSid
+        }
+        Complete-BlazerTransaction $Transaction
+        return
+    }
+    if ($Transaction.Progress -cne 'files_changing') { throw 'Unknown setup recovery progress.' }
     $currentRegistration = Get-BlazerRegistration
     $guiClosed = $currentRegistration -and $currentRegistration.ContainsKey('LastClosedTransaction') -and
         $currentRegistration.LastClosedTransaction -ceq $Transaction.Transaction
@@ -280,6 +309,7 @@ function New-BlazerWindowsProvider {
     @{
         Validate = { param($operation) Get-BlazerValidatedState $Context $operation }.GetNewClosure()
         Prepare = { param($state, $operation) New-BlazerTransaction $Context $state }.GetNewClosure()
+        Checkpoint = { param($tx,$progress) Set-BlazerTransactionProgress $tx $progress }
         CloseApplication = { param($tx) Close-BlazerApplications $tx.Directory $tx.State.OperatorSid $tx.Transaction }
         StopService = { param($tx) Stop-BlazerService }
         DeleteService = { param($tx) Remove-BlazerService }

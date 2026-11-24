@@ -43,21 +43,49 @@ function Read-BlazerIncomingPayload {
 
 $mutex = $null
 $locked = $false
+$resultPath = $null
+$started = [DateTime]::UtcNow.ToString('o')
 try {
     Assert-BlazerSetupCaller
     $mutex = [Threading.Mutex]::new($false, 'Global\KobaProduction.Blazer.Setup')
     try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
     if (-not $locked) { throw 'Another Blazer installation or removal is already running.' }
+    $setupRoot = Get-BlazerSetupStateDirectory
+    Assert-BlazerProtectedPath $setupRoot
+    $logs = Join-Path $setupRoot 'logs'
+    [void](Assert-BlazerRegularPath $logs $setupRoot)
+    if (Test-Path -LiteralPath $logs) { Assert-BlazerProtectedPath $logs }
+    Set-BlazerProtectedDirectory $logs
+    $resultPath = Join-Path $logs 'last-result.json'
     $context = @{ Directory=(Get-BlazerDirectory); OperatorSid=$OperatorSid; Transaction=$Transaction;
         PayloadDirectory=$PayloadDirectory; Payload=$null; Metadata=$null }
     Repair-BlazerPendingTransaction $context
     if ($Operation -eq 'Recover') { Write-Output 'SETUP_RECOVERY_COMPLETE'; exit 0 }
     if ($Operation -eq 'Install') { $context.Payload=Read-BlazerIncomingPayload; $context.Metadata=$context.Payload }
     Invoke-BlazerInstallation (New-BlazerWindowsProvider $context) $Operation
+    try { Write-BlazerJson $resultPath @{ schema=1; operation=$Operation; transaction=$Transaction; result='complete'; started=$started; completed=[DateTime]::UtcNow.ToString('o') } }
+    catch { Write-Warning ('SETUP_DIAGNOSTIC_WRITE_FAILED: ' + $_.Exception.Message) }
     Write-Output 'SETUP_COMPLETE'
     exit 0
 } catch {
-    Write-Error $_ -ErrorAction Continue
+    $failure = $_
+    $detail = $failure.Exception.Message
+    $detail = $detail.Substring(0, [Math]::Min(4096, $detail.Length))
+    $position = [string]$failure.InvocationInfo.PositionMessage
+    $stack = [string]$failure.ScriptStackTrace
+    if ($resultPath) {
+        try {
+            Write-BlazerJson $resultPath @{ schema=1; operation=$Operation; transaction=$Transaction; result='failed';
+                started=$started; completed=[DateTime]::UtcNow.ToString('o'); error=$detail;
+                failed_stage=$failure.Exception.Data['SetupStage']; rollback_outcome=$failure.Exception.Data['RollbackOutcome'];
+                recovery_directory=$failure.Exception.Data['RecoveryDirectory'];
+                position=$position.Substring(0,[Math]::Min(2048,$position.Length));
+                stack=$stack.Substring(0,[Math]::Min(4096,$stack.Length)) }
+        } catch { [Console]::Error.WriteLine('SETUP_DIAGNOSTIC_WRITE_FAILED: ' + $_.Exception.Message) }
+    }
+    Write-Output ('SETUP_ERROR: ' + $detail)
+    if ($resultPath) { Write-Output ('SETUP_RESULT: ' + $resultPath) }
+    Write-Error $failure -ErrorAction Continue
     exit 1
 } finally {
     if ($locked) { $mutex.ReleaseMutex() }

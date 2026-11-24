@@ -183,7 +183,10 @@ Setup с клиентом, закреплённым BlazeCore, Wintun и упр�
 `-Configuration Release -DevelopmentInstaller`: неустанавливаемый compile-check
 артефакт с текущим клиентом, без публикации и без заявления immutable identity.
 Установщик использует мастер NSIS с русским и английским интерфейсом;
-целевой каталог — `C:\Program Files\Blazer`.
+целевой каталог — `C:\Program Files\Blazer`, только для статической поставки.
+Журналы, восстановление и временный staging установщика находятся в защищённом
+`CommonApplicationData\KobaProduction\Blazer` (обычно `%ProgramData%\KobaProduction\Blazer`);
+профили и настройки клиента остаются в `%LocalAppData%\Blazer`.
 `-OutputDirectory` меняет общую родительскую папку пакетов.
 Пакет содержит `LICENSE`. Скрипт ищет `blazecore.exe` с
 закреплённым SHA-256 в Windows release-пакете или debug-сборке соседнего BlazeCore
