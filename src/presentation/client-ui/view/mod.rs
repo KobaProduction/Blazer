@@ -6,7 +6,7 @@ mod theme;
 mod view_model;
 mod widgets;
 
-pub use host::{AppUpdateStatus, AppUpdates, UiHost};
+pub use host::{AppUpdateStatus, AppUpdates, UiHost, UpdateRelease};
 pub use import_source::read_file as decode_qr_file;
 #[cfg(all(debug_assertions, feature = "demo"))]
 pub use view_model::{ConfigurationKind, ConfigurationPreview, Screen, SettingsPage};

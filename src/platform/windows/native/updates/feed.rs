@@ -1,6 +1,8 @@
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
+use client_ui::UpdateRelease;
 use reqwest::{StatusCode, Url, blocking::Client, redirect};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -12,11 +14,11 @@ use super::setup::{MAX_SETUP_BYTES, valid_digest};
 const REPOSITORY: &str = "https://github.com/KobaProduction/Blazer";
 const API: &str = "https://api.github.com/repos/KobaProduction/Blazer/releases";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
+const MAX_RELEASE_NOTES_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub(super) struct ReleaseAsset {
-    pub display_version: String,
-    pub release_url: String,
+    pub release: UpdateRelease,
     pub name: String,
     pub download_url: String,
     pub size: u64,
@@ -34,6 +36,7 @@ struct Release {
     tag_name: String,
     draft: bool,
     prerelease: bool,
+    body: Option<String>,
     assets: Vec<Asset>,
 }
 
@@ -232,13 +235,26 @@ fn evaluate(
         manifest.version
     };
     Ok(CheckResult::Available(ReleaseAsset {
-        display_version: display,
-        release_url: format!("{REPOSITORY}/releases/tag/{}", release.tag_name),
+        release: UpdateRelease {
+            version: display,
+            release_url: format!("{REPOSITORY}/releases/tag/{}", release.tag_name),
+            notes: release_notes(release.body.as_deref()),
+        },
         name: asset.name.clone(),
         download_url: asset.browser_download_url.clone(),
         size: asset.size,
         sha256: manifest.setup.sha256,
     }))
+}
+
+fn release_notes(body: Option<&str>) -> Arc<str> {
+    let text = body.unwrap_or_default();
+    let limited = &text[..text.floor_char_boundary(MAX_RELEASE_NOTES_BYTES)];
+    let cleaned: String = limited
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect();
+    Arc::from(cleaned.trim())
 }
 
 fn manifest_identity(manifest: &Manifest, release: &Release) -> Result<ReleaseIdentity, String> {
@@ -374,6 +390,7 @@ mod tests {
             tag_name: tag.into(),
             draft: false,
             prerelease: preview,
+            body: preview.then(|| "## Changes\r\n\r\n- Improved updating".into()),
             assets: vec![Asset {
                 name: name.clone(),
                 size: 100,
@@ -404,21 +421,43 @@ mod tests {
     #[test]
     fn preview_metadata_offers_same_xy_new_commit_and_stable_promotion() {
         let (release, manifest, name, installed) = fixture(true);
-        assert!(matches!(
-            evaluate(&release, manifest, &name, &installed),
-            Ok(CheckResult::Available(_))
-        ));
+        let CheckResult::Available(preview) =
+            evaluate(&release, manifest, &name, &installed).unwrap()
+        else {
+            panic!("expected preview update");
+        };
+        assert_eq!(&*preview.release.notes, "## Changes\n\n- Improved updating");
         let (release, manifest, name, installed) = fixture(false);
-        assert!(matches!(
-            evaluate(&release, manifest, &name, &installed),
-            Ok(CheckResult::Available(_))
-        ));
+        let CheckResult::Available(stable) =
+            evaluate(&release, manifest, &name, &installed).unwrap()
+        else {
+            panic!("expected stable update");
+        };
+        assert!(stable.release.notes.is_empty());
         let (release, manifest, name, mut installed) = fixture(true);
         installed.channel = ReleaseChannel::Stable;
         assert!(matches!(
             evaluate(&release, manifest, &name, &installed),
             Ok(CheckResult::Current)
         ));
+    }
+
+    #[test]
+    fn release_body_is_optional_and_notes_are_bounded_at_a_utf8_boundary() {
+        let input = r#"{"tag_name":"v0.1","draft":false,"prerelease":false,"assets":[]}"#;
+        let release: Release = serde_json::from_str(input).unwrap();
+        assert!(release_notes(release.body.as_deref()).is_empty());
+
+        let prefix = "x".repeat(MAX_RELEASE_NOTES_BYTES - 2);
+        let input = serde_json::json!({
+            "tag_name": "v0.1",
+            "draft": false,
+            "prerelease": false,
+            "assets": [],
+            "body": format!("\0{prefix}Ж")
+        });
+        let release: Release = serde_json::from_value(input).unwrap();
+        assert_eq!(&*release_notes(release.body.as_deref()), prefix);
     }
 
     #[test]

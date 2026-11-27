@@ -4,6 +4,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
+use client_ui::UpdateRelease;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -32,8 +33,8 @@ pub(super) enum SetupOutcome {
 }
 
 impl StagedSetup {
-    pub(super) fn version(&self) -> &str {
-        &self.asset.display_version
+    pub(super) fn release(&self) -> &UpdateRelease {
+        &self.asset.release
     }
 
     pub(super) fn launch(self) -> Result<SetupOutcome, String> {
@@ -50,7 +51,11 @@ impl StagedSetup {
     }
 }
 
-pub(super) fn stage(asset: ReleaseAsset, body: impl Read) -> io::Result<StagedSetup> {
+pub(super) fn stage(
+    asset: ReleaseAsset,
+    body: impl Read,
+    on_progress: impl FnMut(u64),
+) -> io::Result<StagedSetup> {
     if asset.size == 0
         || asset.size > MAX_SETUP_BYTES
         || !valid_digest(&asset.sha256)
@@ -63,6 +68,11 @@ pub(super) fn stage(asset: ReleaseAsset, body: impl Read) -> io::Result<StagedSe
         .tempdir_in(cache_root()?)?;
     let path = directory.path().join(&asset.name);
     let mut destination = File::create_new(&path)?;
+    let body = DownloadReader {
+        body,
+        received: 0,
+        on_progress,
+    };
     let copied = io::copy(&mut body.take(asset.size + 1), &mut destination)?;
     if copied != asset.size {
         return Err(invalid("setup size does not match GitHub metadata"));
@@ -86,6 +96,23 @@ pub(super) fn stage(asset: ReleaseAsset, body: impl Read) -> io::Result<StagedSe
         locked,
         asset,
     })
+}
+
+struct DownloadReader<R, F> {
+    body: R,
+    received: u64,
+    on_progress: F,
+}
+
+impl<R: Read, F: FnMut(u64)> Read for DownloadReader<R, F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.body.read(buffer)?;
+        if count > 0 {
+            self.received += count as u64;
+            (self.on_progress)(self.received);
+        }
+        Ok(count)
+    }
 }
 
 fn cache_root() -> io::Result<std::path::PathBuf> {
@@ -221,8 +248,11 @@ mod tests {
 
     fn asset(bytes: &[u8]) -> ReleaseAsset {
         ReleaseAsset {
-            display_version: "0.1".into(),
-            release_url: String::new(),
+            release: UpdateRelease {
+                version: "0.1".into(),
+                release_url: String::new(),
+                notes: "Fixture notes".into(),
+            },
             name: "Blazer-0.1-windows-x86_64-setup.exe".into(),
             download_url: String::new(),
             size: bytes.len() as u64,
@@ -236,19 +266,24 @@ mod tests {
         let expected = asset(bytes);
         let mut traversal = expected.clone();
         traversal.name = "../Blazer-setup.exe".into();
-        assert!(stage(traversal, bytes.as_slice()).is_err());
-        assert!(stage(expected.clone(), b"changed".as_slice()).is_err());
+        assert!(stage(traversal, bytes.as_slice(), |_| {}).is_err());
+        assert!(stage(expected.clone(), b"changed".as_slice(), |_| {}).is_err());
         let mut tampered = bytes.to_vec();
         tampered[2] ^= 1;
-        assert!(stage(expected.clone(), tampered.as_slice()).is_err());
+        assert!(stage(expected.clone(), tampered.as_slice(), |_| {}).is_err());
         assert!(
             stage(
                 expected.clone(),
-                [bytes.as_slice(), b"extra"].concat().as_slice()
+                [bytes.as_slice(), b"extra"].concat().as_slice(),
+                |_| {}
             )
             .is_err()
         );
-        let staged = stage(expected, bytes.as_slice()).unwrap();
+        let mut progress = Vec::new();
+        let body = bytes[..2].chain(&bytes[2..]);
+        let staged = stage(expected, body, |received| progress.push(received)).unwrap();
+        assert_eq!(progress, [2, bytes.len() as u64]);
+        assert_eq!(&*staged.release().notes, "Fixture notes");
         let path = staged.directory.path().join(&staged.asset.name);
         assert!(OpenOptions::new().write(true).open(&path).is_err());
         assert!(fs::remove_file(&path).is_err());
@@ -260,7 +295,7 @@ mod tests {
     #[test]
     fn staging_cleanup_preserves_active_and_foreign_directories() {
         let bytes = b"MZ isolated cleanup fixture";
-        let staged = stage(asset(bytes), bytes.as_slice()).unwrap();
+        let staged = stage(asset(bytes), bytes.as_slice(), |_| {}).unwrap();
         let path = staged.directory.path().to_path_buf();
         cleanup_directory(&path);
         assert!(path.join(&staged.asset.name).exists());

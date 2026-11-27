@@ -1,11 +1,13 @@
+#[path = "release_notes.rs"]
+mod release_notes;
+
 use super::{
     APP_VERSION, AppUpdateStatus, ConnectionStatus, Key, ViewFrame, divider, group, setting_row,
 };
 use crate::view::widgets::connection_controls::CONNECTION_CONTROL_WIDTH;
-#[cfg(all(debug_assertions, feature = "demo"))]
-use crate::view::widgets::controls::SELECTOR_HEIGHT;
-use crate::view::widgets::controls::action_button;
+use crate::view::widgets::controls::{SELECTOR_HEIGHT, action_button};
 use crate::view::widgets::layout::modal_content_width;
+use crate::{AppUpdates, UpdateRelease};
 
 const REPOSITORY_URL: &str = "https://github.com/KobaProduction/Blazer";
 const CONTENT_INSET: i8 = 10;
@@ -148,7 +150,7 @@ impl ViewFrame<'_> {
 
     fn update_content(&self, ui: &mut egui::Ui) {
         #[cfg(all(debug_assertions, feature = "demo"))]
-        if self.view.preview {
+        if self.view.preview && self.view.host.app_updates.is_none() {
             self.preview_update(ui);
             return;
         }
@@ -160,6 +162,7 @@ impl ViewFrame<'_> {
         }
         let Some(updates) = &self.view.host.app_updates else {
             self.update_check_row(ui, false);
+            divider(ui);
             update_details(ui, |ui| {
                 ui.weak(self.tr(Key::AboutUpdateUnavailable));
             });
@@ -168,13 +171,16 @@ impl ViewFrame<'_> {
         let status = (updates.status)();
         let enabled = !matches!(
             status,
-            AppUpdateStatus::Checking | AppUpdateStatus::Downloading | AppUpdateStatus::Installing
+            AppUpdateStatus::Checking
+                | AppUpdateStatus::Downloading { .. }
+                | AppUpdateStatus::Installing
         );
         if self.update_check_row(ui, enabled) {
             (updates.check)();
         }
         if !matches!(status, AppUpdateStatus::Idle) {
-            update_details(ui, |ui| self.update_status(ui, status, updates));
+            divider(ui);
+            self.update_status(ui, status, updates);
         }
     }
 
@@ -191,14 +197,31 @@ impl ViewFrame<'_> {
         clicked
     }
 
-    fn update_status(
-        &self,
-        ui: &mut egui::Ui,
-        status: AppUpdateStatus,
-        updates: &crate::AppUpdates,
-    ) {
+    fn update_status(&self, ui: &mut egui::Ui, status: AppUpdateStatus, updates: &AppUpdates) {
         match status {
-            AppUpdateStatus::Idle => {}
+            AppUpdateStatus::Available { release } => self.release_update(
+                ui,
+                &self.message(Key::AboutUpdateTitle, &[("version", &release.version)]),
+                &release,
+                |ui| self.download_update(ui, updates),
+            ),
+            AppUpdateStatus::Downloading { release, fraction } => {
+                self.release_update(ui, self.tr(Key::AboutUpdateDownloading), &release, |ui| {
+                    update_progress(ui, fraction)
+                })
+            }
+            AppUpdateStatus::Ready { release } => self.release_update(
+                ui,
+                &self.message(Key::AboutUpdateReady, &[("version", &release.version)]),
+                &release,
+                |ui| self.install_update(ui, updates),
+            ),
+            status => self.update_message(ui, status),
+        }
+    }
+
+    fn update_message(&self, ui: &mut egui::Ui, status: AppUpdateStatus) {
+        update_details(ui, |ui| match status {
             AppUpdateStatus::Checking => {
                 ui.spinner();
             }
@@ -215,53 +238,65 @@ impl ViewFrame<'_> {
             AppUpdateStatus::Cancelled { code } => {
                 ui.label(self.message(Key::AboutUpdateCancelled, &[("code", &code.to_string())]));
             }
-            AppUpdateStatus::Available {
-                version,
-                release_url,
-            } => {
-                ui.label(self.message(Key::AboutUpdateTitle, &[("version", &version)]));
-                ui.hyperlink_to(self.tr(Key::AboutUpdateOpenRelease), release_url);
-                if let Some(download) = &updates.download
-                    && ui
-                        .add(action_button(
-                            ui,
-                            self.tr(Key::AboutUpdateDownload),
-                            CONNECTION_CONTROL_WIDTH,
-                        ))
-                        .clicked()
-                {
-                    download();
-                }
-                if updates.download.is_none() {
-                    ui.add(egui::Label::new(self.tr(Key::AboutUpdateManaged)).wrap());
-                }
-            }
             AppUpdateStatus::Installing => {
                 ui.add(egui::Label::new(self.tr(Key::AboutUpdateInstalling)).wrap());
             }
-            AppUpdateStatus::Downloading => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spinner();
-                    ui.add(egui::Label::new(self.tr(Key::AboutUpdateDownloading)).wrap());
-                });
-            }
-            AppUpdateStatus::Ready { version } => {
-                self.ready_update(ui, &version, updates);
-            }
+            _ => {}
+        });
+    }
+
+    fn release_update(
+        &self,
+        ui: &mut egui::Ui,
+        title: &str,
+        release: &UpdateRelease,
+        action: impl FnOnce(&mut egui::Ui),
+    ) {
+        let id = egui::Id::unique("about-update-release-notes")
+            .with((&release.version, &release.release_url));
+        let mut open = ui
+            .ctx()
+            .data(|data| data.get_temp::<bool>(id))
+            .unwrap_or(false);
+        setting_row(ui, title, |ui| {
+            open |= ui
+                .add(action_button(
+                    ui,
+                    self.tr(Key::AboutUpdateNotes),
+                    CONNECTION_CONTROL_WIDTH,
+                ))
+                .clicked();
+        });
+        update_details(ui, action);
+        if open {
+            open = !self.release_notes_dialog(ui, id, release);
+        }
+        ui.ctx().data_mut(|data| data.insert_temp(id, open));
+    }
+
+    fn download_update(&self, ui: &mut egui::Ui, updates: &AppUpdates) {
+        let Some(download) = &updates.download else {
+            ui.add(egui::Label::new(self.tr(Key::AboutUpdateManaged)).wrap());
+            return;
+        };
+        if ui
+            .add(action_button(
+                ui,
+                self.tr(Key::AboutUpdateDownload),
+                ui.available_width(),
+            ))
+            .clicked()
+        {
+            download();
         }
     }
 
-    fn ready_update(&self, ui: &mut egui::Ui, version: &str, updates: &crate::AppUpdates) {
-        ui.label(self.message(Key::AboutUpdateReady, &[("version", version)]));
+    fn install_update(&self, ui: &mut egui::Ui, updates: &AppUpdates) {
         let disconnected =
             self.snapshot.connection == ConnectionStatus::Disconnected && !self.snapshot.busy;
         let install = ui.add_enabled(
             disconnected,
-            action_button(
-                ui,
-                self.tr(Key::AboutUpdateInstall),
-                CONNECTION_CONTROL_WIDTH,
-            ),
+            action_button(ui, self.tr(Key::AboutUpdateInstall), ui.available_width()),
         );
         if !disconnected {
             install.on_disabled_hover_text(self.tr(Key::AboutUpdateDisconnect));
@@ -277,8 +312,9 @@ impl ViewFrame<'_> {
         if ui.ctx().data_mut(|data| data.get_temp::<bool>(id)) == Some(true) {
             return;
         }
+        divider(ui);
         update_details(ui, |ui| {
-            ui.label(self.message(Key::AboutUpdateTitle, &[("version", "0.2.0")]));
+            ui.label(self.message(Key::AboutUpdateTitle, &[("version", "0.2")]));
             ui.label(self.tr(Key::AboutUpdatePreview));
             self.preview_update_buttons(ui, id);
         });
@@ -322,10 +358,19 @@ impl ViewFrame<'_> {
     }
 }
 
+fn update_progress(ui: &mut egui::Ui, fraction: f32) {
+    ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(ui.available_width())
+            .desired_height(SELECTOR_HEIGHT)
+            .corner_radius(5)
+            .show_percentage(),
+    );
+}
+
 fn update_details(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
-    divider(ui);
     egui::Frame::new()
-        .inner_margin(CONTENT_INSET)
+        .inner_margin(egui::Margin::symmetric(CONTENT_INSET, 5))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = CONTENT_GAP;
             contents(ui);

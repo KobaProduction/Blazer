@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use vpn_presentation::Controller;
@@ -18,13 +18,18 @@ use super::{
     native_options,
 };
 use blazer::{NativeView, ui_host};
-use client_ui::BlazerView;
+use client_ui::{AppUpdateStatus, AppUpdates, BlazerView, UiHost, UpdateRelease};
 
-pub fn run_demo() -> eframe::Result {
+pub fn run_demo(updates: bool) -> eframe::Result {
+    let title = if updates {
+        Key::DemoUpdateAppName
+    } else {
+        Key::DemoAppName
+    };
     eframe::run_native(
-        localization::text(Locale::Russian, Key::DemoAppName),
+        localization::text(Locale::Russian, title),
         native_options(),
-        Box::new(|creation| {
+        Box::new(move |creation| {
             blazer::set_taskbar_icon(creation);
             let events = sample_log_events();
             let snapshot = ClientSnapshot {
@@ -35,21 +40,116 @@ pub fn run_demo() -> eframe::Result {
                 diagnostic_events: events,
                 ..sample_catalog()
             };
-            let mut window = sample_window(&creation.egui_ctx, snapshot);
-            window.enable_demo();
+            let context = &creation.egui_ctx;
+            let mut host = ui_host();
+            if updates {
+                host.app_updates = Some(update_controls(context));
+            }
+            let mut window = sample_window(context, snapshot, host);
+            if updates {
+                window.enable_update_demo();
+            } else {
+                window.enable_demo();
+            }
             Ok(Box::new(NativeView::new(window, false)))
         }),
     )
 }
 
-fn sample_window(context: &egui::Context, snapshot: ClientSnapshot) -> BlazerView {
+fn sample_window(context: &egui::Context, snapshot: ClientSnapshot, host: UiHost) -> BlazerView {
     let dirty = Arc::new(AtomicBool::new(false));
     let session = DemoSession {
         snapshot: Arc::new(Mutex::new(snapshot)),
         dirty: Arc::clone(&dirty),
         context: context.clone(),
     };
-    BlazerView::new(context, Controller::new(session, dirty), ui_host())
+    BlazerView::new(context, Controller::new(session, dirty), host)
+}
+
+#[derive(Default)]
+struct DemoUpdate {
+    status: AppUpdateStatus,
+    pending: Option<DemoUpdateTransition>,
+}
+
+struct DemoUpdateTransition {
+    started: Instant,
+    duration: Duration,
+    next: AppUpdateStatus,
+}
+
+impl DemoUpdate {
+    fn status(&mut self, context: &egui::Context) -> AppUpdateStatus {
+        if let Some(transition) = &self.pending {
+            let elapsed = transition.started.elapsed();
+            if elapsed >= transition.duration {
+                self.status = transition.next.clone();
+                self.pending = None;
+            } else if let AppUpdateStatus::Downloading { fraction, .. } = &mut self.status {
+                *fraction = elapsed.as_secs_f32() / transition.duration.as_secs_f32();
+                context.request_repaint_after(Duration::from_millis(16));
+            } else {
+                context.request_repaint_after(transition.duration - elapsed);
+            }
+        }
+        self.status.clone()
+    }
+}
+
+fn update_controls(context: &egui::Context) -> AppUpdates {
+    let release = UpdateRelease {
+        version: "0.2".to_owned(),
+        release_url: "https://github.com/KobaProduction/Blazer/releases/tag/preview".to_owned(),
+        notes: Arc::from(
+            "## Обновления приложения\n\n\
+            Пример описания выпуска для интерактивного демо.\n\n\
+            - Прогресс загрузки виден в процентах.\n\
+            - Описание выпуска доступно во время загрузки и перед установкой.\n\n\
+            ## Интерфейс\n\n\
+            - Кнопки скачивания и установки занимают всю ширину блока.\n\
+            - Разметка подстраивается под ширину окна.",
+        ),
+    };
+    let state = Arc::new(Mutex::new(DemoUpdate::default()));
+    let action = |status: AppUpdateStatus, next: AppUpdateStatus, delay_ms| {
+        let state = Arc::clone(&state);
+        let context = context.clone();
+        Arc::new(move || {
+            let mut state = state.lock().expect("demo update");
+            if state.pending.is_none() {
+                state.status = status.clone();
+                state.pending = Some(DemoUpdateTransition {
+                    started: Instant::now(),
+                    duration: Duration::from_millis(delay_ms),
+                    next: next.clone(),
+                });
+            }
+            context.request_repaint();
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let check = action(
+        AppUpdateStatus::Checking,
+        AppUpdateStatus::Available {
+            release: release.clone(),
+        },
+        650,
+    );
+    let download = action(
+        AppUpdateStatus::Downloading {
+            release: release.clone(),
+            fraction: 0.0,
+        },
+        AppUpdateStatus::Ready { release },
+        2400,
+    );
+    let install = action(AppUpdateStatus::Installing, AppUpdateStatus::Current, 1100);
+    let context = context.clone();
+    AppUpdates {
+        check,
+        download: Some(download),
+        install,
+        status: Arc::new(move || state.lock().expect("demo update").status(&context)),
+    }
 }
 
 struct DemoSession {

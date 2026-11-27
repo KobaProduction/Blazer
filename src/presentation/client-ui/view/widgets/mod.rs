@@ -34,7 +34,7 @@ pub struct BlazerView {
     interface_zoom: f32,
     platform_error: Option<ErrorNotice>,
     #[cfg(all(debug_assertions, feature = "demo"))]
-    demo: bool,
+    demo_title: Option<Key>,
     #[cfg(all(debug_assertions, feature = "demo"))]
     preview_zoom: Option<f32>,
 }
@@ -50,7 +50,7 @@ impl BlazerView {
             interface_zoom: 1.0,
             platform_error: None,
             #[cfg(all(debug_assertions, feature = "demo"))]
-            demo: false,
+            demo_title: None,
             #[cfg(all(debug_assertions, feature = "demo"))]
             preview_zoom: None,
         }
@@ -137,7 +137,14 @@ impl BlazerView {
     #[cfg(all(debug_assertions, feature = "demo"))]
     pub fn enable_demo(&mut self) {
         self.state.preview = true;
-        self.demo = true;
+        self.demo_title = Some(Key::DemoAppName);
+    }
+
+    #[cfg(all(debug_assertions, feature = "demo"))]
+    pub fn enable_update_demo(&mut self) {
+        self.enable_demo();
+        self.demo_title = Some(Key::DemoUpdateAppName);
+        self.state.open(Screen::Settings(SettingsPage::About));
     }
 
     #[cfg(all(debug_assertions, feature = "demo"))]
@@ -302,11 +309,7 @@ impl BlazerView {
         }
         let title_key = Key::AppName;
         #[cfg(all(debug_assertions, feature = "demo"))]
-        let title_key = if self.demo {
-            Key::DemoAppName
-        } else {
-            title_key
-        };
+        let title_key = self.demo_title.unwrap_or(title_key);
         let title = localization::text(locale, title_key).to_owned();
         context.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.title_locale = Some(locale);

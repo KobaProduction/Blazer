@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use client_ui::{AppUpdateStatus, AppUpdates};
+use client_ui::{AppUpdateStatus, AppUpdates, UpdateRelease};
 use eframe::egui;
 
 mod feed;
@@ -8,6 +9,8 @@ mod installation;
 mod setup;
 
 use feed::ReleaseAsset;
+
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 enum State {
@@ -19,7 +22,10 @@ enum State {
     Failed(String),
     Cancelled(i32),
     Available(ReleaseAsset),
-    Downloading,
+    Downloading {
+        release: UpdateRelease,
+        fraction: f32,
+    },
     Ready(setup::StagedSetup),
     Installing,
 }
@@ -36,19 +42,24 @@ impl State {
             },
             Self::Cancelled(code) => AppUpdateStatus::Cancelled { code: *code },
             Self::Available(asset) => AppUpdateStatus::Available {
-                version: asset.display_version.clone(),
-                release_url: asset.release_url.clone(),
+                release: asset.release.clone(),
             },
             Self::Ready(update) => AppUpdateStatus::Ready {
-                version: update.version().to_owned(),
+                release: update.release().clone(),
             },
-            Self::Downloading => AppUpdateStatus::Downloading,
+            Self::Downloading { release, fraction } => AppUpdateStatus::Downloading {
+                release: release.clone(),
+                fraction: *fraction,
+            },
             Self::Installing => AppUpdateStatus::Installing,
         }
     }
 
     fn busy(&self) -> bool {
-        matches!(self, Self::Checking | Self::Downloading | Self::Installing)
+        matches!(
+            self,
+            Self::Checking | Self::Downloading { .. } | Self::Installing
+        )
     }
 }
 
@@ -112,18 +123,30 @@ impl Updater {
             return;
         };
         let asset = asset.clone();
-        *state = State::Downloading;
+        *state = State::Downloading {
+            release: asset.release.clone(),
+            fraction: 0.0,
+        };
         drop(state);
-        self.run_job(move |_| {
+        self.run_job(move |updater| {
+            let mut last_repaint = Instant::now();
             if !installation::managed_installation() {
                 return Err(
                     "ManagedInstallationRequired: install Blazer using the setup wizard".into(),
                 );
             }
             let response = feed::download_response(&asset.download_url)?;
-            setup::stage(asset, response)
-                .map(State::Ready)
-                .map_err(|error| format!("SetupDownload: {error}"))
+            let size = asset.size;
+            setup::stage(asset, response, |received| {
+                if received <= size
+                    && (received == size || last_repaint.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL)
+                {
+                    updater.publish_progress(received as f32 / size as f32);
+                    last_repaint = Instant::now();
+                }
+            })
+            .map(State::Ready)
+            .map_err(|error| format!("SetupDownload: {error}"))
         });
     }
 
@@ -172,6 +195,15 @@ impl Updater {
     fn publish(&self, status: State) {
         if let Ok(mut state) = self.state.lock() {
             *state = status;
+        }
+        self.context.request_repaint();
+    }
+
+    fn publish_progress(&self, progress: f32) {
+        if let Ok(mut state) = self.state.lock()
+            && let State::Downloading { fraction, .. } = &mut *state
+        {
+            *fraction = progress;
         }
         self.context.request_repaint();
     }

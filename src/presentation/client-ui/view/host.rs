@@ -8,6 +8,13 @@ pub type CaptureQrImage = Arc<dyn Fn() -> ImportResult + Send + Sync>;
 pub type ScanQrCamera = Arc<dyn Fn(&str, &str, &str, &str) -> bool + Send + Sync>;
 pub type OpenUpdates = Arc<dyn Fn(&str) + Send + Sync>;
 
+#[derive(Clone)]
+pub struct UpdateRelease {
+    pub version: String,
+    pub release_url: String,
+    pub notes: Arc<str>,
+}
+
 #[derive(Clone, Default)]
 pub enum AppUpdateStatus {
     #[default]
@@ -21,14 +28,16 @@ pub enum AppUpdateStatus {
     Cancelled {
         code: i32,
     },
-    Downloading,
+    Downloading {
+        release: UpdateRelease,
+        fraction: f32,
+    },
     Installing,
     Ready {
-        version: String,
+        release: UpdateRelease,
     },
     Available {
-        version: String,
-        release_url: String,
+        release: UpdateRelease,
     },
 }
 

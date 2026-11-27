@@ -8,7 +8,10 @@ use std::ffi::{OsStr, OsString};
 pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next();
     match command.as_deref() {
-        None => Ok(demo::run_demo()?),
+        None => Ok(demo::run_demo(false)?),
+        Some(command) if command == OsStr::new("--updates") && args.next().is_none() => {
+            Ok(demo::run_demo(true)?)
+        }
         Some(command) if command == OsStr::new("--screenshot") => {
             let path = args.next().ok_or(USAGE)?;
             let screen = args.next().unwrap_or_else(|| "home".into());
@@ -21,7 +24,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), Box<dyn std::
     }
 }
 
-const USAGE: &str = "usage: blazer --demo [--screenshot <file.png> [screen]]";
+const USAGE: &str = "usage: blazer --demo [--updates | --screenshot <file.png> [screen]]";
 
 fn native_options() -> eframe::NativeOptions {
     let mut options = blazer::native_options();
